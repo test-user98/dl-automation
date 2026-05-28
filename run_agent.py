@@ -17,13 +17,15 @@ structlog.configure(
 
 sys.path.insert(0, ".")
 
+import os
+os.environ.setdefault("HUMAN_LOOP_BACKEND", "console")  # show stuck questions in terminal
+
 from config.settings import get_settings
-from agent.state_manager import StateManager, JobStatus
+from agent.state_manager import StateManager
 from agent.learning_store import LearningStore
 from agent.human_loop import HumanLoop
 from agent.brain import AgentBrain
 from browser.controller import BrowserController
-from orchestrator import Orchestrator
 
 settings = get_settings()
 SARATHI_HOME = f"{settings.sarathi_base_url}/sarathiHomePublic.do"

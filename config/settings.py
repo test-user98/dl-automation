@@ -69,7 +69,7 @@ class Settings(BaseSettings):
     max_auto_retry_with_learning: int = Field(3, env="MAX_AUTO_RETRY_WITH_LEARNING")
 
     # ── HUMAN IN THE LOOP ─────────────────────────────────────────────────────
-    human_loop_backend: Literal["webhook", "firebase", "polling"] = Field(
+    human_loop_backend: Literal["webhook", "firebase", "polling", "console"] = Field(
         "polling", env="HUMAN_LOOP_BACKEND"
     )
     human_loop_webhook_url: str = Field("", env="HUMAN_LOOP_WEBHOOK_URL")

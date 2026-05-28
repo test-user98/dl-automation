@@ -108,17 +108,25 @@ class HumanLoop:
         backend = settings.human_loop_backend
         if backend == "webhook":
             await self._send_webhook(request)
+            response = await self._poll_for_response(
+                job.job_id, settings.human_loop_timeout_minutes * 60
+            )
         elif backend == "firebase":
             await self._send_firebase(request)
+            response = await self._poll_for_response(
+                job.job_id, settings.human_loop_timeout_minutes * 60
+            )
+        elif backend == "console":
+            # Terminal / test mode — print question, read answer from stdin
+            response = await self._ask_console(request)
         else:
-            # polling — customer calls our API
+            # polling — customer calls POST /jobs/{id}/human-response via API
             self._pending[job.job_id] = None
+            response = await self._poll_for_response(
+                job.job_id, settings.human_loop_timeout_minutes * 60
+            )
 
-        # Wait for response
-        timeout = settings.human_loop_timeout_minutes * 60
-        response = await self._poll_for_response(job.job_id, timeout)
-
-        if response is None:
+        if response is None:  # noqa: SIM102
             # Timeout — escalate to partner agent console
             log.warning("human_loop.timeout", job_id=job.job_id, step=step_name)
             return HumanResponse(answer="__timeout__", raw={})
@@ -137,6 +145,45 @@ class HumanLoop:
                 return self._pending.pop(job_id)
             await asyncio.sleep(3)
         return None
+
+    async def _ask_console(self, request: HumanRequest) -> Optional[str]:
+        """
+        Terminal / test mode: print the stuck question to stdout and read
+        the operator's answer from stdin. Non-blocking via run_in_executor.
+        """
+        sep = "=" * 60
+        print(f"\n{sep}")
+        print(f"  AGENT NEEDS HELP  —  step: {request.step_name}")
+        print(sep)
+        print(f"\n{request.question}\n")
+        if request.context:
+            print(f"Context: {request.context[:400]}\n")
+        if request.options:
+            print("Options:")
+            for i, opt in enumerate(request.options, 1):
+                print(f"  {i}. {opt}")
+            print()
+
+        loop = asyncio.get_event_loop()
+        try:
+            answer = await loop.run_in_executor(
+                None,
+                lambda: input("Your answer (or press Enter to skip this step): ").strip()
+            )
+        except EOFError:
+            answer = ""
+
+        if not answer:
+            answer = "skip"
+
+        # If user typed a number, map it to the option text
+        if answer.isdigit() and request.options:
+            idx = int(answer) - 1
+            if 0 <= idx < len(request.options):
+                answer = request.options[idx]
+
+        print(f"\nAgent received: '{answer}'\n{sep}\n")
+        return answer
 
     async def _send_webhook(self, request: HumanRequest):
         if not settings.human_loop_webhook_url:
