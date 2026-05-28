@@ -697,8 +697,11 @@ KNOWN OBSTACLES: {json.dumps(next_step.known_obstacles if next_step else [])}
 
         elif at == "fill":
             if action.selector:
-                ok = await self._browser.fill(action.selector, action.value or action.text)
-                return ok, f"fill selector='{action.selector}'"
+                is_date = any(k in action.selector.lower() for k in ["dob", "date", "birth"])
+                ok = await self._browser.fill(
+                    action.selector, action.value or action.text, blur_after=is_date
+                )
+                return ok, f"fill selector='{action.selector}' blur_after={is_date}"
             return False, "fill: no selector"
 
         elif at == "select":
@@ -754,8 +757,18 @@ KNOWN OBSTACLES: {json.dumps(next_step.known_obstacles if next_step else [])}
             captcha_bytes = await self._browser.crop_element_screenshot(sel) or await self._browser.screenshot()
             solution = await self._captcha.solve(captcha_bytes)
             if solution:
-                inp = args.get("input_selector", "input[name*='captcha'], input[id*='captcha']")
-                return await self._browser.fill(inp, solution)
+                # Try selectors in order — Sarathi misspells "captcha" as "captha" (visible id: entCaptha).
+                # Always prefer visible inputs over hidden ones.
+                for inp_sel in [
+                    args.get("input_selector", ""),
+                    "#entCaptha",
+                    "input[id*='captha']:not([type='hidden'])",
+                    "input[id*='captcha']:not([type='hidden'])",
+                    "input[name*='captcha']:not([type='hidden'])",
+                ]:
+                    if inp_sel and await self._browser.fill(inp_sel, solution):
+                        log.info("brain.captcha_filled", selector=inp_sel, solution=solution)
+                        return True
             return False
 
         elif tool == "image_processor":

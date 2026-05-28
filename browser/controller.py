@@ -183,9 +183,14 @@ class BrowserController:
             log.warning("browser.type_failed", selector=selector, error=str(e))
             return False
 
-    async def fill(self, selector: str, value: str) -> bool:
+    async def fill(self, selector: str, value: str, blur_after: bool = False) -> bool:
         try:
             await self._page.fill(selector, value, timeout=8000)
+            if blur_after:
+                # Press Tab to dismiss date-picker calendars or other overlays that
+                # open on focus and don't close automatically after a programmatic fill.
+                await self._page.keyboard.press("Tab")
+                await asyncio.sleep(0.3)
             return True
         except Exception as e:
             log.warning("browser.fill_failed", selector=selector, error=str(e))
