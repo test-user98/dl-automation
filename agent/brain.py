@@ -128,6 +128,28 @@ class AgentBrain:
                 step_action_history = []
                 last_step_name = current_step
 
+            # ── Conditional steps: auto-skip after 2 failures ─────────────────
+            # A conditional step (e.g. close_state_popup) only applies if the
+            # portal shows the relevant UI. If it keeps failing, the condition
+            # simply isn't met — skip it silently and move on.
+            if next_step and next_step.is_conditional and fails >= 2:
+                log.info(
+                    "brain.conditional_step_auto_skipped",
+                    step=current_step,
+                    reason="Conditional step — popup/UI likely not present this run",
+                )
+                job.mark_step_done(current_step, StepLog(
+                    step_name=current_step,
+                    status="skipped",
+                    observation="Conditional step not applicable on this run",
+                    action_taken="auto_skip",
+                ))
+                await self._sm.save(job)
+                step_failures.pop(current_step, None)
+                failure_context = ""
+                step_action_history = []
+                continue
+
             # ── Escalate to human after too many self-healing attempts ─────────
             if fails >= settings.max_consecutive_step_failures:
                 log.warning(
@@ -663,6 +685,13 @@ KNOWN OBSTACLES: {json.dumps(next_step.known_obstacles if next_step else [])}
             if not ok and action.text:
                 ok = await self._browser.click_link_containing(action.text)
                 detail.append(f"link_containing='{action.text}' -> {ok}")
+
+            # If the text looks like a modal-close button (x, ×, close) and all
+            # click attempts failed, try the universal popup-close routine.
+            close_texts = {"x", "×", "close", "dismiss", "skip"}
+            if not ok and action.text and action.text.strip().lower() in close_texts:
+                ok = await self._browser.close_popups_on_page()
+                detail.append(f"close_popup_fallback -> {ok}")
 
             return ok, " | ".join(detail)
 

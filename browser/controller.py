@@ -120,13 +120,31 @@ class BrowserController:
         if self._is_destructive(text):
             log.warning("browser.blocked_destructive_click", text=text)
             return False
+
+        stripped = text.strip()
+
+        # Short strings (≤3 chars, e.g. "x", "×", "OK") must use exact match and
+        # prefer <button> elements over <a> tags to avoid false positives.
+        if len(stripped) <= 3:
+            try:
+                # Prefer button with exact text
+                btn = self._page.locator(f"button").filter(has_text=stripped).first
+                if await btn.is_visible(timeout=500):
+                    await btn.click(timeout=3000)
+                    await self._wait_stable()
+                    log.info("browser.short_text_button_clicked", text=stripped)
+                    return True
+            except Exception:
+                pass
+            exact = True  # fall through with exact match
+
         try:
-            locator = self._page.get_by_text(text, exact=exact)
+            locator = self._page.get_by_text(stripped, exact=exact)
             await locator.first.click(timeout=8000)
             await self._wait_stable()
             return True
         except Exception as e:
-            log.warning("browser.click_text_failed", text=text, error=str(e))
+            log.warning("browser.click_text_failed", text=stripped, error=str(e))
             return False
 
     async def click_selector(self, selector: str, label: str = "") -> bool:
