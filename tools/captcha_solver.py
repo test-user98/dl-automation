@@ -120,37 +120,25 @@ class CaptchaSolver:
 
         return None
 
-    # ── Claude vision fallback ─────────────────────────────────────────────────
+    # ── LLM vision CAPTCHA solver (uses configured primary/fallback) ───────────
 
     async def _solve_claude(self, image_bytes: bytes) -> Optional[str]:
-        import anthropic
-        b64 = base64.b64encode(image_bytes).decode()
-        client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
-
-        response = client.messages.create(
-            model=settings.llm_model,
-            max_tokens=64,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {"type": "base64", "media_type": "image/png", "data": b64},
-                    },
-                    {
-                        "type": "text",
-                        "text": (
-                            "This is a CAPTCHA image from an Indian government website. "
-                            "Read the characters shown and respond with ONLY the characters, "
-                            "nothing else. No spaces unless the CAPTCHA has spaces. "
-                            "Be exact — case sensitive."
-                        ),
-                    },
-                ],
-            }],
+        from agent.llm_client import get_llm_client
+        llm = get_llm_client()
+        system = "You are a CAPTCHA reader. Respond with ONLY the characters shown, nothing else."
+        user   = (
+            "This is a CAPTCHA image from an Indian government website. "
+            "Read the characters shown and respond with ONLY the exact characters. "
+            "No spaces, no explanation, no punctuation — just the CAPTCHA text."
         )
-        text = response.content[0].text.strip()
-        return text if text else None
+        try:
+            result = await llm.vision(image_bytes, system, user)
+            text = result.strip()
+            log.info("captcha.llm_solved", chars=len(text), preview=text[:8])
+            return text if text else None
+        except Exception as e:
+            log.error("captcha.llm_failed", error=str(e))
+            return None
 
     # ── Manual fallback ────────────────────────────────────────────────────────
 

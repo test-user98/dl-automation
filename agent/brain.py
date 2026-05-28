@@ -90,6 +90,10 @@ class AgentBrain:
         step_count   = 0
         step_failures: dict[str, int] = {}   # step_name -> consecutive fail count
         failure_context = ""                  # diagnosis from last failed action
+        # Records every action taken within the current step so the LLM
+        # knows what it already did and doesn't repeat the same fill/click
+        step_action_history: list[str] = []
+        last_step_name = ""
 
         while step_count < settings.max_steps_per_job:
             step_count += 1
@@ -118,6 +122,11 @@ class AgentBrain:
 
             current_step = next_step.name if next_step else "unknown"
             fails        = step_failures.get(current_step, 0)
+
+            # Reset action history when we move to a new step
+            if current_step != last_step_name:
+                step_action_history = []
+                last_step_name = current_step
 
             # ── Escalate to human after too many self-healing attempts ─────────
             if fails >= settings.max_consecutive_step_failures:
@@ -195,6 +204,7 @@ class AgentBrain:
                 learned_hint=learned,
                 dom_elements=dom_elements,
                 failure_context=failure_context,
+                step_action_history=step_action_history,
             )
 
             log.info(
@@ -230,6 +240,16 @@ class AgentBrain:
                 post_url=post_url[:60],
                 detail=exec_detail,
             )
+
+            # ── Record action in step history (prevents repeating same fills) ───
+            step_action_history.append(
+                f"[{'OK' if success else 'FAIL'}] {action.action_type} "
+                f"selector='{action.selector}' text='{action.text}' value='{action.value}' "
+                f"— {action.description}"
+            )
+            # Keep last 10 actions to avoid bloating the prompt
+            if len(step_action_history) > 10:
+                step_action_history = step_action_history[-10:]
 
             # ── If action failed: self-diagnose and prepare next iteration ─────
             if not success and action.action_type not in ("wait", "scroll"):
@@ -458,6 +478,7 @@ class AgentBrain:
         learned_hint: Optional[Scenario],
         dom_elements: dict = None,
         failure_context: str = "",
+        step_action_history: list = None,
     ) -> AgentAction:
         next_step       = pending_steps[0] if pending_steps else None
         remaining_names = [s.name for s in pending_steps]
@@ -526,12 +547,20 @@ class AgentBrain:
             "Respond ONLY with a single valid JSON object. No markdown."
         )
 
+        history_text = ""
+        if step_action_history:
+            history_text = (
+                "\n\nACTIONS ALREADY TAKEN IN THIS STEP (do NOT repeat these — move to the next field/action):\n"
+                + "\n".join(f"  {i+1}. {h}" for i, h in enumerate(step_action_history))
+            )
+
         user_text = f"""=== CURRENT STATE ===
 URL: {url}
 Page text (truncated to 1200 chars):
 {page_text[:1200]}
 {dom_text}
 {failure_text}
+{history_text}
 === GOAL ===
 Complete the DL Renewal for this customer.
 
@@ -557,6 +586,14 @@ KNOWN OBSTACLES: {json.dumps(next_step.known_obstacles if next_step else [])}
    confirmation text appeared, form field is filled).
 9. If you have already tried one approach and it is in the SELF-DIAGNOSIS section,
    DO NOT try it again — choose a fundamentally different approach.
+10. PAGE RESET DETECTION: If the screenshot shows a form field is EMPTY but ACTIONS
+    ALREADY TAKEN shows it was previously filled — the page refreshed and wiped the
+    form. Re-fill ALL fields from scratch, starting from the first empty one.
+11. When a form has multiple fields (e.g. DL number + DOB + CAPTCHA), fill ALL of
+    them before clicking submit. Check ACTIONS ALREADY TAKEN to know which ones are
+    done, then fill the remaining ones in sequence.
+12. CAPTCHA: always use action_type="tool_call" and tool="captcha_solver" to solve it.
+    After solving, fill the captcha input, then click the submit/GO button.
 
 === RESPOND WITH EXACTLY THIS JSON ===
 {{

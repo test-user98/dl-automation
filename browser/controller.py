@@ -68,6 +68,9 @@ class BrowserController:
             },
             user_agent=settings.browser_user_agent,
             accept_downloads=True,
+            # Pre-grant browser-level permissions so no dialog ever blocks the agent.
+            # Sarathi requests camera for photo capture — we handle that via file upload.
+            permissions=["camera", "microphone", "notifications"],
         )
 
         # Restore cookies from a previous session if available
@@ -264,46 +267,61 @@ class BrowserController:
     async def save_cookies(self) -> list[dict]:
         return await self._context.cookies()
 
-    async def close_popups_on_page(self):
+    async def close_popups_on_page(self) -> bool:
         """
-        Attempt to find and close any visible overlay/modal/popup.
-        Uses common close patterns: X button, Escape key, 'close' text.
+        Close any visible overlay/modal/popup.
+        Fast path: Sarathi-specific selectors with 300 ms timeout.
+        Fallback: generic selectors + Escape.
         """
-        closed = False
+        # Fast path — Sarathi known modals
+        fast_selectors = [
+            ".modal.in .close",
+            ".modal.in [data-dismiss='modal']",
+            "#contactless_statepopup .close",
+            "#contactless_statepopup [data-dismiss='modal']",
+        ]
+        for selector in fast_selectors:
+            try:
+                el = self._page.locator(selector).first
+                if await el.is_visible(timeout=300):
+                    await el.click(timeout=2000)
+                    await asyncio.sleep(0.3)
+                    log.info("browser.popup_closed_fast", selector=selector)
+                    return True
+            except Exception:
+                pass
 
-        # Try Escape key first (works for many modals)
+        # Escape key (works when data-keyboard is not false)
         await self._page.keyboard.press("Escape")
-        await asyncio.sleep(0.4)
+        await asyncio.sleep(0.3)
 
-        # Try clicking a close button by aria-label
+        # Generic selectors
         for selector in [
-            "button[aria-label='Close']",
-            "button[aria-label='close']",
-            ".close",
-            ".modal-close",
-            "[data-dismiss='modal']",
-            "button.btn-close",
+            "button[aria-label='Close']", "button[aria-label='close']",
+            ".close", "[data-dismiss='modal']", "button.btn-close",
         ]:
             try:
                 el = self._page.locator(selector).first
-                if await el.is_visible():
-                    await el.click()
-                    closed = True
+                if await el.is_visible(timeout=300):
+                    await el.click(timeout=2000)
+                    await asyncio.sleep(0.3)
                     log.info("browser.popup_closed", selector=selector)
-                    await asyncio.sleep(0.4)
-                    break
+                    return True
             except Exception:
                 pass
 
-        if not closed:
-            # Last resort — try clicking any visible X or × character
-            try:
-                await self._page.get_by_text("×").first.click()
-                closed = True
-            except Exception:
-                pass
+        # × character (exact text match only — avoids false positives)
+        try:
+            x_btn = self._page.locator("button").filter(has_text="×").first
+            if await x_btn.is_visible(timeout=300):
+                await x_btn.click(timeout=2000)
+                log.info("browser.popup_closed_x_button")
+                return True
+        except Exception:
+            pass
 
-        return closed
+        log.debug("browser.no_popup_found")
+        return False
 
     # ── Destructive action guard ───────────────────────────────────────────────
 
@@ -413,21 +431,39 @@ class BrowserController:
             return False
 
     async def click_link_containing(self, text: str) -> bool:
-        """Click an <a> tag whose text contains the given string (case-insensitive)."""
+        """
+        Click an <a> tag whose text contains the given string (case-insensitive).
+        Refuses single-character searches — too ambiguous (e.g. 'x' matches 'Expired').
+        For short strings (<= 2 chars) uses exact whole-word match instead.
+        """
+        if not text or not text.strip():
+            return False
+
+        stripped = text.strip()
         try:
-            result = await self._page.evaluate(f"""() => {{
-                const text = {json.dumps(text.lower())};
-                const links = Array.from(document.querySelectorAll('a'));
-                const match = links.find(a => a.innerText.toLowerCase().includes(text));
-                if (match) {{ match.click(); return true; }}
-                return false;
-            }}""")
+            if len(stripped) <= 2:
+                # Exact word match only — avoid single-letter false positives
+                result = await self._page.evaluate(f"""() => {{
+                    const target = {json.dumps(stripped.lower())};
+                    const links = Array.from(document.querySelectorAll('a'));
+                    const match = links.find(a => a.innerText.trim().toLowerCase() === target && a.offsetParent !== null);
+                    if (match) {{ match.click(); return true; }}
+                    return false;
+                }}""")
+            else:
+                result = await self._page.evaluate(f"""() => {{
+                    const target = {json.dumps(stripped.lower())};
+                    const links = Array.from(document.querySelectorAll('a'));
+                    const match = links.find(a => a.innerText.toLowerCase().includes(target) && a.offsetParent !== null);
+                    if (match) {{ match.click(); return true; }}
+                    return false;
+                }}""")
             if result:
                 await self._wait_stable()
-                log.info("browser.link_clicked", text=text)
+                log.info("browser.link_clicked", text=stripped)
                 return True
-            log.warning("browser.link_not_found", text=text)
+            log.warning("browser.link_not_found", text=stripped)
             return False
         except Exception as e:
-            log.warning("browser.link_click_failed", text=text, error=str(e))
+            log.warning("browser.link_click_failed", text=stripped, error=str(e))
             return False
