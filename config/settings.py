@@ -124,6 +124,14 @@ class Settings(BaseSettings):
     screenshot_on_every_step: bool = Field(True, env="SCREENSHOT_ON_EVERY_STEP")
     log_level: str = Field("INFO", env="LOG_LEVEL")
 
+    # ── DEMO MODE ────────────────────────────────────────────────────────────
+    # When True, a customer-submitted service selection is treated as success
+    # and the job is short-circuited to SUBMITTED with a synthetic ACK after
+    # a short delay. Used ONLY for recordings/demos — never enable in prod.
+    # Set DEMO_AUTO_ACK=true in the env (or .env) to turn on.
+    demo_auto_ack: bool = Field(False, env="DEMO_AUTO_ACK")
+    demo_auto_ack_delay_seconds: float = Field(6.0, env="DEMO_AUTO_ACK_DELAY_SECONDS")
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
 

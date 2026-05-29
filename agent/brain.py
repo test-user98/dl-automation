@@ -545,6 +545,16 @@ class AgentBrain:
                 if self._dialog_indicates_failure(dialog_msg):
                     portal_alert_seen = True
                     log.warning("brain.portal_alert", message=dialog_msg[:120], step=current_step)
+                    # Surface the portal's own words to the customer UI so the
+                    # customer can see WHAT Sarathi is complaining about, not
+                    # just a generic "we're trying again". Kept short so the
+                    # customer doesn't see internal noise.
+                    job.customer_data["last_portal_message"] = {
+                        "text": dialog_msg.strip()[:240],
+                        "kind": "alert",
+                        "step": current_step,
+                        "at": datetime.utcnow().isoformat(),
+                    }
                     # Treat validation alerts as failures so the LLM retries with fresh data.
                     step_failures[current_step] = fails + 1
                     failure_context = (

@@ -9,7 +9,7 @@ Validates:
   Bug D — phase advances past PHASE_CONNECTING once portal popup is closed.
   Bug G — retrying/portal-down payloads do not render the generic answer box.
 
-Run after restarting uvicorn on 127.0.0.1:8001.
+Run after restarting uvicorn on 127.0.0.1:8002.
 
 Usage: python scripts/validate_fixes.py
 """
@@ -205,7 +205,7 @@ async def test_bug_a_ui_pin_stays_on_step_3() -> bool:
         browser = await p.chromium.launch(headless=True)
         ctx = await browser.new_context()
         page = await ctx.new_page()
-        await page.goto("http://127.0.0.1:8001/")
+        await page.goto("http://127.0.0.1:8002/")
         await page.wait_for_selector("#screen-1")
 
         # Step 1 -> 2
@@ -341,7 +341,7 @@ async def test_state_confirmation_ui_changes_payload() -> bool:
             body='{"status":"AGENT_RUNNING","customer_view":{"phase":"connecting","headline":"Starting","subline":"","action_required":false,"action_type":"","last_step_label":"Connecting","customer_request":{}}}',
         ))
 
-        await page.goto("http://127.0.0.1:8001/")
+        await page.goto("http://127.0.0.1:8002/")
         await page.click("#step1-next")
         await page.wait_for_selector("#screen-2:not(.hidden)")
         await page.fill("#dl_raw", "RJ0720170010191")
@@ -355,20 +355,42 @@ async def test_state_confirmation_ui_changes_payload() -> bool:
         await page.wait_for_selector("#screen-3:not(.hidden)")
         await page.fill("#pin_code", "334401")
 
-        # Verify the review shows the DL-derived state
+        # Verify the review shows the DL-derived state and accepts it as the
+        # default — the customer is NOT forced to re-confirm. Earlier slice
+        # forced an explicit confirm; the current user-requested behavior is
+        # auto-accept-from-DL with a "Change" affordance.
         review_text = await page.text_content("#review-rows")
         ok &= assert_eq("review shows Rajasthan from DL", "Rajasthan" in (review_text or ""), True)
-        ok &= assert_eq("review asks customer to confirm state",
-                        "please confirm" in (review_text or "").lower(), True)
+        ok &= assert_eq("review labels source as 'from your DL'",
+                        "from your dl" in (review_text or "").lower(), True)
+        # Click Start without touching state — should accept the DL-derived value.
         await page.click("#start-btn")
-        await page.wait_for_timeout(300)
-        banner_text = await page.text_content("#step3-banner")
-        ok &= assert_eq("start blocked until filing state confirmed",
-                        "confirm the state" in (banner_text or "").lower(), True)
-        ok &= assert_eq("confirm-and-start not called before state confirm",
-                        len(captured_payloads), 0)
+        await page.wait_for_timeout(500)
+        ok &= assert_eq("DL-derived state is accepted without manual confirm",
+                        len(captured_payloads) >= 1, True)
+        if captured_payloads:
+            ok &= assert_eq("payload uses DL-derived filing state",
+                            captured_payloads[-1].get("state_code"), "RJ")
+
+        # Go back to review to validate manual override still works. Wipe
+        # sessionStorage first — otherwise the rehydrate path will skip the
+        # form and jump us straight back to the live screen of the previous
+        # mock job.
+        await page.evaluate("() => sessionStorage.clear()")
+        await page.goto("http://127.0.0.1:8002/")
+        await page.click("#step1-next")
+        await page.wait_for_selector("#screen-2:not(.hidden)")
+        await page.fill("#dl_raw", "RJ0720170010191")
+        async with page.expect_response("**/onboard/validate-dl") as resp_info2:
+            await page.fill("#dob", "04-09-1998")
+        await resp_info2.value
+        await page.fill("#mobile", "9876512345")
+        await page.click("#screen-2 button.primary")
+        await page.wait_for_selector("#screen-3:not(.hidden)")
+        await page.fill("#pin_code", "334401")
 
         # Override state via the Change → dropdown
+        await page.click("#state-edit-toggle")
         await page.wait_for_selector("#state-edit:not(.hidden)")
         await page.select_option("#state-edit-select", "MH")
         await page.wait_for_timeout(150)
@@ -382,7 +404,7 @@ async def test_state_confirmation_ui_changes_payload() -> bool:
         await page.click("#start-btn")
         await page.wait_for_timeout(800)
 
-        ok &= assert_eq("confirm-and-start was called", len(captured_payloads) >= 1, True)
+        ok &= assert_eq("confirm-and-start was called", len(captured_payloads) >= 2, True)
         if captured_payloads:
             ok &= assert_eq("payload state_code override",
                             captured_payloads[-1].get("state_code"), "MH")
@@ -393,7 +415,7 @@ async def test_state_confirmation_ui_changes_payload() -> bool:
 
 async def main():
     print("=" * 70)
-    print("Validating customer-UI fixes against http://127.0.0.1:8001")
+    print("Validating customer-UI fixes against http://127.0.0.1:8002")
     print("=" * 70)
     results = [
         test_bug_d_phase_advance_past_connecting(),

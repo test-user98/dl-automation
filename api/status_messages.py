@@ -272,12 +272,36 @@ def customer_job_view(job: Job) -> dict:
         )
         severity = "warning"
 
+    # Latest portal-side error/alert text the agent saw (e.g. "Please provide
+    # valid Driving Licence data / Captcha"). Surfaces to the customer as a
+    # passive banner so they can see what Sarathi is complaining about while
+    # the agent is still working. Only set when non-stale (last 5 minutes).
+    portal_message = ""
+    last_portal = job.customer_data.get("last_portal_message") or {}
+    if isinstance(last_portal, dict):
+        portal_message_text = (last_portal.get("text") or "").strip()
+        if portal_message_text:
+            try:
+                from datetime import datetime, timezone
+                at_iso = last_portal.get("at") or ""
+                # Parse as UTC; tolerate both naive and tz-aware ISO strings.
+                if at_iso:
+                    dt = datetime.fromisoformat(at_iso.replace("Z", "+00:00"))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    age = (datetime.now(timezone.utc) - dt).total_seconds()
+                    if age <= 300:
+                        portal_message = portal_message_text
+            except Exception:
+                portal_message = portal_message_text  # if parse fails, show it anyway
+
     return {
         # New phase-based fields
         "phase":           phase,
         "headline":        title,
         "subline":         message,
         "mobile_suffix":   mobile_suffix if action_type == "otp" else "",
+        "portal_message":  portal_message,
         # Legacy fields — kept so the current frontend still works
         "title":            title,
         "message":          message,

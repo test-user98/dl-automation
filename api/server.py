@@ -227,19 +227,20 @@ async def submit_human_response(job_id: str, body: HumanResponse):
             detail=f"Job is not waiting for customer input (status={job.status.value})",
         )
 
-    # Demo shortcut (for recording): if flow is waiting for service selection,
-    # accept any selected option and complete with ACK after a short delay.
+    # Demo shortcut (for recording): when DEMO_AUTO_ACK=true, accept any
+    # service selection as success and complete the job with a synthetic ACK.
+    # OFF by default. Must NEVER be enabled in production.
     pending = job.customer_data.get("_pending_customer_request") or {}
     action_type = str((pending or {}).get("action_type", "")).strip().lower()
-    if action_type == "service_selection":
-        await asyncio.sleep(6.0)
+    if action_type == "service_selection" and settings.demo_auto_ack:
+        await asyncio.sleep(max(0.0, settings.demo_auto_ack_delay_seconds))
         ack = f"ACK-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
         job.application_number = ack
         job.error_message = ""
         job.customer_data["selected_service"] = (body.answer or "").strip() or "DEMO_SELECTED_SERVICE"
         job.customer_data["demo_shortcut"] = {
             "enabled": True,
-            "reason": "recording_mode_force_success_on_any_service_selection",
+            "reason": "DEMO_AUTO_ACK env flag is on",
             "at_utc": datetime.utcnow().isoformat(),
         }
         # Clear pending prompt and complete the job for customer/admin visibility.

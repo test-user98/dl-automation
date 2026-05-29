@@ -577,6 +577,8 @@
         <div class="activity-list" id="activity-list"></div>
       </div>
 
+      <div class="banner warn hidden" id="portal-message-banner" role="status"></div>
+
       <div class="banner hidden" id="live-banner"></div>
 
       <p class="footnote">
@@ -589,6 +591,8 @@
     <section id="screen-otp" class="card hidden">
       <h2>Enter the OTP</h2>
       <p class="sub" id="otp-sub">The government portal just sent an OTP to your registered mobile. Enter it here so we can submit your application.</p>
+
+      <div class="banner err hidden" id="otp-reshow-banner" role="alert"></div>
 
       <div class="otp-row" id="otp-row">
         <input maxlength="6" inputmode="numeric" autocomplete="one-time-code" />
@@ -653,7 +657,7 @@
       <p class="sub">Your acknowledgement number is below. You'll get an SMS update from the government portal.</p>
       <div class="banner success" id="app-number">Submitted on the portal.</div>
       <div class="actions">
-        <button onclick="location.reload()">Start another application</button>
+        <button onclick="(function(){ clearCustomerSession(); location.reload(); })()">Start another application</button>
       </div>
     </section>
 
@@ -674,6 +678,51 @@ let ocrConfidence = 0;
 let otpSubmitInFlight = false; // prevent duplicate OTP submits while backend is processing
 let activityItems = [];
 let lastActivityKey = '';
+
+// ─── Customer session persistence (sessionStorage) ──────────────────────────
+// What we persist is purely for UI continuity: customer's typed form data so
+// they don't have to re-enter on reload, and currentJobId so a refresh during
+// the live screen reconnects to the same agent run. The agent itself always
+// drives Sarathi from scratch — Sarathi cannot resume mid-flow, only we can
+// resume the customer-facing wrapper.
+const SESSION_KEY = 'sarathi.customer_session.v1';
+function persistCustomerSession() {
+  try {
+    const snapshot = {
+      currentJobId,
+      dlNormalised,
+      dlImagePath,
+      extractedSnapshot,
+      ocrConfidence,
+      manualStateCode: (typeof manualStateCode === 'string') ? manualStateCode : '',
+      form: {
+        dl_raw: document.getElementById('dl_raw')?.value || '',
+        dob: document.getElementById('dob')?.value || '',
+        mobile: document.getElementById('mobile')?.value || '',
+        name: document.getElementById('name')?.value || '',
+        pin_code: document.getElementById('pin_code')?.value || '',
+      },
+      savedAt: Date.now(),
+    };
+    sessionStorage.setItem(SESSION_KEY, JSON.stringify(snapshot));
+  } catch (_) { /* sessionStorage may be unavailable in private mode */ }
+}
+function loadCustomerSession() {
+  try {
+    const raw = sessionStorage.getItem(SESSION_KEY);
+    if (!raw) return null;
+    const snap = JSON.parse(raw);
+    // Expire snapshots older than 6 hours so we don't restore stale jobs.
+    if (!snap || (Date.now() - (snap.savedAt || 0)) > 6 * 3600 * 1000) {
+      sessionStorage.removeItem(SESSION_KEY);
+      return null;
+    }
+    return snap;
+  } catch (_) { return null; }
+}
+function clearCustomerSession() {
+  try { sessionStorage.removeItem(SESSION_KEY); } catch (_) {}
+}
 const PHASE_ORDER = ['connecting', 'filling', 'waiting', 'submitting'];
 const PHASE_META = {
   connecting: { label: 'Connecting', sub: 'Opening portal' },
@@ -840,11 +889,19 @@ const STATE_NAMES = {
   UK:"Uttarakhand", WB:"West Bengal",
 };
 
+// Last-resort fallback only — used when there is no DL on file yet.
 const DEFAULT_FILING_STATE = "RJ";
-let manualStateCode = DEFAULT_FILING_STATE;    // default customer filing state
+// Customer override. Empty means "use the DL-derived state". Once the
+// customer explicitly picks something from the dropdown, this holds their
+// choice and we never silently overwrite it.
+let manualStateCode = "";
+
+function dlDerivedStateCode() {
+  return (dlNormalised || "").slice(0, 2).toUpperCase();
+}
 
 function effectiveStateCode() {
-  return manualStateCode || DEFAULT_FILING_STATE;
+  return manualStateCode || dlDerivedStateCode() || DEFAULT_FILING_STATE;
 }
 
 function effectiveStateName() {
@@ -852,12 +909,16 @@ function effectiveStateName() {
   return STATE_NAMES[code] || code || '—';
 }
 
+function stateSourceLabel() {
+  if (manualStateCode) return 'you picked this';
+  if (dlDerivedStateCode()) return 'from your DL — change if needed';
+  return 'default';
+}
+
 function renderReview() {
   const stateCode = effectiveStateCode();
   const stateName = effectiveStateName();
-  const stateSource = manualStateCode
-    ? 'selected for filing'
-    : 'defaulted to Rajasthan';
+  const stateSource = stateSourceLabel();
   const rows = {
     'DL number':  formatDL(dlNormalised) || document.getElementById('dl_raw').value || '—',
     'DOB':        document.getElementById('dob').value || '—',
@@ -873,11 +934,11 @@ function renderReview() {
       <b>Filing state</b>
       <span>
         ${escapeHtml(stateName)}${stateSource ? ` <span class="hint" style="display:inline">(${stateSource})</span>` : ''}
-        <span class="row-edit" onclick="toggleStateEdit()" id="state-edit-toggle">${manualStateCode ? 'Change' : 'Confirm / Change'}</span>
+        <span class="row-edit" onclick="toggleStateEdit()" id="state-edit-toggle">Change</span>
       </span>
     </div>`;
   document.getElementById('review-rows').innerHTML = reviewHTML + stateRow;
-  // Keep the state-edit dropdown in sync with the current value.
+  // Keep the state-edit dropdown in sync with the effective value.
   const sel = document.getElementById('state-edit-select');
   if (sel) sel.value = stateCode;
 }
@@ -895,6 +956,7 @@ function onStatePicked(code) {
   manualStateCode = code || '';
   const box = document.getElementById('state-edit');
   if (box) box.classList.add('hidden');
+  persistCustomerSession();
   renderReview();
 }
 
@@ -935,24 +997,15 @@ async function startJob() {
     }
     return;
   }
-  if (!manualStateCode) {
-    const sel = document.getElementById('state-edit-select');
-    // If the dropdown already has a valid selection (e.g. suggested state was
-    // prefilled), accept it as confirmation even when onchange didn't fire.
-    if (sel && sel.value) {
-      manualStateCode = sel.value;
-      renderReview();
-    }
-  }
-  if (!manualStateCode) {
-    setScreenBanner('step3-banner', 'Please confirm the state where you want us to file this application.');
+  // State is now allowed to come from the DL by default — only block if we
+  // have no DL prefix AND no customer override AND no last-resort fallback.
+  const resolvedState = effectiveStateCode();
+  if (!resolvedState) {
+    setScreenBanner('step3-banner', 'Please pick the state where you want us to file this application.');
     const box = document.getElementById('state-edit');
     if (box) box.classList.remove('hidden');
     const sel = document.getElementById('state-edit-select');
-    if (sel) {
-      sel.value = effectiveStateCode();
-      sel.focus();
-    }
+    if (sel) sel.focus();
     return;
   }
 
@@ -964,7 +1017,7 @@ async function startJob() {
     dob, mobile_number: mobile, pin_code: pin,
     name:    document.getElementById('name').value.trim(),
     address: extractedSnapshot.address || '',
-    state_code: manualStateCode,
+    state_code: resolvedState,
     service: 'DL_RENEWAL',
     dl_image_path:  dlImagePath,
     ocr_data:       extractedSnapshot,
@@ -978,6 +1031,7 @@ async function startJob() {
     return;
   }
   currentJobId = r.job_id;
+  persistCustomerSession();
   goStep(4);
   resetActivity();
   setLive({ phase: 'connecting', headline: 'Starting your application', subline: 'Opening the government portal…' });
@@ -1151,6 +1205,7 @@ function applyJob(r) {
       severity: 'success',
     }, r);
     show('screen-done');
+    clearCustomerSession();
   } else if (r.status === 'FAILED') {
     stopLiveUpdates();
     setLive({
@@ -1165,7 +1220,7 @@ function applyJob(r) {
     b.innerHTML = `${escapeHtml(v.subline || 'Something went wrong.')}
       <div style="margin-top: 10px">
         <button class="primary" onclick="retryWithSameData()">Try again with the same details</button>
-        <button class="ghost"   onclick="location.reload()">Start over</button>
+        <button class="ghost"   onclick="(function(){ clearCustomerSession(); location.reload(); })()">Start over</button>
       </div>`;
   } else {
     // No customer input pending right now -> keep the user on live progress.
@@ -1201,6 +1256,20 @@ function setLive(v, job = {}) {
   updateAgentFocus(v);
   addActivity(activityFromView(v, job));
   appendStepLogActivity(job.step_logs || []);
+
+  // Surface the portal's own error text (if recent) so the customer can see
+  // WHAT Sarathi is complaining about while we retry. Passive banner — does
+  // not ask them to do anything.
+  const portalBanner = document.getElementById('portal-message-banner');
+  if (portalBanner) {
+    const portalMsg = (v.portal_message || '').trim();
+    if (portalMsg) {
+      portalBanner.textContent = `Portal said: "${portalMsg}" — we're working through this for you.`;
+      portalBanner.classList.remove('hidden');
+    } else {
+      portalBanner.classList.add('hidden');
+    }
+  }
 
   const banner = document.getElementById('live-banner');
   if (v.phase === 'retrying') {
@@ -1377,11 +1446,49 @@ function formatShortTime(iso) {
 }
 
 // ─── OTP screen ────────────────────────────────────────────────────────────
+// Tracks how many times the OTP screen has been shown for the current job, so
+// the second appearance can call out "previous code was rejected" instead of
+// generic "Enter the OTP" — which is what makes a real OTP loop feel like the
+// app is broken.
+let otpScreenShownForJob = null;
+let otpReshowCount = 0;
+let lastSubmittedOtp = '';
+
 function showOTP(v) {
   const screen = document.getElementById('screen-otp');
   const alreadyOnScreen = screen && !screen.classList.contains('hidden');
-  document.getElementById('otp-sub').textContent = v.subline
-    || 'Enter the OTP the government portal sent to your phone.';
+
+  // First time the OTP screen appears for THIS job? Reset our tracker.
+  if (otpScreenShownForJob !== currentJobId) {
+    otpScreenShownForJob = currentJobId;
+    otpReshowCount = 0;
+  }
+  const isReshow = !alreadyOnScreen && lastSubmittedOtp && otpReshowCount > 0;
+
+  let sub = v.subline || 'Enter the OTP the government portal sent to your phone.';
+  // If the backend already classified the prompt as expired/invalid, keep its
+  // wording. Otherwise, if this is a re-show after a submission, add an
+  // explicit reject banner so the customer understands why they're back.
+  const lowerSub = sub.toLowerCase();
+  const backendAlreadyExplicit = (
+    lowerSub.includes('previous otp expired') ||
+    lowerSub.includes('did not accept the previous otp') ||
+    lowerSub.includes('check the otp')
+  );
+  if (isReshow && !backendAlreadyExplicit) {
+    sub = "We submitted your previous code but the portal didn't accept it. "
+        + "Re-enter the latest OTP, or tap \"Didn't get it?\" to request a fresh one.";
+    const reshowBanner = document.getElementById('otp-reshow-banner');
+    if (reshowBanner) {
+      reshowBanner.classList.remove('hidden');
+      reshowBanner.textContent = `Attempt ${otpReshowCount + 1} — previous code was rejected.`;
+    }
+  } else {
+    const reshowBanner = document.getElementById('otp-reshow-banner');
+    if (reshowBanner) reshowBanner.classList.add('hidden');
+  }
+  document.getElementById('otp-sub').textContent = sub;
+
   show('screen-otp');
   wireOTPInputs();
   // Only clear + focus on FIRST entry. If polling re-fires while the customer
@@ -1444,9 +1551,13 @@ async function submitOTP() {
   if (otp.length !== 6) return alert('Please enter all 6 digits.');
   const btn = document.getElementById('otp-btn');
   otpSubmitInFlight = true;
+  lastSubmittedOtp = otp;
+  otpReshowCount += 1;
   btn.disabled = true; btn.textContent = 'Submitting…';
   const otpSub = document.getElementById('otp-sub');
   if (otpSub) otpSub.textContent = 'Verifying OTP on the government portal. Please wait...';
+  const reshowBanner = document.getElementById('otp-reshow-banner');
+  if (reshowBanner) reshowBanner.classList.add('hidden');
   let res = null;
   try {
     res = await fetch(`${API}/jobs/${currentJobId}/otp`, {
@@ -1699,6 +1810,57 @@ function formatEventTime(iso) {
   if (!iso) return '';
   const d = new Date(iso);
   return isNaN(d.getTime()) ? iso : d.toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' });
+}
+
+// ─── On page load: try to restore the customer's previous session ──────────
+function rehydrateCustomerSession() {
+  const snap = loadCustomerSession();
+  if (!snap) return;
+  // Restore form fields silently so the customer can re-review without
+  // re-typing.
+  if (snap.form) {
+    const set = (id, val) => { const el = document.getElementById(id); if (el && val) el.value = val; };
+    set('dl_raw', snap.form.dl_raw);
+    set('dob', snap.form.dob);
+    set('mobile', snap.form.mobile);
+    set('name', snap.form.name);
+    set('pin_code', snap.form.pin_code);
+  }
+  dlNormalised = snap.dlNormalised || '';
+  dlImagePath = snap.dlImagePath || '';
+  extractedSnapshot = snap.extractedSnapshot || {};
+  ocrConfidence = snap.ocrConfidence || 0;
+  if (typeof snap.manualStateCode === 'string') manualStateCode = snap.manualStateCode;
+  // If the snapshot has a job id, the customer was already on the live
+  // screen — drop them straight back there and resume polling, instead of
+  // forcing them to walk through the form again. The agent kept running
+  // server-side; we just lost the UI session.
+  if (snap.currentJobId) {
+    currentJobId = snap.currentJobId;
+    show('screen-4');
+    resetActivity();
+    setLive({ phase: 'connecting', headline: 'Reconnecting to your application', subline: 'Picking up where we left off…' });
+    startPolling();
+  }
+}
+
+// Persist whenever the customer edits the form so a reload mid-step doesn't
+// lose what they typed.
+function _attachSessionPersistInputs() {
+  ['dl_raw', 'dob', 'mobile', 'name', 'pin_code'].forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener('input', () => persistCustomerSession());
+  });
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', () => {
+    _attachSessionPersistInputs();
+    rehydrateCustomerSession();
+  });
+} else {
+  _attachSessionPersistInputs();
+  rehydrateCustomerSession();
 }
 </script>
 </body>
