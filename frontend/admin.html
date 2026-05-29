@@ -16,6 +16,7 @@
       --line-2:    #cfd6e3;
       --primary:   #0e62d8;
       --primary-d: #0b4ca8;
+      --accent:    var(--primary);
       --success:   #126a2f;
       --success-bg:#eaf7ef;
       --warn:      #7a5300;
@@ -118,10 +119,11 @@
     }
     .drawer-backdrop.on { display: block; }
     .drawer {
-      position: fixed; top: 0; right: 0; width: min(720px, 100%); height: 100vh;
+      position: fixed; top: 0; right: auto; left: max(0px, calc(100vw - 720px));
+      width: min(720px, 100vw); height: 100vh;
       background: #fff; box-shadow: -8px 0 24px rgba(15, 24, 48, 0.18);
       transform: translateX(100%); transition: transform 0.18s ease;
-      z-index: 51; overflow: auto;
+      z-index: 51; overflow: auto; overflow-x: hidden;
     }
     .drawer.on { transform: translateX(0); }
     .drawer header {
@@ -129,6 +131,7 @@
       padding: 14px 18px; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: #fff;
     }
     .drawer .body { padding: 18px; }
+    .drawer input, .drawer select, .drawer textarea { width: 100%; max-width: 100%; }
     .drawer h2 { margin: 0 0 4px; font-size: 18px; }
     .drawer .label { font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
     .kv { display: grid; grid-template-columns: 140px 1fr; gap: 6px 12px; font-size: 14px; }
@@ -598,8 +601,12 @@ async function openCustomer(cid) {
 }
 
 function showDrawer() {
+  const drawer = document.getElementById('drawer');
+  const width = Math.min(720, window.innerWidth);
+  drawer.style.width = `${width}px`;
+  drawer.style.left = `${Math.max(0, window.innerWidth - width)}px`;
   document.getElementById('backdrop').classList.add('on');
-  document.getElementById('drawer').classList.add('on');
+  drawer.classList.add('on');
 }
 function closeDrawer() {
   document.getElementById('backdrop').classList.remove('on');

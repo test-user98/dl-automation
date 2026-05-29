@@ -16,6 +16,7 @@
       --line-2:   #cfd6e3;
       --primary:  #0e62d8;
       --primary-d:#0b4ca8;
+      --accent:   var(--primary);
       --success:  #126a2f;
       --success-bg:#eaf7ef;
       --warn:     #7a5300;
@@ -297,7 +298,7 @@
 
       <div class="field">
         <label>Present address PIN code</label>
-        <input id="pin_code" placeholder="6-digit PIN" maxlength="6" inputmode="numeric" />
+        <input id="pin_code" placeholder="6-digit PIN" maxlength="6" inputmode="numeric" oninput="renderReview()" />
       </div>
 
       <h2 style="margin-top: 24px">Review before we start</h2>

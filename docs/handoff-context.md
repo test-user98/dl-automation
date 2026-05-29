@@ -2,7 +2,7 @@
 
 Repo: `C:\Users\yashs\OneDrive\Desktop\token26`
 Remote: `https://github.com/test-user98/dl-automation.git`
-Current local checkpoint commit: latest local `HEAD` (`Improve bidirectional customer progress bridge`)
+Current local checkpoint commit: latest local `HEAD` (`Add browser smoke test and fix UI regressions`)
 Previous checkpoint: `674096e` (deploy pipeline), `fc15a82` (customer onboarding + status layer), `52c2100` (agent hardening)
 
 Do not push without explicit user approval. The user wants local proof before
@@ -510,3 +510,50 @@ Current verification boundary:
   reach service selection, and `CHANGE OF DATE OF BIRTH IN DL` was rejected by
   Sarathi for `DTO, LONGDING`; that rejection is now treated as a terminal,
   customer-safe service/RTO eligibility message.
+
+## Latest Browser/UI Smoke Verification
+
+Current local checkpoint: `Add browser smoke test and fix UI regressions`.
+
+Added `scripts/browser_smoke.py`, a repeatable Chromium smoke test that:
+
+- loads the real customer UI from local FastAPI;
+- mocks only `/onboard/confirm-and-start` and `/jobs/smoke-job*` so it does
+  not start live Sarathi automation;
+- uses the real backend for `/onboard/validate-dl`, `/lookup`, `/admin/summary`,
+  `/admin/applications`, and `/admin/applications/{id}`;
+- captures console warnings/errors, failed requests, 4xx/5xx API responses,
+  API call durations, screenshots, and simple layout overflow issues;
+- exercises customer flow:
+  landing -> details -> review -> mocked start -> OTP -> service-selection
+  human request -> acknowledgement done;
+- exercises customer tracking lookup with seeded phone `9876512345`;
+- exercises operator dashboard sign-in, summary, applications table, and app
+  drawer.
+
+UI fixes from this browser pass:
+
+- Customer review now updates the PIN row when the customer enters the PIN
+  instead of showing `PIN code: -`.
+- Timeline dot color now has `--accent` defined in both customer and admin UI.
+- Admin drawer inputs/selects/textareas are constrained to drawer width.
+- Admin drawer positioning is stabilized against horizontally scrollable
+  tables, and the smoke test waits for the drawer slide animation before
+  measuring layout.
+
+Validated locally:
+
+- `python scripts/browser_smoke.py --base http://127.0.0.1:8000 --secret dev-secret-change-in-prod`
+  -> `ok: true`
+- Browser smoke observed:
+  - console issues: `[]`
+  - failed requests: `[]`
+  - bad responses: `[]`
+  - layout issues: `[]`
+  - acknowledgement screen: `SMOKE-ACK-123`
+  - admin rows: `8`
+- `python -m py_compile scripts/browser_smoke.py`
+- `python -m pytest -q` -> 51 passed.
+
+Screenshots are written to `data/browser_smoke/*.png` during the run and are
+not committed.
