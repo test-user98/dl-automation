@@ -299,6 +299,8 @@ def _title_for_customer_request(request: dict) -> str:
     step_name = request.get("step_name", "")
     if action_type == "service_selection" or step_name == "service_selection":
         return "Choose a DL service"
+    if action_type == "confirmation":
+        return "Please review and confirm"
     if action_type == "choice" or request.get("options"):
         return "Choose an option"
     return "We need one detail"

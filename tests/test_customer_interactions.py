@@ -31,6 +31,7 @@ def test_customer_view_exposes_service_selection_options():
     assert view["action_type"] == "service_selection"
     assert view["headline"] == "Choose a DL service"
     assert view["customer_request"]["options"] == ["CHANGE OF ADDRESS IN DL", "DL EXTRACT"]
+    assert view["customer_request"]["context"] == "Select the DL service you need."
 
 
 def test_customer_view_exposes_text_question():
@@ -49,6 +50,24 @@ def test_customer_view_exposes_text_question():
     assert view["action_type"] == "text"
     assert view["subline"] == "Why do you want to change the DOB?"
     assert view["customer_request"]["question"] == "Why do you want to change the DOB?"
+
+
+def test_customer_view_exposes_confirmation_request():
+    job = _job(JobStatus.STUCK_HUMAN_NEEDED)
+    job.customer_data["_pending_customer_request"] = {
+        "step_name": "confirm_details",
+        "question": "Please verify these details are correct.",
+        "context": "Name: Test User\nDOB: 04-09-1998\nDL: RJ07...",
+        "options": ["Yes, details are correct"],
+        "action_type": "confirmation",
+    }
+
+    view = customer_job_view(job)
+
+    assert view["action_required"] is True
+    assert view["action_type"] == "confirmation"
+    assert view["headline"] == "Please review and confirm"
+    assert "Name: Test User" in view["customer_request"]["context"]
 
 
 def test_customer_view_maps_service_rto_rejection_as_terminal_message():

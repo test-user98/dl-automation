@@ -50,6 +50,14 @@ def test_admin_requires_secret(client):
     assert r.status_code == 401
 
 
+def test_job_stream_requires_secret(client):
+    assert client.get("/jobs/no-such-job/stream?secret=wrong").status_code == 401
+    import api.server
+    ok = client.get(f"/jobs/no-such-job/stream?secret={api.server.settings.api_secret_key}")
+    assert ok.status_code == 200
+    assert "job not found" in ok.text
+
+
 def test_seed_populated(client):
     r = client.get("/admin/summary", headers=_hdr(client))
     assert r.status_code == 200

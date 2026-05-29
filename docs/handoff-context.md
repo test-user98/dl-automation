@@ -2,7 +2,7 @@
 
 Repo: `C:\Users\yashs\OneDrive\Desktop\token26`
 Remote: `https://github.com/test-user98/dl-automation.git`
-Current local checkpoint commit: latest local `HEAD` (`Add customer timeline and operator status bridge`)
+Current local checkpoint commit: latest local `HEAD` (`Improve bidirectional customer progress bridge`)
 Previous checkpoint: `674096e` (deploy pipeline), `fc15a82` (customer onboarding + status layer), `52c2100` (agent hardening)
 
 Do not push without explicit user approval. The user wants local proof before
@@ -422,6 +422,7 @@ The customer app is now a two-way bridge between Sarathi and the user:
   `customer_view.customer_request` and sets `action_required/action_type`.
 - Frontend renders:
   - `action_type="otp"` as the OTP screen;
+  - `confirmation` as a review/consent style prompt with context and options;
   - `service_selection` / `choice` / `text` as the human-needed screen;
   - option buttons for Sarathi choices like available DL services;
   - free text for missing details like DOB-change reason.
@@ -438,3 +439,19 @@ Validated edge cases:
 - Portal-down / 5xx messages map to retrying with a calm customer message.
 - RTO/service ineligibility maps to a terminal, non-retryable friendly
   message instead of a loop.
+- Live customer status now uses `/jobs/{job_id}/stream?secret=...` via
+  `EventSource`, with polling fallback. The UI shows `last_step_label` as a
+  customer-safe "Latest update" so the customer can see progress during the
+  1-2 minute Sarathi automation wait.
+- Human-needed UI now renders `customer_request.context` in a compact context
+  box. This is where the agent can show refined portal details for customer
+  confirmation, e.g. extracted DL holder name/DOB/RTO/service before moving on.
+
+Latest validation for this contract:
+
+- `python -m py_compile api/server.py api/status_messages.py agent/human_loop.py`
+- `python -m pytest` → 39 passed.
+- Local browser smoke against `127.0.0.1:8000`: live status rendered
+  `Latest update: Looking up your DL on the portal`; confirmation request
+  rendered `Name/DOB/DL` context and posted `Yes, details are correct` to
+  `/human-response`.

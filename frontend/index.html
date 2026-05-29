@@ -162,6 +162,7 @@
     @keyframes sp { to { transform: rotate(360deg); } }
     .live-title { font-size: 17px; font-weight: 700; }
     .live-sub   { color: var(--muted); font-size: 14px; margin-top: 4px; }
+    .live-meta  { color: var(--muted); font-size: 12px; margin-top: 8px; }
     .phase-track {
       display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px;
       margin-top: 16px;
@@ -191,6 +192,17 @@
       border: 1px solid var(--line);
     }
     .option-list button:hover { border-color: var(--primary); background: #eef5ff; }
+    .context-box {
+      border: 1px solid var(--line);
+      background: #f7f9fc;
+      border-radius: 10px;
+      padding: 12px;
+      color: var(--ink-2);
+      font-size: 13px;
+      line-height: 1.45;
+      margin-top: 12px;
+      white-space: pre-wrap;
+    }
 
     .footnote { color: var(--muted); font-size: 12px; line-height: 1.5; margin-top: 14px; }
     a { color: var(--primary); }
@@ -309,6 +321,7 @@
         <div>
           <div class="live-title" id="live-title">Starting your application</div>
           <div class="live-sub"   id="live-sub">Connecting to the government portal…</div>
+          <div class="live-meta"  id="live-meta">Live updates will appear here.</div>
         </div>
       </div>
 
@@ -354,6 +367,7 @@
     <section id="screen-human" class="card hidden">
       <h2 id="human-title">We need one detail</h2>
       <p class="sub" id="human-sub">The agent needs your input to continue.</p>
+      <div class="context-box hidden" id="human-context"></div>
 
       <div class="option-list hidden" id="human-options"></div>
 
@@ -384,6 +398,7 @@ const API    = window.location.origin;
 const SECRET = 'dev-secret-change-in-prod';   // must equal API_SECRET_KEY env
 let currentJobId = null;
 let pollTimer = null;
+let liveStream = null;
 let dlNormalised = '';
 let lastSubline = '';
 let dlImageUploaded = false;
@@ -579,9 +594,35 @@ function inlineAlert(msg) {
 
 // ─── Step 4: live polling ──────────────────────────────────────────────────
 function startPolling() {
-  clearInterval(pollTimer);
-  pollTimer = setInterval(poll, 2500);
+  stopLiveUpdates();
+  if (window.EventSource && currentJobId) {
+    liveStream = new EventSource(`${API}/jobs/${currentJobId}/stream?secret=${encodeURIComponent(SECRET)}`);
+    liveStream.onmessage = (event) => {
+      try {
+        const payload = JSON.parse(event.data);
+        if (!payload.error) applyJob(payload);
+      } catch (e) {
+        console.warn('Bad stream payload', e);
+      }
+    };
+    liveStream.onerror = () => {
+      if (liveStream) liveStream.close();
+      liveStream = null;
+      if (!pollTimer) pollTimer = setInterval(poll, 2500);
+    };
+  } else {
+    pollTimer = setInterval(poll, 2500);
+  }
   poll();
+}
+
+function stopLiveUpdates() {
+  clearInterval(pollTimer);
+  pollTimer = null;
+  if (liveStream) {
+    liveStream.close();
+    liveStream = null;
+  }
 }
 
 async function poll() {
@@ -599,19 +640,19 @@ function applyJob(r) {
   setLive(v);
 
   if (v.action_type === 'otp' || r.status === 'WAITING_OTP') {
-    clearInterval(pollTimer);
+    stopLiveUpdates();
     showOTP(v);
   } else if ((v.action_required && v.action_type !== 'otp') || r.status === 'STUCK_HUMAN_NEEDED') {
-    clearInterval(pollTimer);
+    stopLiveUpdates();
     showHumanRequest(v);
   } else if (r.status === 'SUBMITTED' || r.status === 'COMPLETED') {
-    clearInterval(pollTimer);
+    stopLiveUpdates();
     document.getElementById('app-number').textContent = r.application_number
       ? `Acknowledgement number: ${r.application_number}`
       : 'Your application was submitted on the portal.';
     show('screen-done');
   } else if (r.status === 'FAILED') {
-    clearInterval(pollTimer);
+    stopLiveUpdates();
     const b = document.getElementById('live-banner');
     b.className = 'banner err'; b.classList.remove('hidden');
     b.innerHTML = `${escapeHtml(v.subline || 'Something went wrong.')}
@@ -629,6 +670,11 @@ function setLive(v) {
     document.getElementById('live-sub').textContent = sub;
     lastSubline = sub;
   }
+  const meta = document.getElementById('live-meta');
+  const label = v.last_step_label || '';
+  meta.textContent = label
+    ? `Latest update: ${label}`
+    : 'The agent is working in the government portal.';
 
   const spin = document.getElementById('spin');
   spin.className = 'spin';
@@ -735,7 +781,7 @@ function resendOTP() {
 async function retryWithSameData() {
   // Restart agent with the same payload — keep all entered details, just submit again.
   currentJobId = null;
-  clearInterval(pollTimer);
+  stopLiveUpdates();
   document.getElementById('live-banner').classList.add('hidden');
   await startJob();
 }
@@ -761,6 +807,11 @@ function showHumanRequest(v) {
   document.getElementById('human-title').textContent = title;
   document.getElementById('human-sub').textContent = question;
   document.getElementById('human-answer').value = '';
+
+  const contextBox = document.getElementById('human-context');
+  const context = (req.context || '').trim();
+  contextBox.textContent = context;
+  contextBox.classList.toggle('hidden', !context);
 
   const optionsBox = document.getElementById('human-options');
   const options = Array.isArray(req.options) ? req.options : [];

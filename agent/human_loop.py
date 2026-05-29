@@ -100,10 +100,12 @@ class HumanLoop:
             options       = options or [],
         )
 
-        action_type = "otp" if (
-            "otp" in question.lower() or "otp" in step_name.lower()
-        ) else (
+        qlower = f"{step_name} {question} {context}".lower()
+        action_type = "otp" if "otp" in qlower else (
             "service_selection" if step_name == "service_selection" else
+            "confirmation" if any(
+                term in qlower for term in ("confirm", "verify", "correct", "consent", "review")
+            ) else
             "choice" if options else
             "text"
         )

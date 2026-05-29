@@ -15,7 +15,7 @@ import json
 from typing import Optional
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Header
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Header, Query
 from fastapi.responses import StreamingResponse, FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -194,11 +194,18 @@ async def submit_human_response(job_id: str, body: HumanResponse):
 # ── SSE status stream ──────────────────────────────────────────────────────────
 
 @app.get("/jobs/{job_id}/stream")
-async def stream_job_status(job_id: str):
+async def stream_job_status(
+    job_id: str,
+    secret: str = Query("", min_length=0),
+    x_secret: str = Header(None),
+):
     """
     Server-sent events stream — client subscribes and gets live updates.
     The customer app uses this to show real-time step progress.
     """
+    if (x_secret or secret) != settings.api_secret_key:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
     async def event_generator():
         last_step_count = 0
         last_status = None
