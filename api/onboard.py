@@ -272,7 +272,7 @@ async def confirm_and_start(req: ConfirmAndStartRequest):
             "mobile":  req.mobile_number,
             "dl":      _normalizer.format_for_display(dl_result["normalized"]),
             "dob":     req.dob,
-            "state":   dl_result["state_name"],
+            "state":   selected_state_name,
         },
         "message": "Your application has started. We'll notify you when we need your OTP.",
     }

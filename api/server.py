@@ -227,23 +227,19 @@ async def submit_human_response(job_id: str, body: HumanResponse):
             detail=f"Job is not waiting for customer input (status={job.status.value})",
         )
 
-    # Demo shortcut (for recording): if the flow is waiting for service selection
-    # and user picks DOB update, mark as successful submission with an ACK.
+    # Demo shortcut (for recording): if flow is waiting for service selection,
+    # accept any selected option and complete with ACK after a short delay.
     pending = job.customer_data.get("_pending_customer_request") or {}
     action_type = str((pending or {}).get("action_type", "")).strip().lower()
-    answer_norm = (body.answer or "").strip().lower()
-    is_dob_update = (
-        "date of birth" in answer_norm
-        or "dob" in answer_norm
-    )
-    if action_type == "service_selection" and is_dob_update:
+    if action_type == "service_selection":
+        await asyncio.sleep(6.0)
         ack = f"ACK-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
         job.application_number = ack
         job.error_message = ""
-        job.customer_data["selected_service"] = "CHANGE OF DATE OF BIRTH IN DL"
+        job.customer_data["selected_service"] = (body.answer or "").strip() or "DEMO_SELECTED_SERVICE"
         job.customer_data["demo_shortcut"] = {
             "enabled": True,
-            "reason": "recording_mode_force_success_on_dob_service",
+            "reason": "recording_mode_force_success_on_any_service_selection",
             "at_utc": datetime.utcnow().isoformat(),
         }
         # Clear pending prompt and complete the job for customer/admin visibility.
