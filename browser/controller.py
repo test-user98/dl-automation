@@ -16,6 +16,7 @@ import asyncio
 import base64
 import json
 import structlog
+from pathlib import Path
 from typing import Optional
 from playwright.async_api import (
     async_playwright,
@@ -51,23 +52,38 @@ class BrowserController:
         self._page: Optional[Page]                 = None
         self._popup_page: Optional[Page]           = None  # payment popup
         self._allow_destructive: bool              = False
+        self._last_dialog_message: str             = ""    # last alert/confirm text
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
     async def start(self, saved_cookies: list[dict] = None):
         self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(
-            headless=settings.browser_headless,
-            slow_mo=settings.browser_slow_mo_ms,
-            args=["--disable-blink-features=AutomationControlled"],
-        )
+        try:
+            self._browser = await self._playwright.chromium.launch(
+                headless=settings.browser_headless,
+                slow_mo=settings.browser_slow_mo_ms,
+                channel=settings.browser_channel or None,
+                args=["--start-maximized"],
+            )
+        except Exception as e:
+            log.warning(
+                "browser.channel_launch_failed_falling_back",
+                channel=settings.browser_channel,
+                error=str(e),
+            )
+            self._browser = await self._playwright.chromium.launch(
+                headless=settings.browser_headless,
+                slow_mo=settings.browser_slow_mo_ms,
+                args=["--start-maximized"],
+            )
         self._context = await self._browser.new_context(
             viewport={
                 "width":  settings.browser_viewport_width,
                 "height": settings.browser_viewport_height,
             },
-            user_agent=settings.browser_user_agent,
             accept_downloads=True,
+            locale=settings.browser_locale,
+            timezone_id=settings.browser_timezone_id,
             # Pre-grant browser-level permissions so no dialog ever blocks the agent.
             # Sarathi requests camera for photo capture — we handle that via file upload.
             permissions=["camera", "microphone", "notifications"],
@@ -97,9 +113,25 @@ class BrowserController:
     # ── Core actions ───────────────────────────────────────────────────────────
 
     async def goto(self, url: str):
-        await self._page.goto(url, timeout=settings.browser_timeout_ms, wait_until="domcontentloaded")
-        await self._page.wait_for_load_state("networkidle", timeout=10000)
-        log.debug("browser.goto", url=url)
+        last_error = None
+        for attempt in range(1, 4):
+            try:
+                await self._page.goto(
+                    url,
+                    timeout=settings.browser_timeout_ms,
+                    wait_until="domcontentloaded",
+                )
+                try:
+                    await self._page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    log.info("browser.goto_networkidle_timeout", url=url, attempt=attempt)
+                log.debug("browser.goto", url=url, attempt=attempt)
+                return
+            except Exception as e:
+                last_error = e
+                log.warning("browser.goto_failed", url=url, attempt=attempt, error=str(e))
+                await asyncio.sleep(2 * attempt)
+        raise last_error
 
     async def screenshot(self) -> bytes:
         return await self._page.screenshot(type="png", full_page=False)
@@ -196,6 +228,20 @@ class BrowserController:
             log.warning("browser.fill_failed", selector=selector, error=str(e))
             return False
 
+    async def ensure_checked(self, selector: str, checked: bool = True) -> bool:
+        """Ensure a checkbox/radio is in the desired state."""
+        try:
+            el = self._page.locator(selector).first
+            if checked:
+                await el.check(timeout=5000)
+            else:
+                await el.uncheck(timeout=5000)
+            await self._wait_stable()
+            return True
+        except Exception as e:
+            log.warning("browser.check_failed", selector=selector, checked=checked, error=str(e))
+            return False
+
     # ── Select ─────────────────────────────────────────────────────────────────
 
     async def select_option(self, selector: str, value: str = "", label: str = "") -> bool:
@@ -220,6 +266,21 @@ class BrowserController:
             return False
 
     # ── Scroll ────────────────────────────────────────────────────────────────
+
+    async def press_key(self, key: str) -> None:
+        """Press a keyboard key on the current page."""
+        try:
+            await self._page.keyboard.press(key)
+        except Exception as e:
+            log.warning("browser.press_key_failed", key=key, error=str(e))
+
+    async def evaluate(self, script: str):
+        """Run a JS expression and return the result."""
+        try:
+            return await self._page.evaluate(script)
+        except Exception as e:
+            log.warning("browser.evaluate_failed", error=str(e))
+            return None
 
     async def scroll_to_bottom(self):
         await self._page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
@@ -274,8 +335,15 @@ class BrowserController:
 
     # ── JS Dialog handling ────────────────────────────────────────────────────
 
+    async def get_last_dialog_message(self) -> str:
+        """Consume and return the last alert/confirm message shown by the page."""
+        msg = self._last_dialog_message
+        self._last_dialog_message = ""
+        return msg
+
     async def _handle_dialog(self, dialog: Dialog):
         msg = dialog.message
+        self._last_dialog_message = msg  # expose to brain so it can treat as failure
         log.info("browser.dialog", type=dialog.type, message=msg[:100])
         # Never dismiss — always accept (OK / Confirm)
         # Exception: if the dialog says "cancel application" or "reset"
@@ -289,6 +357,11 @@ class BrowserController:
 
     async def save_cookies(self) -> list[dict]:
         return await self._context.cookies()
+
+    async def get_session_cookies_dict(self) -> dict[str, str]:
+        """Return current session cookies as a name→value dict for httpx requests."""
+        cookies = await self._context.cookies()
+        return {c["name"]: c["value"] for c in cookies}
 
     async def close_popups_on_page(self) -> bool:
         """
@@ -360,11 +433,11 @@ class BrowserController:
 
     # ── CAPTCHA crop ──────────────────────────────────────────────────────────
 
-    async def crop_element_screenshot(self, selector: str) -> Optional[bytes]:
+    async def crop_element_screenshot(self, selector: str, timeout_ms: int = 5000) -> Optional[bytes]:
         """Return a screenshot cropped to a specific element (e.g. CAPTCHA image)."""
         try:
             el = self._page.locator(selector).first
-            return await el.screenshot()
+            return await el.screenshot(timeout=timeout_ms)
         except Exception:
             return None
 
@@ -382,31 +455,41 @@ class BrowserController:
                 // <select> elements
                 document.querySelectorAll('select').forEach(el => {
                     const opts = Array.from(el.options).map(o => ({v: o.value, t: o.text.trim()})).slice(0, 30);
+                    const selected = el.selectedOptions && el.selectedOptions.length
+                        ? el.selectedOptions[0]
+                        : null;
                     out.selects.push({
                         id: el.id, name: el.name,
                         selector: el.id ? '#' + el.id : (el.name ? 'select[name="' + el.name + '"]' : 'select'),
                         options: opts,
-                        visible: el.offsetParent !== null
+                        visible: el.offsetParent !== null,
+                        disabled: el.disabled,
+                        value: el.value,
+                        selected_text: selected ? selected.text.trim() : ''
                     });
                 });
 
-                // <input> elements (not hidden)
+                // <input> elements (not hidden) — include disabled and visible flags
                 document.querySelectorAll('input:not([type="hidden"])').forEach(el => {
                     out.inputs.push({
                         id: el.id, name: el.name, type: el.type,
                         placeholder: el.placeholder,
                         selector: el.id ? '#' + el.id : (el.name ? 'input[name="' + el.name + '"]' : 'input[type="' + el.type + '"]'),
-                        visible: el.offsetParent !== null
+                        visible: el.offsetParent !== null,
+                        disabled: el.disabled,
+                        value: el.type === 'password' ? '' : el.value,
+                        checked: !!el.checked
                     });
                 });
 
-                // Buttons
+                // Buttons — include disabled state so agent knows not to click disabled ones
                 document.querySelectorAll('button, input[type="submit"], input[type="button"]').forEach(el => {
                     const txt = (el.innerText || el.value || '').trim();
                     if (txt) out.buttons.push({
                         text: txt, id: el.id,
                         selector: el.id ? '#' + el.id : ('button:has-text("' + txt.substring(0,40) + '")'),
-                        visible: el.offsetParent !== null
+                        visible: el.offsetParent !== null,
+                        disabled: el.disabled || el.hasAttribute('disabled')
                     });
                 });
 
@@ -439,10 +522,12 @@ class BrowserController:
             return {}
 
     async def click_by_js(self, selector: str) -> bool:
-        """Click via JavaScript — useful when Playwright locator times out."""
+        """Click via JavaScript — useful when Playwright locator times out. Refuses disabled elements."""
         try:
+            # Use json.dumps so quotes inside the selector are safely escaped.
+            selector_js = json.dumps(selector)
             clicked = await self._page.evaluate(
-                f"() => {{ const el = document.querySelector('{selector}'); if(el){{el.click(); return true;}} return false; }}"
+                f"() => {{ const el = document.querySelector({selector_js}); if(el && !el.disabled){{el.click(); return true;}} return false; }}"
             )
             if clicked:
                 await self._wait_stable()

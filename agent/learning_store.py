@@ -132,6 +132,87 @@ class LearningStore:
             )
             await db.commit()
 
+    async def record_successful_action(
+        self,
+        step_name: str,
+        observation: str,
+        page_url: str,
+        action_type: str,
+        selector: str = "",
+        text: str = "",
+        value: str = "",
+        tool_args: dict | None = None,
+    ):
+        """
+        Store a concrete action that worked on a page.
+
+        This is the "fifth attempt worked, try it first next time" memory.
+        The id is based on the step, page and action shape so repeated wins
+        reinforce the same scenario instead of creating many near-duplicates.
+        """
+        await self._ensure_db()
+        action_key = json.dumps(
+            {
+                "step": step_name,
+                "url": page_url.split("?")[0],
+                "action_type": action_type,
+                "selector": selector,
+                "text": text,
+                "value": value,
+                "tool_args": tool_args or {},
+            },
+            sort_keys=True,
+        )
+        sid = self.make_scenario_id(step_name, f"WORKED:{action_key}")
+        detail = {
+            "action_type": action_type,
+            "selector": selector,
+            "text": text,
+            "value": value,
+            "tool_args": tool_args or {},
+        }
+        async with aiosqlite.connect(self._db_path) as db:
+            async with db.execute(
+                "SELECT scenario_id FROM scenarios WHERE scenario_id = ?", (sid,)
+            ) as cur:
+                exists = await cur.fetchone()
+
+            if exists:
+                await db.execute(
+                    "UPDATE scenarios SET success_count = success_count + 1, "
+                    "description = ?, solution = ?, solution_detail = ?, updated_at = ? "
+                    "WHERE scenario_id = ?",
+                    (
+                        observation[:1000],
+                        f"Reuse worked action: {action_type} selector={selector} text={text}",
+                        json.dumps(detail),
+                        _now(),
+                        sid,
+                    ),
+                )
+            else:
+                await db.execute(
+                    """INSERT INTO scenarios
+                       (scenario_id, step_name, description, page_url, solution,
+                        solution_detail, human_provided, success_count, fail_count,
+                        created_at, updated_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        sid,
+                        step_name,
+                        observation[:1000],
+                        page_url,
+                        f"Reuse worked action: {action_type} selector={selector} text={text}",
+                        json.dumps(detail),
+                        0,
+                        1,
+                        0,
+                        _now(),
+                        _now(),
+                    ),
+                )
+            await db.commit()
+
     async def mark_solution_outcome(self, scenario_id: str, worked: bool):
         """Track whether a recalled solution actually worked this time."""
         await self._ensure_db()
@@ -158,7 +239,11 @@ class LearningStore:
 
         async with aiosqlite.connect(self._db_path) as db:
             async with db.execute(
-                "SELECT * FROM scenarios WHERE step_name = ? ORDER BY success_count DESC",
+                """SELECT * FROM scenarios
+                   WHERE step_name = ?
+                     AND success_count > fail_count
+                     AND solution NOT LIKE 'DO NOT use:%'
+                   ORDER BY success_count DESC""",
                 (step_name,),
             ) as cursor:
                 rows = await cursor.fetchall()
@@ -167,7 +252,9 @@ class LearningStore:
                     d = dict(zip(cols, row))
                     d["solution_detail"] = json.loads(d["solution_detail"])
                     d["human_provided"]  = bool(d["human_provided"])
-                    candidates.append(Scenario.from_dict(d))
+                    scenario = Scenario.from_dict(d)
+                    if self._is_recallable_solution(scenario):
+                        candidates.append(scenario)
 
         if not candidates:
             return None
@@ -179,13 +266,44 @@ class LearningStore:
         for c in candidates:
             score = self._similarity(observation, c.description)
             if page_url and c.page_url and c.page_url in page_url:
-                score += 0.05   # small URL-match bonus
+                score += 0.10   # small URL-match bonus; same Sarathi URL hosts many different states
+            if c.success_count:
+                score += min(c.success_count, 5) * 0.02
             if score > best_score:
                 best_score = score
                 best = c
 
         threshold = settings.scenario_similarity_threshold
         return best if best_score >= threshold else None
+
+    @staticmethod
+    def _is_recallable_solution(scenario: Scenario) -> bool:
+        """
+        Guardrail for self-learning.
+
+        The store may contain historical "worked" actions from loops. Do not
+        recall generic no-progress actions or navigation that exits the current
+        application flow.
+        """
+        detail = scenario.solution_detail or {}
+        action_type = (detail.get("action_type") or "").lower()
+        text = (detail.get("text") or "").strip().lower()
+        selector = (detail.get("selector") or "").strip().lower()
+
+        if scenario.solution.startswith("Reuse worked action:"):
+            if action_type in {"fill_many", "tool_call", "scroll", "wait"}:
+                return False
+            if action_type == "click" and text in {
+                "change state",
+                "dashboard",
+                "home",
+                "login",
+            }:
+                return False
+            if selector in {"#change_state", "#dashboard", "#home"}:
+                return False
+
+        return True
 
     @staticmethod
     def _similarity(a: str, b: str) -> float:

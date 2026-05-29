@@ -173,6 +173,29 @@ DL_RENEWAL_STEPS: list[FlowStep] = [
         ],
     ),
     FlowStep(
+        name="service_selection",
+        description="Select the DL service from options shown after OTP (Renewal, Extract, etc.)",
+        required_data=[],
+        documents_to_upload=[],
+        is_conditional=True,
+        condition_description="Shown after OTP verification — user picks which DL service they need",
+        known_obstacles=[
+            "DL Renewal is only available if DL expires within 365 days",
+            "page may show checkboxes or radio buttons for service choice",
+        ],
+    ),
+    FlowStep(
+        name="service_form_fill",
+        description="Fill the selected service form — reason dropdown, organ donation, CAPTCHA",
+        required_data=[],
+        documents_to_upload=[],
+        known_obstacles=[
+            "reason for extract/duplicate — must ask user, agent cannot decide",
+            "organ donation checkbox — ask user with 5-second timeout, default NO",
+            "success popup shows ACK number — extract and save",
+        ],
+    ),
+    FlowStep(
         name="fee_payment",
         description="Pay the renewal fee (₹200-500 depending on state) via UPI/card/netbanking",
         required_data=[],
@@ -243,6 +266,8 @@ CUSTOMER_STATUS_MESSAGES = {
     "upload_photo_signature":   "Uploading photo and signature...",
     "mobile_otp_verification":  "Waiting for your OTP...",
     "aadhaar_otp_verification":  "Waiting for your Aadhaar OTP...",
+    "service_selection":        "Waiting for your service selection...",
+    "service_form_fill":        "Filling service form...",
     "fee_payment":              "Processing fee payment...",
     "download_acknowledgment":  "Getting your application reference...",
 }

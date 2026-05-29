@@ -16,10 +16,19 @@ before ever asking a human.
 
 import json
 import asyncio
+import base64
 import structlog
 from typing import Optional
 
 from config.settings import get_settings
+from config.portal_rules import (
+    VERIFY_OTP_RULES,
+    GENERATE_OTP_RULES,
+    DL_FETCH_RULES,
+    DL_CONFIRM_RULES,
+    DL_SERVICES_LANDING_RULES,
+    record_discovery,
+)
 from agent.llm_client import get_llm_client
 from agent.state_manager import Job, JobStatus, StateManager, StepLog, FORBIDDEN_ACTIONS
 from agent.learning_store import LearningStore, Scenario
@@ -80,6 +89,12 @@ class AgentBrain:
         self._otp      = OTPRelay(state_manager)
         self._img_proc = ImageProcessor()
         self._llm      = get_llm_client()
+        self._last_deterministic_failure = ""
+        self._otp_sent: bool = False            # True once OTP API call succeeds
+        self._otp_reveal_attempts: int = 0     # prevent infinite reveal loops
+        self._generate_otp_attempts: int = 0   # deterministic retries before LLM fallback
+        self._cached_otp: str = ""             # OTP cached so retries don't re-ask user
+        self._otp_submit_attempts: int = 0     # retries with same OTP (max 3 before re-ask)
 
     # ── Main loop ──────────────────────────────────────────────────────────────
 
@@ -94,14 +109,31 @@ class AgentBrain:
         # knows what it already did and doesn't repeat the same fill/click
         step_action_history: list[str] = []
         last_step_name = ""
+        consecutive_scrolls = 0              # prevents infinite scroll loops
+        state_seen_counts: dict[str, int] = {}  # detects no-progress loops
 
         while step_count < settings.max_steps_per_job:
             step_count += 1
 
-            screenshot   = await self._browser.screenshot()
-            url          = await self._browser.current_url()
-            page_text    = await self._browser.page_text()
-            dom_elements = await self._browser.get_interactive_elements()
+            try:
+                screenshot   = await self._browser.screenshot()
+                url          = await self._browser.current_url()
+                page_text    = await self._browser.page_text()
+                dom_elements = await self._browser.get_interactive_elements()
+            except Exception as e:
+                job.error_message = f"Browser/page unavailable during observe: {e}"
+                job.step_logs.append(StepLog(
+                    step_name="observe",
+                    status="failed",
+                    observation="The browser page or context closed before the agent could observe it.",
+                    action_taken="observe_page",
+                    error=str(e),
+                ).to_dict())
+                await self._sm.save(job)
+                log.error("brain.observe_failed_page_unavailable", error=str(e))
+                break
+
+            await self._sync_steps_from_page(job, url, page_text, dom_elements)
 
             log.info(
                 "brain.observe",
@@ -123,10 +155,137 @@ class AgentBrain:
             current_step = next_step.name if next_step else "unknown"
             fails        = step_failures.get(current_step, 0)
 
+            otp_result = await self._maybe_handle_otp_page(
+                job=job,
+                current_step=current_step,
+                page_text=page_text,
+                dom_elements=dom_elements,
+                screenshot=screenshot,
+            )
+            if otp_result == "submitted":
+                step_failures.pop(current_step, None)
+                failure_context = ""
+                continue
+            if otp_result == "waiting":
+                break
+
+            generated_otp = await self._maybe_handle_generate_otp_page(
+                job=job,
+                current_step=current_step,
+                page_text=page_text,
+                dom_elements=dom_elements,
+            )
+            if generated_otp:
+                step_failures.pop(current_step, None)
+                failure_context = ""
+                continue
+
+            # ── Service selection (after OTP) ──────────────────────────────────
+            svc_selected = await self._maybe_handle_service_selection_page(
+                job=job,
+                current_step=current_step,
+                page_text=page_text,
+                dom_elements=dom_elements,
+                screenshot=screenshot,
+            )
+            if svc_selected:
+                step_failures.pop(current_step, None)
+                failure_context = ""
+                continue
+
+            # ── Service form (DL Extract / reason / organ donation / ACK) ──────
+            svc_form = await self._maybe_handle_service_form_page(
+                job=job,
+                current_step=current_step,
+                page_text=page_text,
+                dom_elements=dom_elements,
+                screenshot=screenshot,
+            )
+            if svc_form:
+                step_failures.pop(current_step, None)
+                failure_context = ""
+                continue
+
+
+            # ── DL services landing page (just click Continue) ─────────────────
+            services_landing = await self._maybe_handle_dl_services_landing(url=url)
+            if services_landing:
+                step_failures.pop(current_step, None)
+                failure_context = ""
+                continue
+
+            # ── DL details confirmation (PIN code → RTO auto-fill) ─────────────
+            confirmed_dl = await self._maybe_handle_confirm_dl_page(
+                job=job,
+                current_step=current_step,
+                page_text=page_text,
+                dom_elements=dom_elements,
+            )
+            if confirmed_dl:
+                step_failures.pop(current_step, None)
+                failure_context = ""
+                continue
+
+            try:
+                fetched_dl = await self._maybe_handle_dl_fetch_page(
+                    job=job,
+                    current_step=current_step,
+                    page_text=page_text,
+                    dom_elements=dom_elements,
+                )
+            except Exception as _dl_exc:
+                log.warning("brain.dl_fetch_handler_exception", error=str(_dl_exc))
+                fetched_dl = False
+                self._last_deterministic_failure = (
+                    f"DL fetch handler raised exception: {_dl_exc}. "
+                    "The page may have navigated. Check the current URL and retry."
+                )
+            if fetched_dl:
+                step_failures.pop(current_step, None)
+                failure_context = ""
+                continue
+            if self._last_deterministic_failure:
+                step_failures[current_step] = fails + 1
+                failure_context = self._last_deterministic_failure
+                self._last_deterministic_failure = ""
+                log.warning(
+                    "brain.deterministic_step_failed",
+                    step=current_step,
+                    consecutive_fails=step_failures[current_step],
+                    diagnosis=failure_context[:240],
+                )
+                await self._ls.record_failure(
+                    step_name=current_step,
+                    observation=failure_context,
+                    page_url=url,
+                    failed_approach="deterministic_dl_fetch_handler",
+                )
+                continue
+
             # Reset action history when we move to a new step
             if current_step != last_step_name:
                 step_action_history = []
                 last_step_name = current_step
+
+            state_sig = self._state_signature(current_step, url, dom_elements)
+            state_seen_counts[state_sig] = state_seen_counts.get(state_sig, 0) + 1
+            no_progress_active = state_seen_counts[state_sig] >= settings.max_repeated_page_states
+            if state_seen_counts[state_sig] >= settings.max_repeated_page_states:
+                step_failures[current_step] = fails + 1
+                failure_context = (
+                    f"No-progress loop detected: the agent has observed the same "
+                    f"page state {state_seen_counts[state_sig]} times for step "
+                    f"'{current_step}'. A previous action likely returned success "
+                    f"without changing the form/page. Do NOT repeat the same action; "
+                    f"use a different selector, batch-fill missing fields, ask the user "
+                    f"for missing data, or escalate if the portal requires manual input."
+                )
+                log.warning(
+                    "brain.repeated_state_detected",
+                    step=current_step,
+                    repeats=state_seen_counts[state_sig],
+                    url=url[:80],
+                )
 
             # ── Conditional steps: auto-skip after 2 failures ─────────────────
             # A conditional step (e.g. close_state_popup) only applies if the
@@ -173,6 +332,9 @@ class AgentBrain:
                     options=["Retry fresh", "Skip this step", "Abort job"],
                 )
                 answer = (resp.answer or "").lower()
+                if answer == "__timeout__":
+                    log.warning("brain.human_escalation_timeout", step=current_step)
+                    break
                 if "skip" in answer:
                     job.mark_step_done(current_step, StepLog(
                         step_name=current_step,
@@ -228,6 +390,8 @@ class AgentBrain:
                 failure_context=failure_context,
                 step_action_history=step_action_history,
             )
+            if action.action_type == "human_help":
+                action.need_human = True
 
             log.info(
                 "brain.thinking",
@@ -243,6 +407,19 @@ class AgentBrain:
             if action.is_forbidden() and not job.allow_reset:
                 log.warning("brain.blocked_destructive", action=action.description)
                 failure_context = f"Action blocked: '{action.description}' is a destructive action."
+                continue
+
+            bad_navigation = self._is_bad_navigation(action, current_step)
+            if bad_navigation:
+                step_failures[current_step] = fails + 1
+                failure_context = bad_navigation
+                log.warning(
+                    "brain.blocked_bad_navigation",
+                    step=current_step,
+                    text=action.text,
+                    description=action.description,
+                    reason=bad_navigation,
+                )
                 continue
 
             # ── Execute action ─────────────────────────────────────────────────
@@ -263,6 +440,28 @@ class AgentBrain:
                 detail=exec_detail,
             )
 
+            no_progress_action = (
+                no_progress_active
+                and success
+                and not url_changed
+                and action.action_type in ("fill", "fill_many", "scroll", "wait", "tool_call")
+            )
+            if no_progress_action:
+                success = False
+                exec_detail += " | forced_failure=no_progress"
+                failure_context = (
+                    f"No-progress loop confirmed: action '{action.action_type}' returned success "
+                    f"but the page URL/state had already repeated {state_seen_counts[state_sig]} times. "
+                    f"Do not repeat this action. If the next required control is not visible, ask the "
+                    f"user/operator what this page needs instead of scrolling or re-filling."
+                )
+                log.warning(
+                    "brain.no_progress_action_forced_failure",
+                    step=current_step,
+                    action_type=action.action_type,
+                    repeats=state_seen_counts[state_sig],
+                )
+
             # ── Record action in step history (prevents repeating same fills) ───
             step_action_history.append(
                 f"[{'OK' if success else 'FAIL'}] {action.action_type} "
@@ -273,20 +472,86 @@ class AgentBrain:
             if len(step_action_history) > 10:
                 step_action_history = step_action_history[-10:]
 
+            # ── Check for portal alert (form rejected, invalid data, etc.) ────────
+            portal_alert_seen = False
+            dialog_msg = await self._browser.get_last_dialog_message()
+            if dialog_msg:
+                if self._dialog_indicates_failure(dialog_msg):
+                    portal_alert_seen = True
+                    log.warning("brain.portal_alert", message=dialog_msg[:120], step=current_step)
+                    # Treat validation alerts as failures so the LLM retries with fresh data.
+                    step_failures[current_step] = fails + 1
+                    failure_context = (
+                        f"Portal showed alert: '{dialog_msg}'\n"
+                        f"This means the form submission was REJECTED. The form fields have been cleared.\n"
+                        f"ACTION REQUIRED: Re-fill ALL form fields from scratch — DL number, DOB, and a "
+                        f"FRESH CAPTCHA (do NOT reuse the previous CAPTCHA value — use captcha_solver tool).\n"
+                        f"Do NOT navigate away. Stay on this page and retry."
+                    )
+                    # Clear action history — previous fills are gone after form reset
+                    step_action_history = []
+                    success = False
+                else:
+                    log.info("brain.portal_dialog_accepted", message=dialog_msg[:140], step=current_step)
+                    if "application already exists" in dialog_msg.lower():
+                        action.step_complete = True
+                        action.step_name = "confirm_dl_details"
+
+            if success and action.action_type == "click":
+                selector = (action.selector or "").strip()
+                if selector == "#GetDLDetails":
+                    action.step_complete = True
+                    action.step_name = "fetch_dl_details"
+                elif selector == "#dlconfirm":
+                    action.step_complete = True
+                    action.step_name = "confirm_dl_details"
+
+            # ── Track consecutive scrolls — prevent infinite scroll loops ────────
+            if action.action_type == "scroll":
+                if success:
+                    consecutive_scrolls += 1
+                else:
+                    consecutive_scrolls = 0
+            else:
+                consecutive_scrolls = 0
+
             # ── If action failed: self-diagnose and prepare next iteration ─────
-            if not success and action.action_type not in ("wait", "scroll"):
+            scroll_loop = (
+                action.action_type == "scroll"
+                and consecutive_scrolls >= 3
+            )
+            if (not success and action.action_type not in ("wait", "scroll")) or scroll_loop or no_progress_action:
                 step_failures[current_step] = fails + 1
-                failure_context = await self._diagnose_failure(
-                    action=action,
-                    dom_elements=dom_elements,
-                    page_text=page_text,
-                    url=url,
-                )
+                if portal_alert_seen:
+                    # Keep the precise portal rejection reason captured above.
+                    pass
+                elif no_progress_action:
+                    # Keep the no-progress diagnosis prepared above.
+                    pass
+                elif scroll_loop:
+                    failure_context = (
+                        f"Scrolled {consecutive_scrolls} times without finding the target. "
+                        f"The element is NOT reachable by scrolling. Try a different approach: "
+                        f"look for a button/action that reveals it, or re-read the page carefully."
+                    )
+                    consecutive_scrolls = 0
+                    log.warning(
+                        "brain.scroll_loop_detected",
+                        step=current_step,
+                        consecutive=consecutive_scrolls,
+                    )
+                else:
+                    failure_context = await self._diagnose_failure(
+                        action=action,
+                        dom_elements=dom_elements,
+                        page_text=page_text,
+                        url=url,
+                    )
                 log.warning(
                     "brain.self_diagnosis",
                     step=current_step,
                     consecutive_fails=step_failures[current_step],
-                    diagnosis=failure_context,
+                    diagnosis=failure_context[:200],
                 )
                 # Record failure in learning store so future runs avoid this
                 await self._ls.record_failure(
@@ -295,11 +560,30 @@ class AgentBrain:
                     page_url=url,
                     failed_approach=f"{action.action_type} selector={action.selector} text={action.text}",
                 )
+                if learned:
+                    await self._ls.mark_solution_outcome(learned.scenario_id, worked=False)
             else:
                 # Successful action — reset failure state
                 if success:
                     step_failures.pop(current_step, None)
                     failure_context = ""
+                    if learned:
+                        await self._ls.mark_solution_outcome(learned.scenario_id, worked=True)
+                    learnable_action = (
+                        action.action_type in {"click", "select", "check", "upload", "close_popup"}
+                        and (url_changed or action.step_complete)
+                    )
+                    if learnable_action:
+                        await self._ls.record_successful_action(
+                            step_name=current_step,
+                            observation=action.observation or page_text[:1000],
+                            page_url=url,
+                            action_type=action.action_type,
+                            selector=action.selector,
+                            text=action.text,
+                            value=action.value,
+                            tool_args=action.tool_args,
+                        )
 
             # ── Handle special signals ─────────────────────────────────────────
             if action.is_done:
@@ -309,6 +593,26 @@ class AgentBrain:
                 break
 
             if action.need_otp:
+                otp_page_result = await self._maybe_handle_otp_page(
+                    job=job,
+                    current_step=current_step,
+                    page_text=page_text,
+                    dom_elements=dom_elements,
+                    screenshot=screenshot,
+                )
+                if otp_page_result == "submitted":
+                    continue
+                if otp_page_result == "waiting":
+                    break
+                if settings.human_loop_backend == "console":
+                    job.otp_pending_type = action.otp_type or "mobile"
+                    await self._sm.transition(job, JobStatus.WAITING_OTP)
+                    log.warning(
+                        "brain.otp_needed_without_visible_input",
+                        job_id=job.job_id,
+                        type=job.otp_pending_type,
+                    )
+                    break
                 otp = await self._otp.wait_for_otp(job, action.otp_type)
                 if otp:
                     await self._browser.fill(
@@ -388,11 +692,2325 @@ class AgentBrain:
 
             await asyncio.sleep(0.3)
 
-        await self._sm.transition(
-            job,
-            JobStatus.SUBMITTED if job.application_number else JobStatus.FAILED,
-        )
+        if job.status not in {JobStatus.WAITING_OTP, JobStatus.STUCK_HUMAN_NEEDED}:
+            await self._sm.transition(
+                job,
+                JobStatus.SUBMITTED if job.application_number else JobStatus.FAILED,
+            )
         return job
+
+    async def _sync_steps_from_page(
+        self,
+        job: Job,
+        url: str,
+        page_text: str,
+        dom_elements: dict,
+    ):
+        """
+        Align logical flow checkpoints with the real portal page.
+
+        The LLM may forget to mark a step complete even though the browser has
+        clearly moved forward. These checkpoints prevent the agent from going
+        back to menu/navigation steps after it is already inside the application.
+        """
+        path = url.split("?")[0]
+        checkpoints: list[str] = []
+
+        if "stateSelectBean.do" in path:
+            checkpoints = ["open_homepage", "close_homepage_popup", "select_state"]
+        elif "dlServicesDet.do" in path:
+            checkpoints = [
+                "open_homepage",
+                "close_homepage_popup",
+                "select_state",
+                "close_state_popup",
+                "navigate_to_dl_services",
+            ]
+        elif "envaction.do" in path:
+            checkpoints = [
+                "open_homepage",
+                "close_homepage_popup",
+                "select_state",
+                "close_state_popup",
+                "navigate_to_dl_services",
+            ]
+            lower = page_text.lower()
+            input_ids = {
+                (i.get("id") or "").lower()
+                for i in dom_elements.get("inputs", [])
+            }
+            if (
+                "confirm_dl_details" in job.steps_completed
+                and (
+                    "details of the driving licence" in lower
+                    or "details of the driving license" in lower
+                    or "applicant details" in lower
+                    or "applicants present address" in lower
+                    or "pincodedlserreq" in input_ids
+                )
+            ):
+                # In the existing-application branch, Sarathi does not show a
+                # separate "Renewal of Driving Licence" checkbox/link. The
+                # earlier DL Renewal entry point already selected the service.
+                checkpoints.append("select_renewal_service")
+            if "pincodedlserreq" in input_ids or "applicants present address" in lower:
+                # This is a personal/details form, not an auth-method screen.
+                checkpoints.extend([
+                    "select_renewal_service",
+                    "auth_method_selection",
+                ])
+            if (
+                "authentication" in lower
+                or "generate otp" in lower
+                or any("aadhaarholdingtype" in input_id for input_id in input_ids)
+            ):
+                checkpoints.extend([
+                    "fetch_dl_details",
+                    "confirm_dl_details",
+                    "select_renewal_service",
+                ])
+            visible_select_ids = {
+                (s.get("id") or "")
+                for s in dom_elements.get("selects", [])
+                if s.get("visible", True)
+            }
+            if (
+                "dispDLDet" in visible_select_ids
+                or "driving licence details" in lower
+                or "driving license details" in lower
+            ):
+                checkpoints.append("fetch_dl_details")
+            if self._has_otp_input(dom_elements, page_text):
+                checkpoints.append("auth_method_selection")
+
+        changed = False
+        for step_name in checkpoints:
+            if step_name not in job.steps_completed:
+                job.mark_step_done(step_name, StepLog(
+                    step_name=step_name,
+                    status="auto_checkpoint",
+                    observation=f"Browser reached {path}",
+                    action_taken="page_checkpoint",
+                ))
+                log.info("brain.page_checkpoint", step=step_name, url=path[-80:])
+                changed = True
+
+        if changed:
+            await self._sm.save(job)
+
+    async def _maybe_handle_otp_page(
+        self,
+        job: Job,
+        current_step: str,
+        page_text: str,
+        dom_elements: dict,
+        screenshot: bytes,
+    ) -> str:
+        """
+        Deterministically fill OTP when the portal shows the OTP entry form.
+
+        Key design rules:
+          - Ask user for OTP exactly ONCE per OTP session; cache it for retries.
+          - If submission fails (page unchanged), retry with a FRESH captcha but
+            the SAME OTP — don't ask user again.
+          - After 3 failed retries, clear the cache and ask user for a new OTP
+            (the first one may have expired).
+          - Only mark the OTP step done AFTER the page actually navigates away.
+          - Guard: if OTP step already verified, skip entirely.
+
+        Returns:
+          - "submitted": OTP flow handled; continue main loop
+          - "waiting": paused for human input / timeout
+          - "": not an OTP page
+        """
+        if not self._has_otp_input(dom_elements, page_text):
+            return ""
+
+        # ── Guard: OTP already verified this job run ───────────────────────────
+        otp_done = {"mobile_otp_verification", "aadhaar_otp_verification"}
+        if any(s in job.steps_completed for s in otp_done):
+            return ""
+
+        # Detect OTP type by checking which Sarathi OTP function is present.
+        # #verifySarathi (mobile flow) vs Aadhaar eKYC frame elements.
+        otp_type = await self._browser.evaluate("""() => {
+            if (document.getElementById('verifySarathi')
+                || document.getElementById('generateSarathiotp')
+                || document.getElementById('otpNumber')) return 'mobile';
+            if (document.querySelector('[id*="aadhaar" i],[id*="ekyc" i]')) return 'aadhaar';
+            return 'mobile';
+        }""") or "mobile"
+
+        # ── Ask user for OTP (with mobile number shown + Resend option) ──────────
+        if not self._cached_otp:
+            mobile = job.customer_data.get("mobile_number", "")
+            masked  = f"******{mobile[-4:]}" if len(mobile) >= 4 else "your registered number"
+            question = (
+                f"OTP has been sent to {masked}. "
+                f"Please enter it below, or choose 'Resend OTP' if you did not receive it."
+            )
+            context = (
+                f"The Sarathi portal sent a 6-digit OTP to your DL-registered mobile {masked}. "
+                f"Check your SMS and type the OTP. If you didn't receive it, select 'Resend OTP'."
+            )
+            resp = await self._hl.ask(
+                job=job,
+                step_name=current_step,
+                question=question,
+                context=context,
+                screenshot=screenshot,
+                options=["Resend OTP"],
+            )
+            if resp.answer == "__timeout__":
+                job.otp_pending_type = otp_type
+                await self._sm.transition(job, JobStatus.WAITING_OTP)
+                log.warning("brain.otp_waiting_for_user", job_id=job.job_id, type=otp_type)
+                return "waiting"
+
+            # Customer wants to resend OTP
+            if resp.answer.strip().lower() in ("resend otp", "resend", "1"):
+                log.info("brain.otp_resend_requested")
+                self._otp_sent = False          # force generate-OTP handler to run again
+                self._otp_reveal_attempts = 0
+                # Try clicking Sarathi's Resend link directly
+                for resend_text in ["Resend OTP", "Resend", "Resend otp"]:
+                    if await self._browser.click_text(resend_text, exact=False):
+                        log.info("brain.otp_resend_clicked", via=resend_text)
+                        await asyncio.sleep(2.0)
+                        break
+                return "submitted"              # loop back → generate-OTP handler runs
+
+            digits = "".join(ch for ch in resp.answer if ch.isdigit())
+            if not digits:
+                log.warning("brain.otp_invalid_from_user", job_id=job.job_id, raw=resp.answer)
+                return "submitted"              # loop back → will re-ask next iteration
+
+            self._cached_otp = digits
+            self._otp_submit_attempts = 0
+
+        otp = self._cached_otp
+        self._otp_submit_attempts += 1
+        log.info("brain.otp_attempt", attempt=self._otp_submit_attempts, type=otp_type)
+
+        # Keep the same OTP across CAPTCHA retries. "Page unchanged" usually means
+        # CAPTCHA failed, not that the user's OTP was wrong. Clear the OTP only
+        # when Sarathi explicitly says invalid/expired OTP after submit.
+        if self._otp_submit_attempts > 3:
+            log.warning(
+                "brain.otp_many_attempts_same_otp",
+                attempts=self._otp_submit_attempts,
+                action="keeping_otp_retrying_captcha",
+            )
+
+        # ── Pull deterministic facts from the runtime rule book ──────────────────
+        rulebook_otp_input_sel = VERIFY_OTP_RULES["otp_input_selector"]
+        rulebook_captcha_img_sel = VERIFY_OTP_RULES["captcha_image_selector"]
+        rulebook_captcha_inp_sel = VERIFY_OTP_RULES["captcha_input_selector"]
+        rulebook_submit_sel = VERIFY_OTP_RULES["submit_button_selector"]
+        rulebook_submit_fn = VERIFY_OTP_RULES["submit_onclick_fn"]
+        otp_input_sel    = VERIFY_OTP_RULES["otp_input_selector"]
+        captcha_img_sel  = VERIFY_OTP_RULES["captcha_image_selector"]
+        captcha_inp_sel  = VERIFY_OTP_RULES["captcha_input_selector"]
+        submit_sel       = VERIFY_OTP_RULES["submit_button_selector"]
+        forbidden_sel    = VERIFY_OTP_RULES["forbidden_submit_selector"]
+        submit_fn_name   = VERIFY_OTP_RULES["submit_onclick_fn"]
+        known_fns        = VERIFY_OTP_RULES["known_verify_fns"]
+        otp_input_id     = otp_input_sel.lstrip("#")
+        captcha_img_id   = captcha_img_sel.lstrip("#")
+        captcha_inp_id   = captcha_inp_sel.lstrip("#")
+        submit_btn_id    = submit_sel.lstrip("#")
+        forbidden_btn_id = forbidden_sel.lstrip("#")
+
+        # ── Refresh OTP captcha before solving (new image each attempt) ──────────
+        pre_url = await self._browser.current_url()
+        await self._browser.evaluate(f"""() => {{
+            const img = document.getElementById({json.dumps(captcha_img_id)});
+            if (img && img.src) {{
+                const base = img.src.split('?')[0];
+                img.src = base + '?t=' + Date.now();
+            }}
+        }}""")
+        await asyncio.sleep(1.2)  # wait for new captcha image to load
+
+        # Make OTP visibly appear in the textbox before the JS event-heavy fill.
+        # If this fails, the JS block below still acts as the fallback.
+        visible_otp_fill = False
+        try:
+            await self._browser.scroll_into_view(otp_input_sel)
+            visible_otp_fill = await self._browser.fill(otp_input_sel, otp)
+        except Exception as e:
+            log.warning("brain.otp_visible_fill_failed", selector=otp_input_sel, error=str(e))
+        log.info("brain.otp_visible_fill_attempted", selector=otp_input_sel, success=visible_otp_fill)
+
+        # ── Fill OTP + find captcha/submit using rule-book selectors ─────────────
+        otp_section_info = await self._browser.evaluate(f"""() => {{
+            const otp_val   = {json.dumps(otp)};
+            const otpId     = {json.dumps(otp_input_id)};
+            const capImgId  = {json.dumps(captcha_img_id)};
+             const capInpId  = {json.dumps(captcha_inp_id)};
+             const submitId  = {json.dumps(submit_btn_id)};
+             const forbidId  = {json.dumps(forbidden_btn_id)};
+             const selectorFor = (el) => {{
+                 if (!el) return null;
+                 if (el.id) return '#' + CSS.escape(el.id);
+                 if (el.name) return '[name="' + CSS.escape(el.name) + '"]';
+                 return null;
+             }};
+
+             // Fill OTP input — fire per-character keystrokes so Sarathi's
+             // keyup listener (which enables the Submit button) actually runs.
+             const otpEl = document.getElementById(otpId);
+            if (!otpEl) return {{ error: 'no_otp_input' }};
+            otpEl.disabled = false;
+            otpEl.removeAttribute('disabled');
+            otpEl.removeAttribute('hidden');
+            if (otpEl.style.display === 'none') otpEl.style.display = '';
+            otpEl.scrollIntoView({{block: 'center', inline: 'center'}});
+            const nSet = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+            otpEl.focus();
+            nSet.call(otpEl, '');
+            otpEl.dispatchEvent(new Event('input', {{bubbles:true}}));
+            for (let i = 0; i < otp_val.length; i++) {{
+                const ch = otp_val[i];
+                const code = ch.charCodeAt(0);
+                nSet.call(otpEl, otp_val.substring(0, i + 1));
+                otpEl.dispatchEvent(new KeyboardEvent('keydown',
+                    {{bubbles:true, key: ch, code: 'Digit'+ch, keyCode: code, which: code}}));
+                otpEl.dispatchEvent(new KeyboardEvent('keypress',
+                    {{bubbles:true, key: ch, code: 'Digit'+ch, keyCode: code, which: code}}));
+                otpEl.dispatchEvent(new Event('input', {{bubbles:true}}));
+                otpEl.dispatchEvent(new KeyboardEvent('keyup',
+                    {{bubbles:true, key: ch, code: 'Digit'+ch, keyCode: code, which: code}}));
+            }}
+            otpEl.dispatchEvent(new Event('change', {{bubbles:true}}));
+            otpEl.dispatchEvent(new Event('blur',   {{bubbles:true}}));
+
+            // Captcha image and input — rule-book IDs first, then fallback
+            const captchaImg = document.getElementById(capImgId)
+                || document.querySelector('img[src*="captcha" i], img[id*="captha" i]');
+            const captchaInp = document.getElementById(capInpId)
+                || document.querySelector('input[id*="capt" i]:not([type="hidden"])');
+
+            // DUMP ALL VISIBLE BUTTONS for debug + finding the right one
+            const allBtns = Array.from(document.querySelectorAll(
+                'button, input[type="submit"], input[type="button"], a.btn'
+            )).filter(b => b.offsetParent !== null && b.id !== forbidId);
+
+            const btnDump = allBtns.map(b => ({{
+                id: b.id || '',
+                tag: b.tagName,
+                type: b.type || '',
+                text: (b.textContent || '').trim().slice(0, 40),
+                value: (b.value || '').trim().slice(0, 40),
+                onclick: (b.getAttribute('onclick') || '').slice(0, 80),
+                cls: (b.className || '').slice(0, 60),
+            }}));
+
+            // Score each button — higher = more likely the OTP Submit
+            const scoreBtn = (b) => {{
+                let score = 0;
+                const idLow      = (b.id || '').toLowerCase();
+                const onclickLow = (b.getAttribute('onclick') || '').toLowerCase();
+                const txtLow     = ((b.textContent || '') + (b.value || '')).toLowerCase().trim();
+                const clsLow     = (b.className || '').toLowerCase();
+
+                // Strong signals: id/onclick/class mentioning verify+otp
+                if (/verify.*otp|otp.*verify|validate.*otp|otp.*validate/.test(idLow + ' ' + onclickLow + ' ' + clsLow)) score += 100;
+                if (/sarathi.*otp|otp.*sarathi/.test(idLow + ' ' + onclickLow + ' ' + clsLow)) score += 80;
+                // Medium: id/onclick mentioning verify or otp alone
+                if (/verify/.test(idLow + ' ' + onclickLow)) score += 30;
+                if (/otp/.test(idLow + ' ' + onclickLow)) score += 30;
+                // Text content match
+                if (/^submit$/i.test(txtLow)) score += 20;
+                if (/verify|validate/i.test(txtLow)) score += 25;
+                // Penalty: clearly the wrong button
+                if (/generate/i.test(idLow + ' ' + txtLow)) score -= 50;
+                if (/resend|cancel|reset|home|back/i.test(idLow + ' ' + txtLow)) score -= 50;
+                return score;
+            }};
+
+            // Prefer the rule-book Submit ID directly if it exists on the page.
+            let submitBtn = document.getElementById(submitId);
+            let bestScore = submitBtn ? 9999 : -1;
+            if (!submitBtn) {{
+                for (const b of allBtns) {{
+                    const s = scoreBtn(b);
+                    if (s > bestScore) {{ bestScore = s; submitBtn = b; }}
+                }}
+                if (bestScore < 20) submitBtn = null;
+            }}
+
+             return {{
+                 otp_filled:      otpEl.id || otpEl.name,
+                 otp_selector:    selectorFor(otpEl),
+                 otp_value:       otpEl.value || '',
+                 otp_expected_len: otp_val.length,
+                 captcha_img_id:  captchaImg ? (captchaImg.id || '') : null,
+                 captcha_inp_id:  captchaInp ? (captchaInp.id || captchaInp.name) : null,
+                 captcha_img_selector: selectorFor(captchaImg),
+                 captcha_inp_selector: selectorFor(captchaInp),
+                 submit_btn_text: submitBtn  ? (submitBtn.textContent || submitBtn.value || '').trim() : null,
+                 submit_btn_id:   submitBtn  ? (submitBtn.id || '') : null,
+                 submit_btn_selector: selectorFor(submitBtn),
+                 submit_btn_score: bestScore,
+                 all_buttons:     btnDump,
+             }};
+         }}""")
+
+        if not otp_section_info or otp_section_info.get("error"):
+            log.warning("brain.otp_section_not_found", info=otp_section_info)
+            return "submitted"
+
+        log.info("brain.otp_section_found", info=otp_section_info)
+
+        otp_visible_value = otp_section_info.get("otp_value") or ""
+        if otp_visible_value != otp:
+            log.warning(
+                "brain.otp_value_mismatch_after_fill",
+                expected_len=len(otp),
+                actual_len=len(otp_visible_value),
+                selector=otp_section_info.get("otp_selector"),
+            )
+            otp_refill = await self._browser.evaluate(f"""() => {{
+                const val = {json.dumps(otp)};
+                const selector = {json.dumps(otp_section_info.get("otp_selector") or otp_input_sel)};
+                const el = document.querySelector(selector);
+                if (!el) return {{ ok: false, reason: 'otp_input_missing' }};
+                el.disabled = false;
+                el.removeAttribute('disabled');
+                el.focus();
+                const nativeSet = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value').set;
+                nativeSet.call(el, val);
+                el.dispatchEvent(new Event('input', {{bubbles:true}}));
+                el.dispatchEvent(new KeyboardEvent('keyup', {{bubbles:true, key: val.slice(-1)}}));
+                el.dispatchEvent(new Event('change', {{bubbles:true}}));
+                return {{ ok: el.value === val, value_len: (el.value || '').length }};
+            }}""")
+            log.info("brain.otp_value_refill_result", result=otp_refill)
+            if not otp_refill or not otp_refill.get("ok"):
+                return "submitted"
+        else:
+            log.info(
+                "brain.otp_value_verified",
+                selector=otp_section_info.get("otp_selector"),
+                digits=len(otp_visible_value),
+            )
+
+        # ── Fetch the CORRECT captcha image (OTP section) and solve it ────────
+        captcha_img_id = otp_section_info.get("captcha_img_id") or ""
+        captcha_inp_id = otp_section_info.get("captcha_inp_id") or ""
+
+        # Element screenshots were unreliable here because Sarathi briefly hides
+        # #capimg during refresh. Fetch the exact image bytes from the page
+        # instead; no full-page screenshot fallback because it pollutes CAPTCHA.
+        otp_captcha_bytes = b""
+        if captcha_img_id:
+            data_url = await self._browser.evaluate(f"""async () => {{
+                const img = document.getElementById({json.dumps(captcha_img_id)});
+                if (!img || !img.src) return null;
+                const response = await fetch(img.src, {{
+                    credentials: 'same-origin',
+                    cache: 'no-store',
+                }});
+                if (!response.ok) return null;
+                const blob = await response.blob();
+                return await new Promise((resolve, reject) => {{
+                    const reader = new FileReader();
+                    reader.onloadend = () => resolve(reader.result);
+                    reader.onerror = () => reject(new Error('captcha_file_reader_failed'));
+                    reader.readAsDataURL(blob);
+                }});
+            }}""")
+            if data_url and isinstance(data_url, str) and "," in data_url:
+                try:
+                    otp_captcha_bytes = base64.b64decode(data_url.split(",", 1)[1])
+                    log.info(
+                        "brain.otp_captcha_fetched_from_src",
+                        id=captcha_img_id,
+                        bytes=len(otp_captcha_bytes),
+                    )
+                except Exception as e:
+                    log.warning("brain.otp_captcha_decode_failed", error=str(e))
+
+        if not otp_captcha_bytes:
+            log.warning("brain.otp_captcha_fetch_failed", id=captcha_img_id)
+            return "submitted"
+
+        otp_captcha_sol = ""
+        if otp_captcha_bytes:
+            try:
+                timeout_s = max(15, settings.captcha_timeout_seconds + 15)
+                force_manual_captcha = self._otp_submit_attempts >= settings.captcha_max_retries
+                log.info("brain.otp_captcha_solving_started", timeout_seconds=timeout_s)
+                otp_captcha_sol = await asyncio.wait_for(
+                    self._captcha.solve(
+                        otp_captcha_bytes,
+                        force_manual=force_manual_captcha,
+                        prompt_context=(
+                            "OTP verification CAPTCHA. The OTP is already cached; "
+                            "only this CAPTCHA value is needed."
+                        ),
+                    ),
+                    timeout=max(timeout_s, settings.captcha_manual_timeout_seconds + 5)
+                    if force_manual_captcha else timeout_s,
+                )
+                log.info(
+                    "brain.otp_captcha_solved",
+                    solution=otp_captcha_sol,
+                    manual=force_manual_captcha,
+                )
+            except asyncio.TimeoutError:
+                log.warning("brain.otp_captcha_solve_timeout")
+                return "submitted"
+            except Exception as e:
+                log.warning("brain.otp_captcha_solve_failed", error=str(e))
+                return "submitted"
+
+        if not otp_captcha_sol:
+            log.warning("brain.otp_captcha_empty_solution")
+            return "submitted"
+
+        # Fill the CORRECT captcha input (OTP section) with per-character events
+        if captcha_inp_id:
+            captcha_name_selector = f'[name="{captcha_inp_id}"]'
+            filled_cap = await self._browser.evaluate(f"""() => {{
+                const val = {json.dumps(otp_captcha_sol)};
+                const el = document.getElementById({json.dumps(captcha_inp_id)})
+                         || document.querySelector({json.dumps(captcha_name_selector)});
+                if (!el) return {{ ok: false, reason: 'captcha_input_missing' }};
+                el.disabled = false;
+                el.removeAttribute('disabled');
+                if (el.style.display === 'none') el.style.display = '';
+                const nSet = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value').set;
+                el.focus();
+                nSet.call(el, '');
+                el.dispatchEvent(new Event('input', {{bubbles:true}}));
+                for (let i = 0; i < val.length; i++) {{
+                    const ch = val[i];
+                    const code = ch.charCodeAt(0);
+                    nSet.call(el, val.substring(0, i + 1));
+                    el.dispatchEvent(new KeyboardEvent('keydown',
+                        {{bubbles:true, key: ch, keyCode: code, which: code}}));
+                    el.dispatchEvent(new Event('input', {{bubbles:true}}));
+                    el.dispatchEvent(new KeyboardEvent('keyup',
+                        {{bubbles:true, key: ch, keyCode: code, which: code}}));
+                }}
+                el.dispatchEvent(new Event('change', {{bubbles:true}}));
+                el.dispatchEvent(new Event('blur',   {{bubbles:true}}));
+                return {{
+                    ok: el.value === val,
+                    selector: el.id ? '#' + CSS.escape(el.id) : (el.name ? '[name="' + CSS.escape(el.name) + '"]' : ''),
+                    value_len: (el.value || '').length,
+                }};
+            }}""")
+            log.info("brain.otp_captcha_filled", result=filled_cap, solution=otp_captcha_sol)
+            if not filled_cap or not filled_cap.get("ok"):
+                log.warning("brain.otp_captcha_value_not_verified", result=filled_cap)
+                return "submitted"
+            await asyncio.sleep(0.4)
+        else:
+            log.warning("brain.otp_captcha_input_missing", info=otp_section_info)
+            return "submitted"
+
+        await asyncio.sleep(0.3)
+
+        checkbox_info = await self._browser.evaluate("""() => {
+            const isVisible = (el) => {
+                const st = window.getComputedStyle(el);
+                return st && st.display !== 'none' && st.visibility !== 'hidden'
+                    && el.offsetParent !== null;
+            };
+            const boxes = Array.from(document.querySelectorAll('input[type="checkbox"]'))
+                .filter(el => !el.disabled && isVisible(el));
+            const changed = [];
+            for (const el of boxes) {
+                if (!el.checked) {
+                    el.scrollIntoView({block: 'center', inline: 'center'});
+                    el.click();
+                    if (!el.checked) {
+                        const checkedSet = Object.getOwnPropertyDescriptor(
+                            window.HTMLInputElement.prototype, 'checked').set;
+                        checkedSet.call(el, true);
+                    }
+                    el.dispatchEvent(new Event('input', {bubbles:true}));
+                    el.dispatchEvent(new Event('change', {bubbles:true}));
+                    changed.push(el.id || el.name || '(unnamed)');
+                }
+            }
+            return {
+                visible_count: boxes.length,
+                checked: boxes.map(el => ({id: el.id || '', name: el.name || '', checked: el.checked})),
+                changed,
+            };
+        }""")
+        log.info("brain.otp_checkboxes_ready", info=checkbox_info)
+        if checkbox_info and checkbox_info.get("visible_count", 0):
+            unchecked = [
+                box for box in checkbox_info.get("checked", [])
+                if not box.get("checked")
+            ]
+            if unchecked:
+                log.warning("brain.otp_checkbox_not_checked", unchecked=unchecked)
+                return "submitted"
+
+        # ── Click the OTP Submit button (NEVER #submt — that's auth-method Submit) ──
+        submit_btn_id    = otp_section_info.get("submit_btn_id") or ""
+        submit_btn_text  = (otp_section_info.get("submit_btn_text") or "").strip()
+        submit_btn_score = otp_section_info.get("submit_btn_score", -1)
+        all_buttons      = otp_section_info.get("all_buttons", [])
+
+        # Log every visible button so we can see what's on the page
+        log.info("brain.otp_page_buttons", count=len(all_buttons), buttons=all_buttons[:15])
+        log.info("brain.otp_submit_best_match", id=submit_btn_id, text=submit_btn_text,
+                 score=submit_btn_score)
+
+        # The Submit button is often kept disabled by Sarathi's keyup listener,
+        # which doesn't fire when we set value via nativeInputValueSetter.
+        # The cleanest fix is to invoke the onclick function (e.g. verifiedBySarathi())
+        # directly — bypasses the disabled state entirely.
+        clicked = False
+        click_method = "none"
+
+        js_result = await self._browser.evaluate(f"""() => {{
+            const target_id    = {json.dumps(submit_btn_id)};
+            const primary_fn   = {json.dumps(submit_fn_name)};
+            const known_fns    = {json.dumps(known_fns)};
+            const forbid_id    = {json.dumps(forbidden_btn_id)};
+
+            // Helper: parse function name from onclick attribute
+            //   "verifiedBySarathi(); return false;" -> "verifiedBySarathi"
+            const fnFromOnclick = (str) => {{
+                if (!str) return null;
+                const m = str.match(/^\\s*([a-zA-Z_$][\\w$]*)\\s*\\(/);
+                return m ? m[1] : null;
+            }};
+
+            // 1. PRIMARY: call the rule-book function directly
+            if (primary_fn && typeof window[primary_fn] === 'function') {{
+                try {{ window[primary_fn](); return 'rulebook_fn:' + primary_fn; }}
+                catch (e) {{ return 'rulebook_fn_error:' + primary_fn + ':' + e.message; }}
+            }}
+
+            // 2. Parse the function name from the actual button onclick
+            if (target_id) {{
+                const b = document.getElementById(target_id);
+                if (b) {{
+                    b.disabled = false;
+                    b.removeAttribute('disabled');
+                    const fname = fnFromOnclick(b.getAttribute('onclick'));
+                    if (fname && typeof window[fname] === 'function') {{
+                        try {{ window[fname](); return 'fn_from_onclick:' + fname; }}
+                        catch (e) {{ return 'fn_error:' + fname + ':' + e.message; }}
+                    }}
+                }}
+            }}
+
+            // 3. Try any of the known Sarathi verify functions
+            for (const fn of known_fns) {{
+                if (typeof window[fn] === 'function') {{
+                    try {{ window[fn](); return 'known_fn:' + fn; }} catch (e) {{}}
+                }}
+            }}
+
+            // 4. Force-click the button (last resort)
+            if (target_id) {{
+                const b = document.getElementById(target_id);
+                if (b) {{
+                    b.disabled = false;
+                    b.removeAttribute('disabled');
+                    b.click();
+                    return 'force_click:' + target_id;
+                }}
+            }}
+
+            // 5. Last-resort: any visible button whose onclick mentions verify/otp
+            const all = Array.from(document.querySelectorAll(
+                'button, input[type="submit"], input[type="button"], a.btn'
+            )).filter(b => b.offsetParent !== null && b.id !== forbid_id);
+            const cand = all.find(b => {{
+                const k = ((b.id||'') + (b.getAttribute('onclick')||'')).toLowerCase();
+                return /verify|otp/.test(k) && !/generate|resend/.test(k);
+            }});
+            if (cand) {{
+                cand.disabled = false;
+                cand.removeAttribute('disabled');
+                const fname = fnFromOnclick(cand.getAttribute('onclick'));
+                if (fname && typeof window[fname] === 'function') {{
+                    try {{ window[fname](); return 'fallback_fn:' + fname; }} catch (e) {{}}
+                }}
+                cand.click();
+                return 'fallback_click:' + (cand.id || cand.tagName);
+            }}
+            return null;
+        }}""")
+
+        if js_result:
+            clicked = True
+            click_method = js_result
+
+        log.info("brain.otp_submit_attempted", clicked=clicked, method=click_method,
+                 btn_id=submit_btn_id, btn_text=submit_btn_text, type=otp_type)
+
+        # ── Wait and verify OTP submission worked ─────────────────────────────
+        await asyncio.sleep(2.5)
+        post_url    = await self._browser.current_url()
+        post_text   = await self._browser.page_text()
+        post_dom    = await self._browser.get_interactive_elements()
+        dialog_msg  = await self._browser.get_last_dialog_message() or ""
+
+        otp_reject_patterns     = VERIFY_OTP_RULES["rejection_dialog_patterns"]
+        captcha_reject_patterns = VERIFY_OTP_RULES["captcha_rejection_patterns"]
+        rejection_phrases       = otp_reject_patterns + captcha_reject_patterns
+        otp_rejected = any(p in post_text.lower() for p in rejection_phrases) \
+                    or any(p in dialog_msg.lower() for p in rejection_phrases)
+
+        # Page is considered changed if URL changed OR OTP input is gone from post-submit DOM
+        otp_gone_now = not self._has_otp_input(post_dom, post_text)
+        page_changed = (post_url != pre_url) or otp_gone_now
+
+        if dialog_msg:
+            log.info("brain.otp_submit_dialog", message=dialog_msg[:200])
+
+        if page_changed and not otp_rejected:
+            log.info("brain.otp_verified_page_changed", pre=pre_url[-60:], post=post_url[-60:])
+            self._record_otp_rule_discoveries(
+                otp_section_info=otp_section_info,
+                click_method=click_method,
+                rulebook_otp_input_sel=rulebook_otp_input_sel,
+                rulebook_captcha_img_sel=rulebook_captcha_img_sel,
+                rulebook_captcha_inp_sel=rulebook_captcha_inp_sel,
+                rulebook_submit_sel=rulebook_submit_sel,
+                rulebook_submit_fn=rulebook_submit_fn,
+            )
+            completed_step = (
+                "aadhaar_otp_verification" if otp_type == "aadhaar"
+                else "mobile_otp_verification"
+            )
+            if completed_step not in job.steps_completed:
+                job.mark_step_done(completed_step, StepLog(
+                    step_name=completed_step,
+                    status="success",
+                    observation=f"{otp_type} OTP verified — page navigated",
+                    action_taken="otp_js_fill_submit",
+                ))
+            job.otp_pending_type = ""
+            self._otp_sent = False
+            self._otp_reveal_attempts = 0
+            self._cached_otp = ""
+            self._otp_submit_attempts = 0
+            await self._sm.transition(job, JobStatus.AGENT_RUNNING)
+        else:
+            combined = (post_text + " " + dialog_msg).lower()
+            captcha_rejected = any(p in combined for p in captcha_reject_patterns)
+            otp_only_rejected = otp_rejected and not captcha_rejected
+
+            reason = ("portal_rejected_otp" if otp_only_rejected
+                      else "captcha_rejected" if captcha_rejected
+                      else "page_unchanged_after_submit")
+            log.warning("brain.otp_submit_unconfirmed", reason=reason,
+                        attempt=self._otp_submit_attempts, captcha=otp_captcha_sol,
+                        dialog=dialog_msg[:120])
+
+            if otp_only_rejected:
+                # Portal explicitly said OTP is wrong — clear cache to re-ask user
+                self._cached_otp = ""
+                self._otp_submit_attempts = 0
+            # If captcha rejected (but OTP fine), keep OTP cached; next loop fetches new captcha
+
+        return "submitted"
+
+    def _record_rule_discovery(
+        self,
+        rule_name: str,
+        key: str,
+        discovered_value,
+        current_value,
+        source: str,
+    ) -> None:
+        """Persist a learned rule only when it differs from the rule book."""
+        if not discovered_value or discovered_value == current_value:
+            return
+        try:
+            record_discovery(rule_name, key, discovered_value)
+            log.info(
+                "brain.rule_discovery_recorded",
+                rule=rule_name,
+                key=key,
+                value=discovered_value,
+                previous=current_value,
+                source=source,
+            )
+        except Exception as e:
+            log.warning(
+                "brain.rule_discovery_failed",
+                rule=rule_name,
+                key=key,
+                value=discovered_value,
+                error=str(e),
+            )
+
+    @staticmethod
+    def _function_from_click_method(method: str) -> str:
+        """
+        Extract a function name from OTP submit/generate fallback markers.
+
+        Examples:
+          fn_from_onclick:verifiedBySarathi -> verifiedBySarathi
+          known_fn:verifyOTP -> verifyOTP
+        """
+        if not method or ":" not in method:
+            return ""
+        prefix, value = method.split(":", 1)
+        if prefix in {
+            "fn_from_onclick",
+            "known_fn",
+            "fallback_fn",
+            "onclick_fn",
+        } and value:
+            return value.split(":", 1)[0]
+        return ""
+
+    def _record_otp_rule_discoveries(
+        self,
+        otp_section_info: dict,
+        click_method: str,
+        rulebook_otp_input_sel: str,
+        rulebook_captcha_img_sel: str,
+        rulebook_captcha_inp_sel: str,
+        rulebook_submit_sel: str,
+        rulebook_submit_fn: str,
+    ) -> None:
+        """Promote observed OTP selectors/functions after OTP verification succeeds."""
+        discovered = {
+            "otp_input_selector": otp_section_info.get("otp_selector"),
+            "captcha_image_selector": otp_section_info.get("captcha_img_selector"),
+            "captcha_input_selector": otp_section_info.get("captcha_inp_selector"),
+            "submit_button_selector": otp_section_info.get("submit_btn_selector"),
+        }
+        current = {
+            "otp_input_selector": rulebook_otp_input_sel,
+            "captcha_image_selector": rulebook_captcha_img_sel,
+            "captcha_input_selector": rulebook_captcha_inp_sel,
+            "submit_button_selector": rulebook_submit_sel,
+        }
+        for key, value in discovered.items():
+            self._record_rule_discovery(
+                "VERIFY_OTP_RULES",
+                key,
+                value,
+                current[key],
+                source="otp_verified",
+            )
+
+        discovered_fn = self._function_from_click_method(click_method)
+        self._record_rule_discovery(
+            "VERIFY_OTP_RULES",
+            "submit_onclick_fn",
+            discovered_fn,
+            rulebook_submit_fn,
+            source=click_method,
+        )
+
+    def _record_generate_otp_rule_discoveries(
+        self,
+        method: str,
+        discovered_selector: str,
+        discovered_fn: str,
+        rulebook_selector: str,
+        rulebook_fn: str,
+    ) -> None:
+        """Promote observed Generate OTP selector/function after OTP generation succeeds."""
+        self._record_rule_discovery(
+            "GENERATE_OTP_RULES",
+            "button_selector",
+            discovered_selector,
+            rulebook_selector,
+            source=method,
+        )
+
+        fn = discovered_fn or self._function_from_click_method(method)
+        self._record_rule_discovery(
+            "GENERATE_OTP_RULES",
+            "button_onclick_fn",
+            fn,
+            rulebook_fn,
+            source=method,
+        )
+
+    async def _maybe_handle_generate_otp_page(
+        self,
+        job: Job,
+        current_step: str,
+        page_text: str,
+        dom_elements: dict,
+    ) -> bool:
+        """
+        Handle Sarathi's Generate OTP page (CAPTCHA + mobile OTP trigger).
+
+        Root cause of #generateSarathiotp staying disabled:
+          The button requires TWO fields to be non-empty: mobileNumber AND captcha.
+          Our previous code only filled captcha. fill() also skips DOM events, so
+          the portal's JS onChange never fired to enable the button.
+
+        Strategy (primary = direct API, UI = fallback):
+          1. Extract the pre-filled mobile number from the page input.
+          2. Solve + fill CAPTCHA, then press Tab to fire onblur.
+          3. Fill mobile number field and fire input/change events via JS.
+          4. Wait for JS to enable the button, try Playwright click.
+          5. If button still disabled: call getOtpFromSarathi.do API directly
+             using the browser session cookies — server validates CAPTCHA and
+             sends OTP to the registered mobile. No UI button needed.
+        """
+        lower = page_text.lower()
+        visible_buttons = [
+            (b.get("text") or "").strip().lower()
+            for b in dom_elements.get("buttons", [])
+            if b.get("visible", True)
+        ]
+        if "generate otp" not in lower and not any("generate otp" in b for b in visible_buttons):
+            return False
+
+        pre_generate_dom = await self._browser.get_interactive_elements()
+        pre_generate_text = page_text
+        pre_had_otp_input = self._has_otp_input(pre_generate_dom, pre_generate_text)
+
+        # ── Guard: OTP already sent — wait for the real portal OTP section ───
+        if self._otp_sent:
+            self._otp_reveal_attempts += 1
+            log.info("brain.otp_already_sent_waiting", attempt=self._otp_reveal_attempts)
+            await asyncio.sleep(1.0)
+            if self._otp_reveal_attempts > 6:
+                # The portal did not naturally reveal OTP UI; try fresh captcha.
+                log.warning("brain.otp_natural_reveal_gave_up")
+                self._otp_sent = False
+                self._otp_reveal_attempts = 0
+                return False
+            return True  # come back next loop iteration
+
+        log.info("brain.generate_otp_page_detected", step=current_step)
+        self._generate_otp_attempts += 1
+        log.info("brain.generate_otp_attempt", attempt=self._generate_otp_attempts, max_attempts=4)
+        if self._generate_otp_attempts > 4:
+            log.warning("brain.generate_otp_attempts_exhausted", step=current_step)
+            self._generate_otp_attempts = 0
+            return False
+
+        # Consume stale alerts before this attempt. Otherwise an old
+        # "invalid captcha" dialog can poison the proof check for the next
+        # freshly-filled CAPTCHA.
+        await self._browser.get_last_dialog_message()
+
+        # ── Step 1: Read mobile number from pre-filled page field ─────────────
+        mobile = await self._browser.evaluate("""() => {
+            const sels = [
+                'input[name="mobileNumber"]',
+                'input[id*="mobile" i]:not([type="hidden"])',
+                'input[id*="phone" i]:not([type="hidden"])',
+                'input[type="tel"]',
+            ];
+            for (const s of sels) {
+                const el = document.querySelector(s);
+                if (el && el.value && el.value.trim().length >= 6) return el.value.trim();
+            }
+            return null;
+        }""")
+        if not mobile:
+            mobile = job.customer_data.get("mobile_number", "")
+        log.info("brain.generate_otp_mobile", mobile=mobile, step=current_step)
+
+        # ── Step 2: Solve + fill CAPTCHA ──────────────────────────────────────
+        # Refresh CAPTCHA first to avoid stale image / repeated-answer issue.
+        await self._browser.evaluate("""() => {
+            const imgs = Array.from(document.querySelectorAll(
+                'img[id*="cap" i], img[src*="cap" i]'
+            )).filter(img => img.offsetParent !== null || img.id === 'capimg');
+            for (const img of imgs) {
+                if (!img.src) continue;
+                const base = img.src.split('?')[0];
+                img.src = base + '?t=' + Date.now();
+            }
+            const inputs = Array.from(document.querySelectorAll(
+                'input[id*="capt" i]:not([type="hidden"]), input[name*="capt" i]:not([type="hidden"])'
+            ));
+            for (const el of inputs) {
+                const nativeSet = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value').set;
+                nativeSet.call(el, '');
+                el.dispatchEvent(new Event('input', {bubbles:true}));
+                el.dispatchEvent(new Event('change', {bubbles:true}));
+            }
+            return imgs.map(img => img.id || img.src.slice(0, 40));
+        }""")
+        await asyncio.sleep(0.8)
+        for refresh_text in ["Refresh", "Change Image", "Reload"]:
+            try:
+                el = self._browser._page.get_by_text(refresh_text, exact=False)
+                if await el.first.is_visible(timeout=400):
+                    await el.first.click(timeout=2000)
+                    await asyncio.sleep(0.6)
+                    log.info("brain.captcha_refreshed", via=refresh_text)
+                    break
+            except Exception:
+                pass
+
+        fresh_dom = await self._browser.get_interactive_elements()
+        captcha_solution = await self._solve_captcha_value(
+            image_selector=VERIFY_OTP_RULES["captcha_image_selector"],
+            force_manual=self._generate_otp_attempts > settings.captcha_max_retries,
+            prompt_context=(
+                "Generate OTP CAPTCHA. Automatic attempts did not produce a valid OTP request; "
+                "please provide the CAPTCHA shown before clicking Generate OTP."
+                if self._generate_otp_attempts > settings.captcha_max_retries else ""
+            ),
+        )
+        if not captcha_solution:
+            log.warning("brain.generate_otp_captcha_unsolvable", step=current_step)
+            return self._generate_otp_attempts <= 4
+
+        captcha_filled = await self._fill_captcha_field(fresh_dom, captcha_solution)
+        if not captcha_filled:
+            log.warning("brain.generate_otp_captcha_not_filled", step=current_step)
+            return self._generate_otp_attempts <= 4
+
+        # ── Step 3: Fill mobile number field + fire JS events ─────────────────
+        if mobile:
+            filled_mobile = await self._browser.evaluate(f"""() => {{
+                const val = {json.dumps(mobile)};
+                const sels = [
+                    'input[name="mobileNumber"]',
+                    'input[id*="mobile" i]:not([type="hidden"])',
+                    'input[id*="phone" i]:not([type="hidden"])',
+                    'input[type="tel"]',
+                ];
+                for (const s of sels) {{
+                    const el = document.querySelector(s);
+                    if (el) {{
+                        const nativeSet = Object.getOwnPropertyDescriptor(
+                            window.HTMLInputElement.prototype, 'value').set;
+                        nativeSet.call(el, val);
+                        el.dispatchEvent(new Event('input',  {{bubbles:true}}));
+                        el.dispatchEvent(new Event('change', {{bubbles:true}}));
+                        el.dispatchEvent(new Event('blur',   {{bubbles:true}}));
+                        return s;
+                    }}
+                }}
+                return null;
+            }}""")
+            if filled_mobile:
+                log.info("brain.mobile_field_filled", selector=filled_mobile, mobile=mobile)
+
+        # Press Tab on captcha to fire blur → should enable the Generate OTP button
+        await self._browser.press_key("Tab")
+        await asyncio.sleep(1.2)
+
+        # ── Click Generate OTP button/function deterministically ──────────────
+        # #generateotp is an invisible Aadhaar button. The mobile OTP button is
+        # #generateSarathiotp and its onclick is gensarathiOTP(). Call that first
+        # after force-enabling the button so we do not waste time on hidden nodes.
+        clicked = False
+        generate_method = "none"
+        discovered_generate_selector = ""
+        discovered_generate_fn = ""
+        rulebook_generate_selector = GENERATE_OTP_RULES["button_selector"]
+        rulebook_generate_fn = GENERATE_OTP_RULES["button_onclick_fn"]
+
+        gen_btn_id = GENERATE_OTP_RULES["button_selector"].lstrip("#")
+        gen_fn     = GENERATE_OTP_RULES["button_onclick_fn"]
+        result = await self._browser.evaluate(f"""() => {{
+            const fn = {json.dumps(gen_fn)};
+            const targetId = {json.dumps(gen_btn_id)};
+            const btn = document.getElementById(targetId)
+                || Array.from(document.querySelectorAll('button, input[type="button"], input[type="submit"]'))
+                    .find(x => x.id === 'generateSarathiotp'
+                        || /gensarathiotp/i.test(x.getAttribute('onclick') || '')
+                        || /generate\\s*otp/i.test((x.textContent || '') + (x.value || '')));
+            if (btn) {{
+                btn.disabled = false;
+                btn.removeAttribute('disabled');
+                btn.removeAttribute('readonly');
+                btn.style.display = '';
+                btn.style.visibility = 'visible';
+                btn.scrollIntoView({{block: 'center', inline: 'center'}});
+            }}
+            if (typeof window[fn] === 'function') {{
+                try {{ window[fn](); return 'rulebook_fn:' + fn; }} catch(e) {{
+                    return 'rulebook_fn_error:' + fn + ':' + e.message;
+                }}
+            }}
+            if (btn) {{
+                const onclick = btn.getAttribute('onclick') || '';
+                const m = onclick.match(/^\\s*([a-zA-Z_$][\\w$]*)\\s*\\(/);
+                if (m && typeof window[m[1]] === 'function') {{
+                    try {{ window[m[1]](); return 'onclick_fn:' + m[1]; }} catch(e) {{
+                        return 'onclick_fn_error:' + m[1] + ':' + e.message;
+                    }}
+                }}
+                btn.click();
+                return 'force_click:' + (btn.id || 'btn');
+            }}
+            return null;
+        }}""")
+        if result:
+            clicked = True
+            generate_method = result
+            discovered_generate_selector = rulebook_generate_selector
+            if result.startswith("onclick_fn:"):
+                discovered_generate_fn = result.split(":", 1)[1]
+            elif result.startswith("rulebook_fn:"):
+                discovered_generate_fn = gen_fn
+            log.info("brain.generate_otp_js_force_click", method=result)
+
+        # Do not bypass the visible government form with the API here. The UI
+        # click/function is what runs Sarathi's real validation and SMS flow.
+
+        if not clicked:
+            log.warning("brain.generate_otp_all_methods_failed", step=current_step)
+            return self._generate_otp_attempts <= 4
+
+        await asyncio.sleep(2.5)  # wait for Sarathi AJAX to activate OTP entry section
+        otp_proof = await self._verify_otp_was_sent(pre_had_otp_input=pre_had_otp_input)
+        if not otp_proof:
+            log.warning(
+                "brain.generate_otp_unconfirmed",
+                method=generate_method,
+                captcha=captcha_solution,
+            )
+            self._otp_sent = False
+            return self._generate_otp_attempts <= 4
+
+        # Mark OTP as sent only after the portal proves it.
+        self._otp_sent = True
+        self._generate_otp_attempts = 0
+        self._record_generate_otp_rule_discoveries(
+            method=generate_method,
+            discovered_selector=discovered_generate_selector,
+            discovered_fn=discovered_generate_fn,
+            rulebook_selector=rulebook_generate_selector,
+            rulebook_fn=rulebook_generate_fn,
+        )
+
+        if "auth_method_selection" not in job.steps_completed:
+            job.mark_step_done("auth_method_selection", StepLog(
+                step_name="auth_method_selection",
+                status="success",
+                observation="Generated OTP on authentication page",
+                action_taken="generate_otp",
+            ))
+            await self._sm.save(job)
+
+        log.info("brain.generate_otp_clicked", step=current_step)
+        return True
+
+    async def _verify_otp_was_sent(self, pre_had_otp_input: bool) -> bool:
+        """True only when Sarathi naturally shows/mentions the OTP step."""
+        try:
+            page_text = await self._browser.page_text()
+            dom = await self._browser.get_interactive_elements()
+            dialog_msg = await self._browser.get_last_dialog_message() or ""
+        except Exception as e:
+            log.warning("brain.generate_otp_verify_failed", error=str(e))
+            return False
+
+        combined = f"{page_text}\n{dialog_msg}".lower()
+        sent_markers = [
+            "otp has been sent",
+            "otp sent",
+            "enter otp",
+            "one time password",
+            "resend otp",
+            "verify otp",
+        ]
+        rejection_markers = [
+            "invalid captcha",
+            "captcha mismatch",
+            "wrong captcha",
+            "please enter valid captcha",
+            "please enter captcha",
+            "unable to generate otp",
+            "otp not sent",
+        ]
+        rejected = any(marker in combined for marker in rejection_markers)
+        has_text_proof = any(marker in combined for marker in sent_markers)
+        has_input_proof = self._has_otp_input(dom, page_text)
+        newly_showed_otp_input = has_input_proof and not pre_had_otp_input
+        log.info(
+            "brain.generate_otp_proof",
+            text_proof=has_text_proof,
+            input_proof=has_input_proof,
+            pre_had_otp_input=pre_had_otp_input,
+            newly_showed_otp_input=newly_showed_otp_input,
+            rejected=rejected,
+            dialog=dialog_msg[:120],
+        )
+        return has_text_proof or newly_showed_otp_input
+
+    # ── Confirm DL details (PIN code → RTO auto-fill) ─────────────────────────
+
+    async def _maybe_handle_confirm_dl_page(
+        self,
+        job: Job,
+        current_step: str,
+        page_text: str,
+        dom_elements: dict,
+    ) -> bool:
+        """
+        Deterministically handle the DL details confirmation page.
+        Fills pin code (auto-populates RTO), selects YES, clicks Proceed.
+        This replaces the LLM trying to guess the RTO name from a long dropdown.
+        """
+        if "confirm_dl_details" in job.steps_completed:
+            return False
+
+        rules = DL_CONFIRM_RULES
+        yes_select_id = rules["yes_select_selector"].lstrip("#")
+        category_id   = rules["category_selector"].lstrip("#")
+
+        visible_select_ids = {
+            (s.get("id") or "")
+            for s in dom_elements.get("selects", [])
+            if s.get("visible", True)
+        }
+        if yes_select_id not in visible_select_ids:
+            return False
+
+        visible_buttons = [
+            (b.get("text") or "").strip().lower()
+            for b in dom_elements.get("buttons", [])
+            if b.get("visible", True)
+        ]
+        if not any("proceed" in t or "confirm" in t for t in visible_buttons):
+            return False
+
+        log.info("brain.confirm_dl_page_detected", step=current_step)
+
+        # Step 1: Select YES — "Are these your DL details?"
+        await self._browser.select_option(rules["yes_select_selector"], label=rules["yes_label"])
+        await asyncio.sleep(0.5)
+
+        # Step 2: Fill PIN code → portal auto-selects the RTO
+        pin_code = (
+            job.customer_data.get("pin_code")
+            or job.customer_data.get("pincode", "")
+        )
+        if pin_code:
+            for sel in rules["pin_input_selectors"]:
+                if await self._browser.fill(sel, pin_code, blur_after=True):
+                    log.info("brain.pin_code_filled", selector=sel, pin=pin_code)
+                    await asyncio.sleep(rules["rto_autofill_wait_ms"] / 1000)
+                    break
+            else:
+                log.warning("brain.pin_code_field_not_found")
+
+        # Step 3: Select category if visible (General = default)
+        if category_id in visible_select_ids:
+            await self._browser.select_option(rules["category_selector"], label=rules["category_default"])
+            await asyncio.sleep(0.3)
+
+        # Step 4: Click Proceed button
+        clicked = await self._browser.click_selector(rules["proceed_button_selector"], "Proceed")
+        if not clicked:
+            clicked = await self._browser.click_text("Proceed", exact=True)
+        if not clicked:
+            log.warning("brain.confirm_dl_proceed_not_clicked")
+            return False
+
+        await asyncio.sleep(1.5)
+        dialog_msg = await self._browser.get_last_dialog_message()
+        if dialog_msg:
+            log.info("brain.confirm_dl_dialog_accepted", message=dialog_msg[:120])
+
+        job.mark_step_done("confirm_dl_details", StepLog(
+            step_name="confirm_dl_details",
+            status="success",
+            observation="DL details confirmed: YES selected, pin code filled, Proceed clicked",
+            action_taken="confirm_dl",
+        ))
+        await self._sm.save(job)
+        return True
+
+    # ── Service selection page (after OTP verification) ───────────────────────
+
+    async def _maybe_handle_service_selection_page(
+        self,
+        job: Job,
+        current_step: str,
+        page_text: str,
+        dom_elements: dict,
+        screenshot: bytes,
+    ) -> bool:
+        """
+        Handle the DL service selection page that appears after OTP verification.
+        Extracts available services from the page, asks user to pick one,
+        validates DL Renewal eligibility (365-day rule), and clicks Proceed.
+        """
+        if "service_selection" in job.steps_completed:
+            return False
+
+        # Must have actually submitted and verified OTP — not just seen the auth page.
+        # auth_method_selection is marked done as soon as the auth page is detected,
+        # which is too early. Only proceed after OTP is confirmed.
+        otp_verified = {"mobile_otp_verification", "aadhaar_otp_verification"}
+        if not any(s in job.steps_completed for s in otp_verified):
+            return False
+
+        lower = page_text.lower()
+        service_page_signals = [
+            "select service", "service selection", "services on dl",
+            "renewal of driving licence", "extract of driving licence",
+            "duplicate driving licence", "change of address on dl",
+            "select the service", "dl services",
+        ]
+        if not any(sig in lower for sig in service_page_signals):
+            return False
+
+        log.info("brain.service_selection_page_detected", step=current_step)
+
+        # Extract available services from checkboxes / radio buttons / links
+        services: list[str] = []
+        known_service_names = [
+            "Renewal of Driving Licence",
+            "Extract of Driving Licence",
+            "Duplicate Driving Licence",
+            "Change of Address",
+            "Addition of Class of Vehicle",
+            "Deletion of Class of Vehicle",
+            "Change of Name in DL",
+            "NOC from State",
+        ]
+        for svc in known_service_names:
+            if svc.lower() in lower:
+                services.append(svc)
+
+        if not services:
+            services = ["Extract of Driving Licence", "Renewal of Driving Licence", "Duplicate Driving Licence"]
+
+        # DL Renewal 365-day validation
+        from datetime import datetime as _dt
+        dl_expiry = job.customer_data.get("dl_expiry_date", "")
+        renewal_note = ""
+        if dl_expiry:
+            try:
+                exp = _dt.strptime(dl_expiry, "%d-%m-%Y")
+                days_left = (exp - _dt.now()).days
+                if days_left > 365:
+                    renewal_note = (
+                        f"Note: Your DL expires on {dl_expiry} ({days_left} days away). "
+                        "DL Renewal is only available within 365 days of expiry — "
+                        "Renewal has been removed from the options below."
+                    )
+                    services = [s for s in services if "renewal" not in s.lower()]
+                    log.info("brain.dl_renewal_ineligible", days_left=days_left)
+            except Exception:
+                pass
+
+        options_to_show = services[:4]
+        context = renewal_note or "Select the DL service you need. The agent will fill the form and submit."
+
+        resp = await self._hl.ask(
+            job=job,
+            step_name="service_selection",
+            question="Which DL service would you like to apply for?",
+            context=context,
+            screenshot=screenshot,
+            options=options_to_show,
+        )
+
+        if resp.answer in ("__timeout__", ""):
+            log.warning("brain.service_selection_no_answer")
+            return False
+
+        selected = resp.answer
+        job.customer_data["selected_service"] = selected
+        log.info("brain.service_selected", service=selected)
+
+        # Click the selected service (checkbox / radio / link)
+        clicked = False
+        # Try text click first
+        for variant in [selected, selected.split(" of ")[0]]:
+            if await self._browser.click_text(variant, exact=False):
+                clicked = True
+                log.info("brain.service_clicked_text", text=variant)
+                break
+
+        if not clicked:
+            # JS: find element containing the service text and click its input
+            result = await self._browser.evaluate(f"""() => {{
+                const needle = {json.dumps(selected.lower())};
+                for (const el of document.querySelectorAll('label, td, li, span')) {{
+                    if (!el.textContent.toLowerCase().includes(needle)) continue;
+                    const inp = el.querySelector('input') ||
+                                el.parentElement?.querySelector('input[type="checkbox"], input[type="radio"]');
+                    if (inp) {{ inp.click(); return inp.id || inp.name || 'input'; }}
+                    el.click();
+                    return 'text-el';
+                }}
+                return null;
+            }}""")
+            if result:
+                clicked = True
+                log.info("brain.service_clicked_js", result=result)
+
+        if not clicked:
+            log.warning("brain.service_click_failed", service=selected)
+
+        await asyncio.sleep(0.8)
+
+        # Click Proceed / Continue
+        for btn in ["Proceed", "Continue", "Next", "Submit"]:
+            if await self._browser.click_text(btn, exact=True):
+                log.info("brain.service_proceed_clicked", btn=btn)
+                await asyncio.sleep(2.0)
+                break
+
+        job.mark_step_done("service_selection", StepLog(
+            step_name="service_selection",
+            status="success",
+            observation=f"User selected: {selected}",
+            action_taken="service_selection",
+        ))
+        await self._sm.save(job)
+        return True
+
+    # ── Service form (reason / organ donation / CAPTCHA / ACK) ───────────────
+
+    async def _maybe_handle_service_form_page(
+        self,
+        job: Job,
+        current_step: str,
+        page_text: str,
+        dom_elements: dict,
+        screenshot: bytes,
+    ) -> bool:
+        """
+        Handle the DL service-specific form after service selection.
+        Covers: reason dropdown (ask user), organ donation (5s timeout → NO),
+        CAPTCHA + Submit, popup handling, ACK number extraction.
+        """
+        if "service_form_fill" in job.steps_completed:
+            return False
+        if "service_selection" not in job.steps_completed:
+            return False
+
+        lower = page_text.lower()
+        form_signals = [
+            "reason for", "reason of", "organ donation", "willing to donate",
+            "donor", "form confirmation", "declaration", "confirm application",
+        ]
+        if not any(sig in lower for sig in form_signals):
+            return False
+
+        log.info("brain.service_form_page_detected", step=current_step)
+        selected_service = job.customer_data.get("selected_service", "DL service")
+
+        from config.portal_rules import get_fee
+        expected_fee = get_fee(selected_service, job.state_code or job.customer_data.get("state_code", "RJ"))
+        log.info("brain.expected_fee", service=selected_service, state=job.state_code, fee_inr=expected_fee)
+        job.customer_data["expected_fee_inr"] = expected_fee
+
+        # ── 1. Reason dropdown ────────────────────────────────────────────────
+        if "reason" in lower:
+            reason_opts: list[str] = []
+            for sel in dom_elements.get("selects", []):
+                key = ((sel.get("id") or "") + (sel.get("name") or "") + (sel.get("label") or "")).lower()
+                if "reason" in key:
+                    reason_opts = [o.get("text", o) if isinstance(o, dict) else str(o)
+                                   for o in (sel.get("options") or [])]
+                    reason_opts = [o for o in reason_opts if o and o.strip() and "select" not in o.lower()]
+                    break
+
+            if reason_opts:
+                resp = await self._hl.ask(
+                    job=job,
+                    step_name="service_form_fill",
+                    question=f"Please select your reason for '{selected_service}':",
+                    context="The form requires a reason for this DL service request.",
+                    screenshot=screenshot,
+                    options=reason_opts[:4],
+                )
+                if resp.answer not in ("__timeout__", ""):
+                    for sel in dom_elements.get("selects", []):
+                        key = ((sel.get("id") or "") + (sel.get("name") or "")).lower()
+                        if "reason" in key:
+                            await self._browser.select_option(sel.get("selector", ""), label=resp.answer)
+                            log.info("brain.reason_selected", reason=resp.answer)
+                            await asyncio.sleep(0.5)
+                            break
+
+                    # Click Confirm to load next part of form
+                    for btn in ["Confirm", "Submit", "Proceed", "Next"]:
+                        if await self._browser.click_text(btn, exact=True):
+                            log.info("brain.reason_confirm_clicked", btn=btn)
+                            await asyncio.sleep(2.5)
+                            break
+
+        # Re-read page after reason confirm
+        await asyncio.sleep(0.5)
+        fresh_text = await self._browser.page_text()
+        fresh_dom  = await self._browser.get_interactive_elements()
+
+        # ── 2. Organ donation (5-second timeout → NO) ─────────────────────────
+        if "organ" in fresh_text.lower() or "donat" in fresh_text.lower():
+            log.info("brain.organ_donation_question")
+            resp = await self._hl.ask(
+                job=job,
+                step_name="service_form_fill",
+                question="Do you wish to donate your organs? (Auto-selects NO in 5 seconds)",
+                context="The form has an organ donation option. Your consent is required.",
+                screenshot=await self._browser.screenshot(),
+                options=["Yes", "No"],
+                timeout_seconds=5,
+            )
+            donate_yes = resp.answer.lower().startswith("y") if resp.answer not in ("__timeout__", "") else False
+            log.info("brain.organ_donation_answer", answer=resp.answer, donating=donate_yes)
+
+            if donate_yes:
+                # Find and check organ donation checkbox
+                for inp in fresh_dom.get("inputs", []):
+                    key = ((inp.get("id") or "") + (inp.get("name") or "") + (inp.get("label") or "")).lower()
+                    if "organ" in key or "donat" in key:
+                        await self._browser.ensure_checked(inp.get("selector", ""))
+                        log.info("brain.organ_donation_checked")
+                        break
+            # If NO → leave unchecked (Sarathi's default)
+
+        # Re-read again for CAPTCHA
+        fresh_dom2 = await self._browser.get_interactive_elements()
+
+        # ── 3. CAPTCHA + Submit ───────────────────────────────────────────────
+        captcha_sol = await self._solve_captcha_value()
+        if captcha_sol:
+            await self._fill_captcha_field(fresh_dom2, captcha_sol)
+            log.info("brain.service_form_captcha_filled", solution=captcha_sol)
+            await self._browser.press_key("Tab")
+            await asyncio.sleep(0.5)
+
+        for btn in ["Submit", "Proceed", "Confirm", "Next"]:
+            if await self._browser.click_text(btn, exact=True):
+                log.info("brain.service_form_submitted", btn=btn)
+                await asyncio.sleep(3.0)
+                break
+
+        # ── 4. Handle "NOT donating organs" confirmation popup ────────────────
+        await asyncio.sleep(1.0)
+        dialog_msg = await self._browser.get_last_dialog_message()
+        if dialog_msg:
+            log.info("brain.service_form_dialog", message=dialog_msg[:120])
+
+        # ── 5. Extract ACK number ─────────────────────────────────────────────
+        ack = await self._extract_ack_number()
+        if ack:
+            job.application_number = ack
+            log.info("brain.ack_extracted", ack=ack)
+
+        job.mark_step_done("service_form_fill", StepLog(
+            step_name="service_form_fill",
+            status="success",
+            observation=f"Service form submitted for {selected_service}. ACK: {ack or 'pending'}",
+            action_taken="service_form_fill",
+        ))
+        await self._sm.save(job)
+        return True
+
+    # ── Payment page handler ──────────────────────────────────────────────────
+
+    async def _maybe_handle_payment_page(
+        self,
+        job: Job,
+        page_text: str,
+        dom_elements: dict,
+    ) -> bool:
+        """
+        Detect and handle the fee payment page.
+
+        Rule book facts (from portal_rules.py):
+          - Payment page often opens in a NEW POPUP window
+          - Expected fee is known from get_fee() — log and verify it matches
+          - If fee is deducted but portal shows pending → do NOT retry payment
+          - Preferred: UPI first (fastest), then netbanking/card
+
+        This handler does NOT attempt automated payment — fee deduction is
+        irreversible and must be confirmed by a human or a separate payment flow.
+        Instead it:
+          1. Detects the payment page
+          2. Logs the fee amount shown on screen
+          3. Switches to popup window if needed
+          4. Pauses and asks user to complete payment manually
+          5. After user confirms, extracts ACK number
+        """
+        if "fee_payment" in job.steps_completed:
+            return False
+
+        lower = page_text.lower()
+        payment_signals = [
+            "pay now", "proceed to pay", "payment gateway",
+            "fee payment", "total fee", "amount payable",
+            "transaction amount", "pay fee", "online payment",
+        ]
+        if not any(sig in lower for sig in payment_signals):
+            return False
+
+        from config.portal_rules import PAYMENT_RULES, get_fee
+        expected_fee = job.customer_data.get(
+            "expected_fee_inr",
+            get_fee(
+                job.customer_data.get("selected_service", ""),
+                job.state_code or job.customer_data.get("state_code", "RJ"),
+            ),
+        )
+        log.info("brain.payment_page_detected", expected_fee_inr=expected_fee)
+
+        # Try to switch to popup window if payment opened one
+        try:
+            pages = self._browser._page.context.pages
+            if len(pages) > 1:
+                self._browser._page = pages[-1]
+                log.info("brain.payment_switched_to_popup", pages=len(pages))
+                await asyncio.sleep(1.0)
+                page_text = await self._browser.page_text()
+        except Exception as e:
+            log.warning("brain.payment_popup_switch_failed", error=str(e))
+
+        # Extract fee amount shown on page
+        amount_on_page = await self._browser.evaluate(r"""() => {
+            const text = document.body?.innerText || '';
+            const m = text.match(/(?:Rs\.?|INR|₹)\s*(\d[\d,]+)/i)
+                   || text.match(/(\d[\d,]+)\s*(?:Rs\.?|INR|₹)/i)
+                   || text.match(/total[^₹\d]*(?:Rs\.?|INR|₹)?\s*(\d[\d,]+)/i);
+            return m ? m[1].replace(',','') : null;
+        }""")
+        if amount_on_page:
+            log.info("brain.payment_amount_on_page", amount=amount_on_page, expected=expected_fee)
+
+        # Ask user to complete payment — agent does not auto-pay (irreversible)
+        resp = await self._hl.ask(
+            job=job,
+            step_name="fee_payment",
+            question=(
+                f"Payment page is open. Expected fee: ₹{expected_fee}. "
+                f"{'Amount shown: ₹' + str(amount_on_page) + '.' if amount_on_page else ''} "
+                "Please complete the payment and type 'done' when finished."
+            ),
+            context=(
+                f"Preferred: UPI (fastest). "
+                f"If deduction happened but portal shows pending — do NOT retry. "
+                f"Gateway: {PAYMENT_RULES['gateway']}"
+            ),
+            screenshot=await self._browser.screenshot(),
+            options=["done", "payment failed", "already paid"],
+        )
+
+        answer = (resp.answer or "").lower()
+        if "fail" in answer or answer == "__timeout__":
+            log.warning("brain.payment_failed_or_timeout", answer=answer)
+            return False
+
+        await asyncio.sleep(2.0)
+        ack = await self._extract_ack_number()
+        if ack:
+            job.application_number = ack
+            log.info("brain.ack_after_payment", ack=ack)
+
+        job.mark_step_done("fee_payment", StepLog(
+            step_name="fee_payment",
+            status="success",
+            observation=f"Payment completed. Fee: ₹{expected_fee}. ACK: {ack or 'pending'}",
+            action_taken="payment_human_confirmed",
+        ))
+        await self._sm.save(job)
+        return True
+
+    async def _extract_ack_number(self) -> str:
+        """Extract application reference/ACK number from the current page."""
+        result = await self._browser.evaluate(r"""() => {
+            const text = document.body ? document.body.innerText : '';
+            const patterns = [
+                /application\s+(?:reference\s+)?number[:\s]+([A-Z0-9\/\-]+)/i,
+                /reference\s+number[:\s]+([A-Z0-9\/\-]+)/i,
+                /ACK[:\s#]+([A-Z0-9\/\-]+)/i,
+                /application\s+no[.:\s]+([A-Z0-9\/\-]+)/i,
+                /\b(RJ\d{8,})\b/,
+                /\b([A-Z]{2}\d{10,})\b/,
+            ];
+            for (const pat of patterns) {
+                const m = text.match(pat);
+                if (m && m[1]) return m[1].trim();
+            }
+            return null;
+        }""")
+        return result or ""
+
+    async def _maybe_handle_dl_fetch_page(
+        self,
+        job: Job,
+        current_step: str,
+        page_text: str,
+        dom_elements: dict,
+    ) -> bool:
+        return await self._dl_fetch_impl(job, current_step, page_text, dom_elements)
+
+    async def _maybe_handle_dl_services_landing(self, url: str) -> bool:
+        """
+        dlServicesDet.do is a static instructions page with a single 'Continue'
+        button that takes you to envaction.do. No LLM needed — rules drive it.
+        """
+        rules = DL_SERVICES_LANDING_RULES
+        if rules["url_fragment"] not in url:
+            return False
+
+        log.info("brain.dl_services_landing_detected")
+        clicked = False
+        for text in rules["continue_button_texts"]:
+            if await self._browser.click_text(text, exact=True):
+                clicked = True
+                log.info("brain.dl_services_landing_continue_clicked", via=text)
+                break
+        if not clicked:
+            # JS fallback: click any visible Continue/Proceed button
+            texts_re = "|".join(rules["continue_button_texts"])
+            result = await self._browser.evaluate(f"""() => {{
+                const re = new RegExp('^(' + {json.dumps(texts_re)} + ')$', 'i');
+                const btn = Array.from(document.querySelectorAll(
+                    'button, input[type="submit"], input[type="button"], a.btn'
+                )).find(b => b.offsetParent !== null
+                          && re.test((b.textContent||'').trim() || (b.value||'').trim()));
+                if (btn) {{ btn.click(); return btn.id || btn.tagName; }}
+                return null;
+            }}""")
+            if result:
+                clicked = True
+                log.info("brain.dl_services_landing_js_clicked", via=result)
+        await asyncio.sleep(1.5)
+        return clicked
+
+    async def _dl_fetch_impl(
+        self,
+        job: Job,
+        current_step: str,
+        page_text: str,
+        dom_elements: dict,
+    ) -> bool:
+        """
+        Deterministic handler for the DL number/DOB/CAPTCHA page.
+
+        This page is stable enough that letting the LLM choose each action adds
+        latency and caused a loop of repeated CAPTCHA solving. Runs whenever the
+        DL number + DOB form fields are present and not yet confirmed, regardless
+        of current_step (handles cases where user skipped or LLM mis-marked).
+        """
+        if "confirm_dl_details" in job.steps_completed:
+            return False
+
+        rules = DL_FETCH_RULES
+        dl_sel  = rules["dl_input_selector"]
+        dob_sel = rules["dob_input_selector"]
+
+        selectors = {i.get("selector", "") for i in dom_elements.get("inputs", [])}
+        if dl_sel not in selectors or dob_sel not in selectors:
+            return False
+
+        lower_check = page_text.lower()
+        if ("driving licence number" not in lower_check
+                and "driving license number" not in lower_check):
+            return False
+
+        log.info("brain.dl_fetch_page_detected")
+
+        dl_number = job.customer_data.get("dl_number", "")
+        dob = job.customer_data.get("dob", "")
+        if not dl_number or not dob:
+            question = "Please provide the Driving Licence number and Date of Birth."
+            resp = await self._hl.ask(
+                job=job,
+                step_name=current_step,
+                question=question,
+                context="DL number/DOB are required before fetching DL details.",
+                options=[],
+            )
+            if resp.answer == "__timeout__":
+                self._last_deterministic_failure = (
+                    "DL number/DOB are required, but no human response was available."
+                )
+                return False
+            return False
+
+        self._last_deterministic_failure = ""
+        for attempt in range(1, settings.captcha_max_retries + 1):
+            # Consume stale alerts before this attempt so only this click's
+            # rejection is considered.
+            await self._browser.get_last_dialog_message()
+
+            ok_dl  = await self._browser.fill(dl_sel,  dl_number)
+            ok_dob = await self._browser.fill(dob_sel, dob, blur_after=True)
+            # Give the portal a moment to react to the DOB tab-blur
+            await asyncio.sleep(0.8)
+            # Check the page is still live (Tab can trigger navigation on some portals)
+            try:
+                _ = await self._browser.current_url()
+            except Exception as e:
+                log.warning("brain.dl_fetch_page_closed_after_dob", error=str(e))
+                self._last_deterministic_failure = (
+                    f"Page became unavailable after filling DOB (Tab may have navigated): {e}"
+                )
+                return False
+            fresh_dom = await self._browser.get_interactive_elements()
+            ok_captcha = await self._solve_and_fill_visible_captcha(
+                fresh_dom,
+                image_selector=rules["captcha_image_selector"],
+                force_manual=attempt >= settings.captcha_max_retries,
+                prompt_context=(
+                    "DL details CAPTCHA. Previous automatic attempts were rejected; "
+                    "please provide the CAPTCHA shown for Get DL Details."
+                    if attempt >= settings.captcha_max_retries else ""
+                ),
+            )
+
+            ok_terms = True
+            privacy_sel = rules["privacy_checkbox_selector"]
+            fresh_selectors = {i.get("selector", "") for i in fresh_dom.get("inputs", [])}
+            if privacy_sel in fresh_selectors:
+                ok_terms = await self._browser.ensure_checked(privacy_sel)
+
+            if not (ok_dl and ok_dob and ok_captcha and ok_terms):
+                log.warning(
+                    "brain.dl_fetch_prepare_failed",
+                    attempt=attempt,
+                    dl=ok_dl,
+                    dob=ok_dob,
+                    captcha=ok_captcha,
+                    terms=ok_terms,
+                )
+                self._last_deterministic_failure = (
+                    "Could not prepare DL details form before clicking Get DL Details. "
+                    f"dl={ok_dl}, dob={ok_dob}, captcha={ok_captcha}, terms={ok_terms}."
+                )
+                return False
+
+            get_btn_sel = rules["get_dl_button_selector"]
+            clicked = await self._browser.click_selector(get_btn_sel, "Get DL Details")
+            if not clicked:
+                clicked = await self._browser.click_text("Get DL Details", exact=True)
+
+            if not clicked:
+                log.warning("brain.get_dl_details_click_failed", attempt=attempt)
+                self._last_deterministic_failure = (
+                    "Could not click Get DL Details even though the form fields were filled."
+                )
+                return False
+
+            await asyncio.sleep(2.0)
+            dialog_msg = await self._browser.get_last_dialog_message()
+            if dialog_msg and self._dialog_indicates_failure(dialog_msg):
+                log.warning(
+                    "brain.dl_fetch_rejected",
+                    attempt=attempt,
+                    message=dialog_msg[:160],
+                )
+                after_reject_dom = await self._browser.get_interactive_elements()
+                has_dl_field = any(
+                    i.get("selector") == dl_sel and i.get("visible", True)
+                    for i in after_reject_dom.get("inputs", [])
+                )
+                if not has_dl_field:
+                    log.warning("brain.dl_fetch_form_disappeared_after_reject")
+                    if attempt < settings.captcha_max_retries:
+                        try:
+                            current = await self._browser.current_url()
+                            await self._browser.goto(current)
+                            await asyncio.sleep(1.0)
+                            log.info("brain.dl_fetch_form_reloaded_after_reject", attempt=attempt)
+                            continue
+                        except Exception as e:
+                            log.warning("brain.dl_fetch_reload_failed", error=str(e))
+                    self._last_deterministic_failure = (
+                        f"Portal rejected Get DL Details with alert '{dialog_msg}', "
+                        "and the DL form disappeared even after retry/reload. Ask the "
+                        "user/operator to inspect DL/DOB or wait before retrying."
+                    )
+                    return False
+                continue
+
+            if dialog_msg:
+                log.info("brain.dl_fetch_dialog_accepted", message=dialog_msg[:160])
+
+            verified = await self._dl_fetch_success_visible()
+            if verified:
+                log.info("brain.get_dl_details_verified", attempt=attempt)
+                self._last_deterministic_failure = ""
+                return True
+
+            log.warning("brain.get_dl_details_no_success_proof", attempt=attempt)
+
+        log.warning("brain.dl_fetch_exhausted_retries")
+        self._last_deterministic_failure = (
+            "Clicked Get DL Details but could not verify that DL details or the next controls appeared. "
+            "The agent should stay on the DL fetch page, retry with a fresh CAPTCHA if available, "
+            "or ask the user/operator instead of clicking navigation links."
+        )
+        return False
+
+    async def _dl_fetch_success_visible(self) -> bool:
+        """Return True when the page proves Get DL Details worked."""
+        try:
+            page_text = await self._browser.page_text()
+            dom = await self._browser.get_interactive_elements()
+        except Exception as e:
+            log.warning("brain.dl_fetch_verify_failed", error=str(e))
+            return False
+
+        # Fastest check: if #dlno is gone the form navigated away → success
+        visible_input_ids = {
+            (i.get("id") or "").lower()
+            for i in dom.get("inputs", [])
+            if i.get("visible", True)
+        }
+        if "dlno" not in visible_input_ids:
+            log.info("brain.dl_fetch_success_dl_field_gone")
+            return True
+
+        lower = page_text.lower()
+        visible_select_ids = {
+            (s.get("id") or "")
+            for s in dom.get("selects", [])
+            if s.get("visible", True)
+        }
+        visible_buttons = [
+            (b.get("text") or "").strip().lower()
+            for b in dom.get("buttons", [])
+            if b.get("visible", True)
+        ]
+        has_confirm_button = any(t in {"proceed", "continue"} for t in visible_buttons)
+        has_details_text = any(
+            marker in lower
+            for marker in [
+                "driving licence details",
+                "driving license details",
+                "licence holder",
+                "license holder",
+                "class of vehicles",
+                "select category",
+                "applicant details",
+            ]
+        )
+        has_confirm_select = "dispDLDet" in visible_select_ids
+        return (has_confirm_select or has_details_text) and has_confirm_button
+
+    async def _solve_and_fill_visible_captcha(
+        self,
+        dom_elements: dict,
+        *,
+        image_selector: str = "",
+        force_manual: bool = False,
+        prompt_context: str = "",
+    ) -> bool:
+        captcha_bytes = await self._fetch_visible_captcha_bytes(image_selector=image_selector)
+        if not captcha_bytes:
+            try:
+                captcha_bytes = await self._browser.screenshot()
+            except Exception as e:
+                log.warning("brain.captcha_fallback_screenshot_failed", error=str(e))
+                return False
+        solution = await self._captcha.solve(
+            captcha_bytes,
+            force_manual=force_manual,
+            prompt_context=prompt_context,
+        )
+        if solution and force_manual:
+            latest_bytes = await self._fetch_visible_captcha_bytes(image_selector=image_selector)
+            if latest_bytes and latest_bytes != captcha_bytes:
+                log.warning("brain.captcha_changed_after_manual_answer")
+                solution = await self._captcha.solve(
+                    latest_bytes,
+                    force_manual=True,
+                    prompt_context=(
+                        f"{prompt_context}\n"
+                        "The CAPTCHA refreshed while waiting. Use the newly saved image only."
+                    ).strip(),
+                )
+        if not solution:
+            return False
+
+        return await self._fill_captcha_field(dom_elements, solution)
+
+    async def _fetch_visible_captcha_bytes(self, image_selector: str = "") -> bytes:
+        """Fetch the visible CAPTCHA image bytes from its src URL."""
+        data_url = await self._browser.evaluate(f"""async () => {{
+            const preferredSelector = {json.dumps(image_selector)};
+            const isVisible = (img) => {{
+                if (!img || !img.src) return false;
+                const st = window.getComputedStyle(img);
+                return st.display !== 'none' && st.visibility !== 'hidden';
+            }};
+            let img = preferredSelector ? document.querySelector(preferredSelector) : null;
+            if (!isVisible(img)) img = null;
+            const imgs = Array.from(document.querySelectorAll(
+                'img[id*="captcha" i], img[src*="captcha" i], img[id*="captha" i], img[src*="captha" i], img[id*="cap" i], img[src*="cap" i]'
+            )).filter(isVisible);
+            if (!img) {{
+                img = imgs.find(x => x.id === 'captchaimg')
+                   || imgs.find(x => x.id === 'capimg')
+                   || imgs.find(x => /captcha|captha|cap/i.test((x.id || '') + ' ' + (x.src || '')));
+            }}
+            if (!img || !img.src) return null;
+            const response = await fetch(img.src, {{
+                credentials: 'same-origin',
+                cache: 'no-store',
+            }});
+            if (!response.ok) return null;
+            const blob = await response.blob();
+            return await new Promise((resolve, reject) => {{
+                const reader = new FileReader();
+                reader.onloadend = () => resolve({{
+                    id: img.id || '',
+                    src: img.src.slice(0, 120),
+                    data: reader.result,
+                }});
+                reader.onerror = () => reject(new Error('captcha_file_reader_failed'));
+                reader.readAsDataURL(blob);
+            }});
+        }}""")
+        if not data_url or not isinstance(data_url, dict):
+            return b""
+        raw = data_url.get("data") or ""
+        if "," not in raw:
+            return b""
+        try:
+            decoded = base64.b64decode(raw.split(",", 1)[1])
+            log.info(
+                "brain.captcha_fetched_from_src",
+                id=data_url.get("id", ""),
+                bytes=len(decoded),
+            )
+            return decoded
+        except Exception as e:
+            log.warning("brain.captcha_src_decode_failed", error=str(e))
+            return b""
+
+    async def _reveal_otp_section(self) -> int:
+        """Show the hidden OTP entry section that Sarathi's JS normally reveals via AJAX callback."""
+        revealed = await self._browser.evaluate("""() => {
+            let count = 0;
+            // Reveal any element whose id/class contains 'otp' and is currently hidden
+            document.querySelectorAll('*[id], *[class]').forEach(el => {
+                const key = ((el.id || '') + ' ' + (el.className || '')).toLowerCase();
+                if (!key.includes('otp')) return;
+                const st = window.getComputedStyle(el);
+                if (st.display === 'none' || el.hidden) {
+                    el.style.display = 'block';
+                    el.removeAttribute('hidden');
+                    count++;
+                }
+            });
+            // Also try known Sarathi div IDs
+            ['enterSarathiOtpDiv', 'sarathiOtpDiv', 'otpDiv', 'enterOtpDiv',
+             'entOtpDiv', 'otp_section', 'otpSection', 'verifyOtpDiv'].forEach(id => {
+                const el = document.getElementById(id);
+                if (el && (el.hidden || window.getComputedStyle(el).display === 'none')) {
+                    el.style.display = 'block';
+                    el.removeAttribute('hidden');
+                    count++;
+                }
+            });
+            return count;
+        }""")
+        if revealed:
+            log.info("brain.otp_section_revealed", elements=revealed)
+        return int(revealed or 0)
+
+    async def _solve_captcha_value(
+        self,
+        *,
+        image_selector: str = "",
+        force_manual: bool = False,
+        prompt_context: str = "",
+    ) -> str:
+        """Solve the visible CAPTCHA and return the text solution (not yet filled)."""
+        captcha_bytes = await self._fetch_visible_captcha_bytes(image_selector=image_selector)
+        if not captcha_bytes:
+            try:
+                captcha_bytes = await self._browser.screenshot()
+            except Exception as e:
+                log.warning("brain.captcha_screenshot_failed", error=str(e))
+                return ""
+        solution = await self._captcha.solve(
+            captcha_bytes,
+            force_manual=force_manual,
+            prompt_context=prompt_context,
+        )
+        if solution and force_manual:
+            latest_bytes = await self._fetch_visible_captcha_bytes(image_selector=image_selector)
+            if latest_bytes and latest_bytes != captcha_bytes:
+                log.warning("brain.captcha_changed_after_manual_answer")
+                solution = await self._captcha.solve(
+                    latest_bytes,
+                    force_manual=True,
+                    prompt_context=(
+                        f"{prompt_context}\n"
+                        "The CAPTCHA refreshed while waiting. Use the newly saved image only."
+                    ).strip(),
+                )
+        # Refusal filtering also happens inside CaptchaSolver._solve_claude(),
+        # but guard here too in case a different provider returns garbage.
+        if solution and len(solution) > 12:
+            log.warning("brain.captcha_solution_too_long", chars=len(solution), preview=solution[:20])
+            return ""
+        return solution or ""
+
+    async def _fill_captcha_field(self, dom_elements: dict, solution: str) -> bool:
+        """Fill a CAPTCHA field with the given solution string."""
+        selectors = []
+        for inp in dom_elements.get("inputs", []):
+            if inp.get("disabled"):
+                continue
+            key = " ".join([
+                inp.get("id", ""),
+                inp.get("name", ""),
+                inp.get("placeholder", ""),
+            ]).lower()
+            if "captcha" in key or "captha" in key:
+                selectors.append(inp.get("selector", ""))
+        selectors.extend([
+            "#entcaptxt", "#entCaptha", "#captcha",
+            "input[id*='captha' i]:not([type='hidden'])",
+            "input[name*='captha' i]:not([type='hidden'])",
+            "input[id*='captcha' i]:not([type='hidden'])",
+            "input[name*='captcha' i]:not([type='hidden'])",
+            "input[placeholder*='captcha' i]:not([type='hidden'])",
+        ])
+        for selector in [s for s in selectors if s]:
+            if await self._browser.fill(selector, solution):
+                proof = await self._browser.evaluate(f"""() => {{
+                    const el = document.querySelector({json.dumps(selector)});
+                    return {{
+                        ok: !!el && el.value === {json.dumps(solution)},
+                        value_len: el ? (el.value || '').length : 0,
+                    }};
+                }}""")
+                log.info(
+                    "brain.captcha_field_filled",
+                    selector=selector,
+                    solution=solution,
+                    proof=proof,
+                )
+                if proof and proof.get("ok"):
+                    return True
+
+        # JS fallback — Sarathi sometimes CSS-hides the captcha input so Playwright
+        # fill() times out waiting for it to be visible. Set value directly via JS.
+        result = await self._browser.evaluate(f"""() => {{
+            const val = {json.dumps(solution)};
+            const candidates = [
+                '#entcaptxt', '#entCaptha', '#captcha',
+                'input[id*="captha" i]', 'input[id*="captcha" i]',
+                'input[name*="captha" i]', 'input[name*="captcha" i]',
+            ];
+            for (const s of candidates) {{
+                const el = document.querySelector(s);
+                if (!el || el.type === 'hidden') continue;
+                const nativeSet = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value').set;
+                nativeSet.call(el, val);
+                el.dispatchEvent(new Event('input',  {{bubbles:true}}));
+                el.dispatchEvent(new Event('change', {{bubbles:true}}));
+                el.dispatchEvent(new Event('blur',   {{bubbles:true}}));
+                return {{
+                    selector: s,
+                    ok: el.value === val,
+                    value_len: (el.value || '').length,
+                }};
+            }}
+            return null;
+        }}""")
+        if result:
+            log.info("brain.captcha_field_filled_js", result=result, solution=solution)
+            return bool(result.get("ok")) if isinstance(result, dict) else True
+        return False
+
+    async def _api_generate_sarathi_otp(self, mobile: str, captcha: str) -> bool:
+        """
+        Call getOtpFromSarathi.do directly using browser session cookies.
+        This bypasses the disabled #generateSarathiotp UI button.
+        The server still validates CAPTCHA and sends OTP to the mobile.
+        """
+        import httpx
+        try:
+            cookies = await self._browser.get_session_cookies_dict()
+            current_url = await self._browser.current_url()
+            async with httpx.AsyncClient(timeout=20, verify=False) as client:
+                resp = await client.post(
+                    "https://sarathi.parivahan.gov.in/sarathiservice/getOtpFromSarathi.do",
+                    data={"mobileNumber": mobile, "captcha": captcha},
+                    cookies=cookies,
+                    headers={
+                        "Accept": "*/*",
+                        "Accept-Language": "en-US,en;q=0.9",
+                        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                        "Origin": "https://sarathi.parivahan.gov.in",
+                        "Referer": current_url,
+                        "X-Requested-With": "XMLHttpRequest",
+                        "User-Agent": settings.browser_user_agent,
+                    },
+                )
+            response_text = resp.text.strip() if resp.text else ""
+            log.info(
+                "brain.generate_otp_api_response",
+                status=resp.status_code,
+                body=response_text[:200],
+            )
+            # Sarathi returns "SUCCESS" or a mobile number on success
+            if resp.status_code == 200 and response_text:
+                lower = response_text.lower()
+                if "error" in lower or "invalid" in lower or "captcha" in lower:
+                    log.warning("brain.generate_otp_api_rejected", body=response_text[:200])
+                    return False
+                return True
+            return False
+        except Exception as e:
+            log.warning("brain.generate_otp_api_exception", error=str(e))
+            return False
+
+    @staticmethod
+    def _has_otp_input(dom_elements: dict, page_text: str) -> bool:
+        lower_text = page_text.lower()
+        if "otp" not in lower_text:
+            return False
+        for inp in dom_elements.get("inputs", []):
+            if not inp.get("visible", True):
+                continue
+            key = " ".join([
+                inp.get("id", ""),
+                inp.get("name", ""),
+                inp.get("placeholder", ""),
+            ]).lower()
+            if "otp" in key:
+                return True
+        return any(term in lower_text for term in ["enter otp", "one time password", "verify otp"])
+
+    @staticmethod
+    def _otp_input_selectors(dom_elements: dict) -> list[str]:
+        selectors: list[str] = []
+        for inp in dom_elements.get("inputs", []):
+            if not inp.get("visible", True) or inp.get("disabled"):
+                continue
+            key = " ".join([
+                inp.get("id", ""),
+                inp.get("name", ""),
+                inp.get("placeholder", ""),
+            ]).lower()
+            if "otp" in key:
+                selectors.append(inp.get("selector", ""))
+        if not selectors:
+            for inp in dom_elements.get("inputs", []):
+                if not inp.get("visible", True) or inp.get("disabled"):
+                    continue
+                input_type = (inp.get("type") or "").lower()
+                key = " ".join([
+                    inp.get("id", ""),
+                    inp.get("name", ""),
+                    inp.get("placeholder", ""),
+                ]).lower()
+                blocked = ["captcha", "captha", "dlno", "dob", "date", "aadhaarholdingtype"]
+                if input_type in {"text", "tel", "number"} and not any(b in key for b in blocked):
+                    selectors.append(inp.get("selector", ""))
+        selectors.extend([
+            "input[id*='otp' i]:not([type='hidden'])",
+            "input[name*='otp' i]:not([type='hidden'])",
+            "input[placeholder*='otp' i]:not([type='hidden'])",
+        ])
+        return [s for s in selectors if s]
+
+    @staticmethod
+    def _dialog_indicates_failure(message: str) -> bool:
+        lower = message.lower()
+        if "application already exists" in lower:
+            return False
+        failure_terms = [
+            "please provide",
+            "invalid",
+            "not valid",
+            "captcha",
+            "error",
+            "failed",
+            "mandatory",
+            "required",
+        ]
+        return any(term in lower for term in failure_terms)
+
+    @staticmethod
+    def _is_bad_navigation(action: AgentAction, current_step: str) -> str:
+        text = (action.text or "").strip().lower()
+        desc = (action.description or "").strip().lower()
+        if current_step not in ("open_homepage", "close_homepage_popup", "select_state"):
+            blocked_texts = {"dashboard", "login", "change state", "home"}
+            if (
+                text in blocked_texts
+                or "clicking 'dashboard'" in desc
+                or "clicking 'login'" in desc
+                or "clicking 'change state'" in desc
+                or "clicking 'home'" in desc
+            ):
+                return (
+                    "Blocked backtracking/navigation action. Dashboard/Login/Change State/Home "
+                    "leaves the current application flow and can restart the portal. Stay on "
+                    "the current Sarathi application page, use visible form fields, retry captcha, "
+                    "or ask the user/operator for help."
+                )
+        return ""
+
+    def _state_signature(self, step_name: str, url: str, dom_elements: dict) -> str:
+        """
+        Compact page-state fingerprint for loop detection.
+
+        We intentionally use DOM values/checked states instead of body text because
+        Sarathi prints changing timestamps on some pages, which would hide loops.
+        """
+        import hashlib
+
+        selects = [
+            {
+                "k": s.get("id") or s.get("name") or s.get("selector"),
+                "v": s.get("value", ""),
+                "t": s.get("selected_text", ""),
+            }
+            for s in dom_elements.get("selects", [])[:20]
+            if s.get("visible", True)
+        ]
+        inputs = [
+            {
+                "k": i.get("id") or i.get("name") or i.get("selector"),
+                "type": i.get("type", ""),
+                "v": i.get("value", ""),
+                "checked": i.get("checked", False),
+            }
+            for i in dom_elements.get("inputs", [])[:40]
+            if i.get("visible", True)
+        ]
+        buttons = [
+            {
+                "t": b.get("text", ""),
+                "disabled": b.get("disabled", False),
+            }
+            for b in dom_elements.get("buttons", [])[:20]
+            if b.get("visible", True)
+        ]
+        links = [
+            l.get("text", "")
+            for l in dom_elements.get("links", [])[:30]
+            if l.get("visible", True)
+        ]
+        raw = json.dumps(
+            {
+                "step": step_name,
+                "url": url.split("?")[0],
+                "selects": selects,
+                "inputs": inputs,
+                "buttons": buttons,
+                "links": links,
+            },
+            sort_keys=True,
+        )
+        return hashlib.sha256(raw.encode()).hexdigest()
 
     # ── Self-diagnosis ────────────────────────────────────────────────────────
 
@@ -530,23 +3148,33 @@ class AgentBrain:
                     opts = ", ".join(f'"{o["t"]}"' for o in s["options"][:10])
                     parts.append(
                         f'  selector="{s["selector"]}"  id="{s["id"]}"  '
-                        f'name="{s["name"]}"  options=[{opts}]  visible={s["visible"]}'
+                        f'name="{s["name"]}"  selected="{s.get("selected_text", "")}"  '
+                        f'value="{s.get("value", "")}"  options=[{opts}]  visible={s["visible"]}'
                     )
             else:
                 parts.append("NO <select> dropdowns found on this page.")
 
             if inputs:
-                parts.append("INPUT FIELDS:")
-                for i in inputs[:8]:
+                visible_inputs = [i for i in inputs if i.get("visible", True)]
+                hidden_inputs  = [i for i in inputs if not i.get("visible", True)]
+                parts.append(f"INPUT FIELDS (visible={len(visible_inputs)}, hidden={len(hidden_inputs)}):")
+                for i in visible_inputs[:20]:
+                    dis = "  [DISABLED]" if i.get("disabled") else ""
+                    checked = f' checked={i.get("checked")}' if i.get("type") in ("checkbox", "radio") else ""
+                    current = f' value="{i.get("value", "")[:80]}"'
                     parts.append(
                         f'  selector="{i["selector"]}"  id="{i["id"]}"  '
                         f'name="{i["name"]}"  type="{i["type"]}"  '
-                        f'placeholder="{i["placeholder"]}"  visible={i["visible"]}'
+                        f'placeholder="{i["placeholder"]}"{current}{checked}{dis}'
                     )
 
             if buttons:
                 visible_btns = [b for b in buttons if b["visible"]][:10]
-                parts.append(f"BUTTONS: {[b['text'] for b in visible_btns]}")
+                btn_info = [
+                    b["text"] + (" [DISABLED — do NOT JS-click]" if b.get("disabled") else "")
+                    for b in visible_btns
+                ]
+                parts.append(f"BUTTONS: {btn_info}")
 
             if links:
                 vis_links = [l for l in links if l["visible"]][:20]
@@ -599,9 +3227,13 @@ KNOWN OBSTACLES: {json.dumps(next_step.known_obstacles if next_step else [])}
 1. NEVER click Reset / Clear All / Cancel / browser back button.
 2. Dismiss any popup/modal FIRST before other actions.
 3. If two auth options exist, pick mobile OTP.
-4. Email is optional — skip if not in customer data.
+4. Email is optional — leave the email field blank unless the portal marks it required.
+   Do NOT fill any fallback or placeholder email.
 5. If CAPTCHA fails, get a fresh one and retry.
 6. Use selectors EXACTLY from ACTUAL PAGE ELEMENTS above — do NOT invent selectors.
+   NEVER use CSS `:contains()` syntax (e.g. `button:contains('OK')`) — it is jQuery-only
+   and does NOT work in Playwright. Instead: leave selector blank and set text="OK", OR
+   use the button's ID from the BUTTONS list (e.g. `#dlconfirm`).
 7. If no <select> exists for state selection, the state is likely a CLICKABLE LINK.
    Use action_type="click" and text="Rajasthan" (or the state name) to click it.
 8. Set step_complete=true ONLY when you are certain it worked (e.g. URL changed,
@@ -613,15 +3245,33 @@ KNOWN OBSTACLES: {json.dumps(next_step.known_obstacles if next_step else [])}
     form. Re-fill ALL fields from scratch, starting from the first empty one.
 11. When a form has multiple fields (e.g. DL number + DOB + CAPTCHA), fill ALL of
     them before clicking submit. Check ACTIONS ALREADY TAKEN to know which ones are
-    done, then fill the remaining ones in sequence.
+    done, then fill the remaining ones. If 2+ ordinary fields are visible and their
+    values are known in CUSTOMER DATA, prefer one action_type="fill_many" with:
+    tool_args={{"fields":[{{"selector":"#fieldId","value":"value"}}]}}
+    instead of filling them one by one. Do not include CAPTCHA in fill_many.
 12. CAPTCHA: always use action_type="tool_call" and tool="captcha_solver" to solve it.
     After solving, fill the captcha input, then click the submit/GO button.
+13. DISABLED BUTTONS (shown as [DISABLED — do NOT JS-click]): never try to click a
+    disabled button. It means a required checkbox or field hasn't been filled yet.
+    Look at ALL visible inputs to find what's missing (a service checkbox, agreement,
+    or required field). Complete that first, then the button will enable.
+14. After clicking 'Get DL Details' / 'GO', use action_type="wait" for 3 seconds to let
+    the AJAX response load before reading the page. New inputs or sections may appear.
+15. If you are stuck scrolling and can't find an element, STOP scrolling and instead
+    look at BUTTONS and INPUT FIELDS above — the element may need to be revealed by
+    clicking something (like 'Get DL Details') first.
+16. If the portal asks for a field that is not in CUSTOMER DATA, ask the user with
+    action_type="human_help", need_human=true, human_question="...", and
+    tool_args={{"field_key":"pin_code"}} (use the relevant key). If CUSTOMER DATA has
+    pin_code or pincode, fill that value directly; for this test it is 334401.
+17. For checkboxes/radio buttons, use action_type="check" with the exact selector.
+    Only click a checkbox if it is currently unchecked.
 
 === RESPOND WITH EXACTLY THIS JSON ===
 {{
   "observation": "what is visible on screen right now",
   "thought": "why this approach, and what is different from last attempt if applicable",
-  "action_type": "click | fill | select | upload | scroll | wait | tool_call | close_popup | otp_wait | human_help | done",
+  "action_type": "click | fill | fill_many | check | select | upload | scroll | wait | tool_call | close_popup | otp_wait | human_help | done",
   "description": "plain English description of what you are doing",
   "selector": "exact CSS selector from ACTUAL PAGE ELEMENTS, or empty string",
   "text": "link/button text to click, or text to type",
@@ -671,6 +3321,16 @@ KNOWN OBSTACLES: {json.dumps(next_step.known_obstacles if next_step else [])}
             detail = []
             ok = False
 
+            # Strip jQuery :contains() selectors — they're invalid CSS/JS.
+            # Extract the text and fall through to click_text instead.
+            if action.selector and ":contains(" in action.selector:
+                import re as _re
+                m = _re.search(r':contains\([\'"](.+?)[\'"]\)', action.selector)
+                if m and not action.text:
+                    action.text = m.group(1)
+                action.selector = ""
+                detail.append(f"stripped_contains_selector extracted_text='{action.text}'")
+
             if action.selector:
                 ok = await self._browser.click_selector(action.selector, action.description)
                 detail.append(f"selector='{action.selector}' -> {ok}")
@@ -703,6 +3363,35 @@ KNOWN OBSTACLES: {json.dumps(next_step.known_obstacles if next_step else [])}
                 )
                 return ok, f"fill selector='{action.selector}' blur_after={is_date}"
             return False, "fill: no selector"
+
+        elif at == "fill_many":
+            fields = action.tool_args.get("fields", [])
+            if not fields:
+                return False, "fill_many: no fields"
+
+            details = []
+            ok_count = 0
+            for field in fields:
+                selector = field.get("selector", "")
+                source_key = field.get("source_key", "")
+                value = field.get("value", "")
+                if source_key and not value:
+                    value = job.customer_data.get(source_key, "")
+                if not selector:
+                    details.append("missing_selector -> False")
+                    continue
+                is_date = any(k in selector.lower() for k in ["dob", "date", "birth"])
+                ok = await self._browser.fill(selector, str(value), blur_after=is_date)
+                details.append(f"{selector} -> {ok}")
+                if ok:
+                    ok_count += 1
+            return ok_count == len(fields), f"fill_many {ok_count}/{len(fields)} | " + " | ".join(details)
+
+        elif at == "check":
+            if action.selector:
+                ok = await self._browser.ensure_checked(action.selector, checked=True)
+                return ok, f"check selector='{action.selector}'"
+            return False, "check: no selector"
 
         elif at == "select":
             detail = []
@@ -815,6 +3504,12 @@ KNOWN OBSTACLES: {json.dumps(next_step.known_obstacles if next_step else [])}
         if answer == "__timeout__":
             log.warning("brain.human_loop_timeout", job_id=job.job_id)
             return
+
+        field_key = action.tool_args.get("field_key") or action.tool_args.get("customer_data_key")
+        if field_key and answer and answer.lower() not in {"skip", "abort job", "cancel"}:
+            job.customer_data[field_key] = answer
+            await self._sm.save(job)
+            log.info("brain.human_answer_saved", field_key=field_key, value=answer)
 
         # Record the human solution for future runs
         scenario_id = LearningStore.make_scenario_id(

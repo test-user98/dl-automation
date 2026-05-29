@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     captcha_api_key: str = Field("", env="CAPTCHA_API_KEY")
     captcha_timeout_seconds: int = Field(60, env="CAPTCHA_TIMEOUT_SECONDS")
     captcha_max_retries: int = Field(3, env="CAPTCHA_MAX_RETRIES")
+    captcha_manual_timeout_seconds: int = Field(300, env="CAPTCHA_MANUAL_TIMEOUT_SECONDS")
 
     # ── BROWSER ───────────────────────────────────────────────────────────────
     browser_headless: bool = Field(False, env="BROWSER_HEADLESS")
@@ -39,9 +40,12 @@ class Settings(BaseSettings):
     browser_timeout_ms: int = Field(30000, env="BROWSER_TIMEOUT_MS")
     browser_viewport_width: int = Field(1280, env="BROWSER_VIEWPORT_WIDTH")
     browser_viewport_height: int = Field(800, env="BROWSER_VIEWPORT_HEIGHT")
+    browser_channel: str = Field("chrome", env="BROWSER_CHANNEL")
+    browser_profile_dir: str = Field("./data/chrome_profile", env="BROWSER_PROFILE_DIR")
+    browser_locale: str = Field("en-IN", env="BROWSER_LOCALE")
+    browser_timezone_id: str = Field("Asia/Kolkata", env="BROWSER_TIMEZONE_ID")
     browser_user_agent: str = Field(
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "",
         env="BROWSER_USER_AGENT",
     )
 
@@ -102,6 +106,7 @@ class Settings(BaseSettings):
     # ── AGENT BEHAVIOUR ───────────────────────────────────────────────────────
     max_steps_per_job: int = Field(100, env="MAX_STEPS_PER_JOB")
     max_consecutive_step_failures: int = Field(4, env="MAX_CONSECUTIVE_STEP_FAILURES")
+    max_repeated_page_states: int = Field(3, env="MAX_REPEATED_PAGE_STATES")
     stuck_threshold_retries: int = Field(3, env="STUCK_THRESHOLD_RETRIES")
     screenshot_on_every_step: bool = Field(True, env="SCREENSHOT_ON_EVERY_STEP")
     log_level: str = Field("INFO", env="LOG_LEVEL")

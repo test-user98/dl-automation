@@ -12,9 +12,11 @@ This keeps the customer in control while removing them from the happy path entir
 import asyncio
 import base64
 import json
+import sys
 import httpx
 import structlog
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 from config.settings import get_settings
@@ -77,10 +79,12 @@ class HumanLoop:
         context: str,
         screenshot: Optional[bytes] = None,
         options: list[str] = None,
+        timeout_seconds: Optional[int] = None,
     ) -> HumanResponse:
         """
         Block until the human responds or the timeout expires.
         Returns HumanResponse with the customer's answer.
+        Pass timeout_seconds to override the global setting (e.g. 5 for organ donation).
         """
         screenshot_b64 = ""
         if screenshot:
@@ -105,26 +109,31 @@ class HumanLoop:
 
         await self._sm.transition(job, JobStatus.STUCK_HUMAN_NEEDED, question)
 
+        effective_timeout = timeout_seconds if timeout_seconds is not None else (
+            settings.human_loop_timeout_minutes * 60
+        )
+
         backend = settings.human_loop_backend
         if backend == "webhook":
             await self._send_webhook(request)
-            response = await self._poll_for_response(
-                job.job_id, settings.human_loop_timeout_minutes * 60
-            )
+            response = await self._poll_for_response(job.job_id, effective_timeout)
         elif backend == "firebase":
             await self._send_firebase(request)
-            response = await self._poll_for_response(
-                job.job_id, settings.human_loop_timeout_minutes * 60
-            )
+            response = await self._poll_for_response(job.job_id, effective_timeout)
         elif backend == "console":
             # Terminal / test mode — print question, read answer from stdin
-            response = await self._ask_console(request)
+            try:
+                response = await asyncio.wait_for(
+                    self._ask_console(request),
+                    timeout=effective_timeout,
+                )
+            except asyncio.TimeoutError:
+                log.info("human_loop.console_timeout", step=step_name, timeout=effective_timeout)
+                response = None
         else:
             # polling — customer calls POST /jobs/{id}/human-response via API
             self._pending[job.job_id] = None
-            response = await self._poll_for_response(
-                job.job_id, settings.human_loop_timeout_minutes * 60
-            )
+            response = await self._poll_for_response(job.job_id, effective_timeout)
 
         if response is None:  # noqa: SIM102
             # Timeout — escalate to partner agent console
@@ -164,16 +173,69 @@ class HumanLoop:
                 print(f"  {i}. {opt}")
             print()
 
+        is_otp = "otp" in request.question.lower() or "otp" in request.step_name.lower()
+        prompt = "Enter OTP: " if is_otp else "Your answer (or press Enter to skip): "
+
         loop = asyncio.get_event_loop()
-        try:
-            answer = await loop.run_in_executor(
-                None,
-                lambda: input("Your answer (or press Enter to skip this step): ").strip()
-            )
-        except EOFError:
+
+        async def read_stdin() -> Optional[str]:
+            try:
+                return await loop.run_in_executor(None, lambda: input(prompt).strip())
+            except EOFError:
+                log.warning("human_loop.console_unavailable", job_id=request.job_id, step=request.step_name)
+                return None
+
+        async def read_otp_file() -> str:
+            otp_path = Path("data/manual_otp.txt")
+            while True:
+                if otp_path.exists():
+                    raw = otp_path.read_text(encoding="utf-8").strip()
+                    digits = "".join(ch for ch in raw if ch.isdigit())
+                    if digits:
+                        try:
+                            otp_path.unlink()
+                        except OSError:
+                            pass
+                        print(f"\nAgent received OTP from {otp_path}: '{digits}'\n")
+                        return digits
+                await asyncio.sleep(1)
+
+        if is_otp:
+            print("You can also reply to Codex with the OTP; Codex will write it to data/manual_otp.txt.\n")
+            stdin_task = asyncio.create_task(read_stdin())
+            file_task = asyncio.create_task(read_otp_file())
             answer = ""
+            while not answer:
+                done, pending = await asyncio.wait(
+                    {stdin_task, file_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if file_task in done:
+                    answer = file_task.result()
+                    if not stdin_task.done():
+                        stdin_task.cancel()
+                    break
+                if stdin_task in done:
+                    answer = stdin_task.result() or ""
+                    if answer or sys.stdin.isatty():
+                        if not file_task.done():
+                            file_task.cancel()
+                        break
+                    # No interactive stdin. Keep waiting for data/manual_otp.txt.
+                    stdin_task = asyncio.create_task(read_stdin())
+        else:
+            answer = await read_stdin()
+            if answer is None:
+                return "__timeout__"
 
         if not answer:
+            if not sys.stdin.isatty():
+                log.warning("human_loop.console_no_tty", job_id=request.job_id, step=request.step_name)
+                return "__timeout__"
+            if is_otp:
+                # OTP is mandatory — treat empty entry as timeout, agent will re-ask
+                log.warning("human_loop.otp_empty_entry", job_id=request.job_id)
+                return "__timeout__"
             answer = "skip"
 
         # If user typed a number, map it to the option text

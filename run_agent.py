@@ -8,6 +8,12 @@ import sys
 import structlog
 import logging
 
+# Windows console needs UTF-8 to handle Unicode in Playwright error messages
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 structlog.configure(
     wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
     processors=[
@@ -55,11 +61,13 @@ async def main():
             "dl_number":     "RJ0720170010191",
             "dob":           "04-09-1998",
             "name":          "",           # will be read from portal
-            "mobile_number": "9999999999", # replace with real number for OTP
+            "mobile_number": "7240734163",
             "email":         "",
             "state_code":    "RJ",
             "state":         "Rajasthan",
             "state_name":    "Rajasthan",
+            "pin_code":      "334401",     # present address pin code (test value)
+            "pincode":       "334401",     # alias used by some form fields
         },
         documents     = {},
     )
@@ -88,7 +96,11 @@ async def main():
         print(f"\nAgent error: {e}")
         import traceback; traceback.print_exc()
     finally:
-        input("\nPress Enter to close browser...")
+        try:
+            if sys.stdin.isatty():
+                input("\nPress Enter to close browser...")
+        except EOFError:
+            pass
         await browser.stop()
 
     # Final report

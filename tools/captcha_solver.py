@@ -1,19 +1,21 @@
 """
-CAPTCHA solving tool.
+CAPTCHA solving tool — multi-provider with automatic fallback chain.
 
-Supports:
-  - 2captcha  (paid, reliable, ~15-30s)
-  - capsolver  (paid, faster)
-  - manual     (ask human — fallback for demo)
-  - claude     (use Claude vision to solve simple text CAPTCHAs)
+Solve order (all tried before giving up):
+  1. Primary LLM vision  (claude or gpt4o, whichever is configured as primary)
+  2. Fallback LLM vision (the other one)
+  3. 2captcha / capsolver (if CAPTCHA_API_KEY is set)
+  4. Manual              (ask human — last resort)
 
-The agent calls solve(image_bytes) and gets back a text string to type.
+No single provider failure breaks the flow.
+Each LLM provider is retried once before moving to the next.
 """
 
 import asyncio
 import base64
 import httpx
 import structlog
+from pathlib import Path
 from typing import Optional
 
 from config.settings import get_settings
@@ -21,22 +23,114 @@ from config.settings import get_settings
 log = structlog.get_logger(__name__)
 settings = get_settings()
 
+# Words that mean the LLM refused instead of reading the CAPTCHA
+_REFUSAL_WORDS = (
+    "sorry", "can't", "cannot", "assist", "unable",
+    "help", "i'm", "describe", "appear", "understand",
+    "apolog", "not able",
+)
+
+
+def _normalize_captcha(text: str) -> str:
+    """Keep only alphanumeric CAPTCHA characters from model/manual output."""
+    return "".join(ch for ch in (text or "").strip() if ch.isalnum())
+
+
+def _is_valid_captcha(text: str) -> bool:
+    """Return True only for short alphanumeric strings (≤12 chars, no refusal words)."""
+    normalized = _normalize_captcha(text)
+    if len(normalized) < 4 or len(normalized) > 8:
+        return False
+    lower = text.lower()
+    if any(w in lower for w in _REFUSAL_WORDS):
+        return False
+    return True
+
 
 class CaptchaSolver:
 
-    async def solve(self, image_bytes: bytes) -> Optional[str]:
+    async def solve(
+        self,
+        image_bytes: bytes,
+        *,
+        force_manual: bool = False,
+        allow_manual: bool = True,
+        prompt_context: str = "",
+    ) -> Optional[str]:
+        """
+        Try every available provider in order until we get a valid answer.
+        Returns the CAPTCHA text or None if all providers fail.
+        """
         provider = settings.captcha_provider
-        log.info("captcha.solving", provider=provider)
 
-        for attempt in range(settings.captcha_max_retries):
-            result = await self._solve_once(image_bytes, provider)
-            if result:
-                log.info("captcha.solved", provider=provider, attempt=attempt + 1)
+        if force_manual or provider == "manual":
+            return await self._solve_manual(image_bytes, prompt_context)
+
+        # Paid services — reliable, use directly with retries
+        if provider in ("2captcha", "capsolver"):
+            for attempt in range(settings.captcha_max_retries):
+                result = await self._solve_once(image_bytes, provider)
+                if result and _is_valid_captcha(result):
+                    result = _normalize_captcha(result)
+                    log.info("captcha.solved", provider=provider, attempt=attempt + 1)
+                    return result
+                log.warning("captcha.attempt_failed", provider=provider, attempt=attempt + 1)
+                await asyncio.sleep(2)
+            return await self._solve_manual(image_bytes, prompt_context) if allow_manual else None
+
+        # LLM vision — build the fallback chain based on configured primary/fallback
+        llm_chain = self._build_llm_chain(provider)
+
+        for llm_provider in llm_chain:
+            for attempt in range(2):  # 2 tries per LLM provider
+                result = await self._solve_llm(image_bytes, llm_provider)
+                if result and _is_valid_captcha(result):
+                    result = _normalize_captcha(result)
+                    log.info("captcha.solved", provider=llm_provider, attempt=attempt + 1)
+                    return result
+                log.warning(
+                    "captcha.llm_attempt_failed",
+                    provider=llm_provider,
+                    attempt=attempt + 1,
+                    preview=(result or "")[:40],
+                )
+                await asyncio.sleep(0.5)
+
+        # All LLM providers exhausted — try paid service if key available
+        if settings.captcha_api_key:
+            fallback_paid = "2captcha"
+            log.warning("captcha.falling_back_to_paid", provider=fallback_paid)
+            result = await self._solve_once(image_bytes, fallback_paid)
+            if result and _is_valid_captcha(result):
+                result = _normalize_captcha(result)
+                log.info("captcha.solved_via_paid_fallback", provider=fallback_paid)
                 return result
-            log.warning("captcha.attempt_failed", attempt=attempt + 1)
-            await asyncio.sleep(2)
 
+        if allow_manual:
+            return await self._solve_manual(image_bytes, prompt_context)
+
+        log.error("captcha.all_providers_failed")
         return None
+
+    def _build_llm_chain(self, configured: str) -> list[str]:
+        """
+        Build ordered list of LLM providers to try.
+        claude/gpt4v config sets the primary; the other is tried as automatic fallback.
+        """
+        has_anthropic = bool(settings.anthropic_api_key)
+        has_openai    = bool(settings.openai_api_key)
+
+        if configured == "claude" or settings.llm_primary == "anthropic":
+            chain = (["claude"] if has_anthropic else []) + (["gpt4v"] if has_openai else [])
+        elif configured == "gpt4v" or settings.llm_primary == "openai":
+            chain = (["gpt4v"] if has_openai else []) + (["claude"] if has_anthropic else [])
+        else:
+            # default: whatever is available
+            chain = (["claude"] if has_anthropic else []) + (["gpt4v"] if has_openai else [])
+
+        if not chain:
+            log.warning("captcha.no_llm_api_keys_configured")
+        return chain
 
     async def _solve_once(self, image_bytes: bytes, provider: str) -> Optional[str]:
         if provider == "2captcha":
@@ -44,11 +138,86 @@ class CaptchaSolver:
         elif provider == "capsolver":
             return await self._solve_capsolver(image_bytes)
         elif provider == "claude":
-            return await self._solve_claude(image_bytes)
+            return await self._solve_llm(image_bytes, "claude")
+        elif provider == "gpt4v":
+            return await self._solve_llm(image_bytes, "gpt4v")
         else:
-            return await self._solve_manual(image_bytes)
+            return None
 
-    # ── 2captcha ───────────────────────────────────────────────────────────────
+    # ── LLM dispatcher ────────────────────────────────────────────────────────
+
+    async def _solve_llm(self, image_bytes: bytes, provider: str) -> Optional[str]:
+        if provider == "claude":
+            return await self._solve_claude(image_bytes)
+        elif provider == "gpt4v":
+            return await self._solve_gpt4v(image_bytes)
+        return None
+
+    # ── Claude Vision ─────────────────────────────────────────────────────────
+
+    async def _solve_claude(self, image_bytes: bytes) -> Optional[str]:
+        if not settings.anthropic_api_key:
+            return None
+        try:
+            from agent.llm_client import get_llm_client
+            llm = get_llm_client()
+            system = (
+                "You are a CAPTCHA transcription tool. "
+                "Output ONLY the exact characters visible in the image. "
+                "No explanation, no apology, no punctuation — characters only."
+            )
+            user = (
+                "Transcribe the CAPTCHA text in this image. "
+                "It is 4-8 alphanumeric characters. "
+                "Reply with ONLY those characters, nothing else."
+            )
+            result = (await llm.vision(image_bytes, system, user)).strip()
+            log.info("captcha.claude_response", preview=result[:20], chars=len(result))
+            return result if result else None
+        except Exception as e:
+            log.error("captcha.claude_failed", error=str(e))
+            return None
+
+    # ── GPT-4o Vision (OpenAI) ────────────────────────────────────────────────
+
+    async def _solve_gpt4v(self, image_bytes: bytes) -> Optional[str]:
+        if not settings.openai_api_key:
+            return None
+        try:
+            import openai
+            b64 = base64.b64encode(image_bytes).decode()
+            client = openai.AsyncOpenAI(api_key=settings.openai_api_key)
+            response = await client.chat.completions.create(
+                model="gpt-4o",
+                max_tokens=20,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": (
+                                    "This is a CAPTCHA image. "
+                                    "Output ONLY the characters shown (4-8 alphanumeric chars). "
+                                    "Nothing else."
+                                ),
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/png;base64,{b64}"},
+                            },
+                        ],
+                    }
+                ],
+            )
+            result = response.choices[0].message.content.strip()
+            log.info("captcha.gpt4v_response", preview=result[:20], chars=len(result))
+            return result if result else None
+        except Exception as e:
+            log.error("captcha.gpt4v_failed", error=str(e))
+            return None
+
+    # ── 2captcha ──────────────────────────────────────────────────────────────
 
     async def _solve_2captcha(self, image_bytes: bytes) -> Optional[str]:
         b64 = base64.b64encode(image_bytes).decode()
@@ -56,7 +225,6 @@ class CaptchaSolver:
         timeout = settings.captcha_timeout_seconds
 
         async with httpx.AsyncClient(timeout=timeout + 10) as client:
-            # Submit CAPTCHA
             resp = await client.post(
                 "http://2captcha.com/in.php",
                 data={"key": api_key, "method": "base64", "body": b64, "json": 1},
@@ -67,9 +235,6 @@ class CaptchaSolver:
                 return None
 
             captcha_id = data["request"]
-            log.debug("captcha.2captcha_submitted", captcha_id=captcha_id)
-
-            # Poll for result
             deadline = asyncio.get_event_loop().time() + timeout
             while asyncio.get_event_loop().time() < deadline:
                 await asyncio.sleep(5)
@@ -81,7 +246,6 @@ class CaptchaSolver:
                     return pd["request"]
                 if pd.get("request") == "ERROR_CAPTCHA_UNSOLVABLE":
                     return None
-
         return None
 
     # ── CapSolver ─────────────────────────────────────────────────────────────
@@ -96,14 +260,10 @@ class CaptchaSolver:
                 "https://api.capsolver.com/createTask",
                 json={
                     "clientKey": api_key,
-                    "task": {
-                        "type": "ImageToTextTask",
-                        "body": b64,
-                    },
+                    "task": {"type": "ImageToTextTask", "body": b64},
                 },
             )
-            data = resp.json()
-            task_id = data.get("taskId")
+            task_id = resp.json().get("taskId")
             if not task_id:
                 return None
 
@@ -117,35 +277,90 @@ class CaptchaSolver:
                 pd = poll.json()
                 if pd.get("status") == "ready":
                     return pd.get("solution", {}).get("text")
-
         return None
 
-    # ── LLM vision CAPTCHA solver (uses configured primary/fallback) ───────────
+    # ── Manual human challenge fallback ──────────────────────────────────────
 
-    async def _solve_claude(self, image_bytes: bytes) -> Optional[str]:
-        from agent.llm_client import get_llm_client
-        llm = get_llm_client()
-        system = "You are a CAPTCHA reader. Respond with ONLY the characters shown, nothing else."
-        user   = (
-            "This is a CAPTCHA image from an Indian government website. "
-            "Read the characters shown and respond with ONLY the exact characters. "
-            "No spaces, no explanation, no punctuation — just the CAPTCHA text."
-        )
+    async def _solve_manual(self, image_bytes: bytes, prompt_context: str = "") -> Optional[str]:
+        """
+        Last-resort human-in-the-loop CAPTCHA handling.
+
+        The image is saved to data/latest_captcha.png. The operator can type the
+        value in the terminal or write it to data/manual_captcha.txt.
+        """
+        data_dir = Path("data")
+        data_dir.mkdir(parents=True, exist_ok=True)
+        image_path = (data_dir / "latest_captcha.png").resolve()
+        answer_path = (data_dir / "manual_captcha.txt").resolve()
+        image_path.write_bytes(image_bytes)
         try:
-            result = await llm.vision(image_bytes, system, user)
-            text = result.strip()
-            log.info("captcha.llm_solved", chars=len(text), preview=text[:8])
-            return text if text else None
-        except Exception as e:
-            log.error("captcha.llm_failed", error=str(e))
-            return None
+            answer_path.unlink()
+        except FileNotFoundError:
+            pass
 
-    # ── Manual fallback ────────────────────────────────────────────────────────
+        log.warning(
+            "captcha.manual_needed",
+            image_path=str(image_path),
+            answer_file=str(answer_path),
+            context=prompt_context,
+        )
 
-    async def _solve_manual(self, image_bytes: bytes) -> Optional[str]:
-        # In a real app this would push the CAPTCHA image to the customer app.
-        # For local dev, log the base64 and wait.
-        b64 = base64.b64encode(image_bytes).decode()
-        log.info("captcha.manual_required", hint="Check CAPTCHA image and enter solution via API")
-        # Caller handles waiting for the human response
+        print("\n" + "=" * 60, flush=True)
+        print("  CAPTCHA NEEDS HUMAN", flush=True)
+        print("=" * 60, flush=True)
+        if prompt_context:
+            print(prompt_context, flush=True)
+        print(f"Image saved at: {image_path}", flush=True)
+        print(f"You can also write the answer to: {answer_path}", flush=True)
+
+        terminal_closed = False
+        input_task = asyncio.create_task(asyncio.to_thread(input, "Enter CAPTCHA: "))
+        deadline = asyncio.get_event_loop().time() + max(
+            60,
+            settings.captcha_manual_timeout_seconds,
+        )
+
+        try:
+            while asyncio.get_event_loop().time() < deadline:
+                if input_task.done():
+                    try:
+                        raw = input_task.result()
+                    except EOFError:
+                        terminal_closed = True
+                        raw = ""
+                    except Exception:
+                        raw = ""
+                    value = _normalize_captcha(raw)
+                    if _is_valid_captcha(value):
+                        log.info("captcha.manual_received", source="terminal", chars=len(value))
+                        return value
+                    if raw.strip():
+                        log.warning(
+                            "captcha.manual_invalid",
+                            source="terminal",
+                            preview=raw[:20],
+                        )
+                    if not terminal_closed:
+                        input_task = asyncio.create_task(
+                            asyncio.to_thread(input, "Enter CAPTCHA: ")
+                        )
+
+                if answer_path.exists():
+                    raw = answer_path.read_text(encoding="utf-8").strip()
+                    try:
+                        answer_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    value = _normalize_captcha(raw)
+                    if _is_valid_captcha(value):
+                        log.info("captcha.manual_received", source="file", chars=len(value))
+                        return value
+                    log.warning("captcha.manual_invalid", source="file", preview=raw[:20])
+
+                await asyncio.sleep(0.5)
+        finally:
+            if not input_task.done():
+                input_task.cancel()
+
+        log.error("captcha.manual_timeout", seconds=settings.captcha_manual_timeout_seconds)
         return None
