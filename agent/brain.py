@@ -97,6 +97,9 @@ class AgentBrain:
         self._llm      = get_llm_client()
         self._last_deterministic_failure = ""
         self._otp_sent: bool = False            # True once OTP API call succeeds
+        # Stashed for the duration of run(); read by captcha helpers so they
+        # can route manual fallback through human_loop.ask + customer UI.
+        self._current_job: Optional[Job] = None
         self._otp_reveal_attempts: int = 0     # prevent infinite reveal loops
         self._generate_otp_attempts: int = 0   # deterministic retries before LLM fallback
         self._cached_otp: str = ""             # OTP cached so retries don't re-ask user
@@ -107,6 +110,7 @@ class AgentBrain:
     # ── Main loop ──────────────────────────────────────────────────────────────
 
     async def run(self, job: Job) -> Job:
+        self._current_job = job
         await self._sm.transition(job, JobStatus.AGENT_RUNNING)
         log.info("brain.run_started", job_id=job.job_id, service=job.service)
 
@@ -1278,6 +1282,8 @@ class AgentBrain:
                             "OTP verification CAPTCHA. The OTP is already cached; "
                             "only this CAPTCHA value is needed."
                         ),
+                        job=self._current_job,
+                        human_loop=self._hl,
                     ),
                     timeout=max(timeout_s, settings.captcha_manual_timeout_seconds + 5)
                     if force_manual_captcha else timeout_s,
@@ -3679,6 +3685,8 @@ class AgentBrain:
                 force_manual=force_manual,
                 allow_manual=force_manual,
                 prompt_context=prompt_context,
+                job=self._current_job,
+                human_loop=self._hl,
             )
             solution = result.text or ""
             last_solution = solution

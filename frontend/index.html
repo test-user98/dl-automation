@@ -154,9 +154,38 @@
     .review .row b { font-weight: 500; color: var(--muted); }
     .review .row span { font-weight: 600; text-align: right; word-break: break-word; }
 
-    /* live status */
+    /* CAPTCHA help screen */
+    .captcha-image-wrap {
+      margin: 14px 0; padding: 14px;
+      background: #f5f7fb; border: 1px solid var(--line); border-radius: 12px;
+      display: flex; justify-content: center; align-items: center; min-height: 90px;
+    }
+    .captcha-image-wrap img {
+      max-width: 100%; height: auto; max-height: 110px;
+      background: #fff; padding: 6px 10px; border-radius: 6px;
+      box-shadow: 0 1px 4px rgba(0,0,0,.08);
+    }
+    .captcha-image-wrap img.hidden { display: none; }
+
+    /* State row on review */
+    .state-row .row-edit {
+      font-size: 12px; font-weight: 500; color: var(--primary);
+      cursor: pointer; padding: 0 6px; user-select: none;
+    }
+    .state-row .row-edit:hover { text-decoration: underline; }
+    #state-edit { margin-top: 8px; }
+    #state-edit select {
+      width: 100%; min-height: 38px; padding: 6px 10px;
+      border: 1px solid var(--line); border-radius: 8px; font: inherit;
+    }
+
+    /* live status — emphasised card so the customer sees activity, not a pale block */
     .live-head {
       display: flex; align-items: center; gap: 12px; margin-bottom: 12px;
+      padding: 14px 16px; border-radius: 12px;
+      background: linear-gradient(135deg, #f1f6ff 0%, #ffffff 60%);
+      border: 1px solid #c4dafd;
+      box-shadow: 0 2px 10px rgba(14, 98, 216, .08);
     }
     .spin {
       width: 18px; height: 18px;
@@ -394,6 +423,49 @@
       <h2 style="margin-top: 24px">Review before we start</h2>
       <div class="review" id="review-rows"></div>
 
+      <div id="state-edit" class="hidden">
+        <label for="state-edit-select" class="hint">Pick the state where you want to file this application</label>
+        <select id="state-edit-select" onchange="onStatePicked(this.value)">
+          <option value="">—</option>
+          <option value="AN">Andaman & Nicobar (AN)</option>
+          <option value="AP">Andhra Pradesh (AP)</option>
+          <option value="AR">Arunachal Pradesh (AR)</option>
+          <option value="AS">Assam (AS)</option>
+          <option value="BR">Bihar (BR)</option>
+          <option value="CH">Chandigarh (CH)</option>
+          <option value="CG">Chhattisgarh (CG)</option>
+          <option value="DD">Daman & Diu (DD)</option>
+          <option value="DL">Delhi (DL)</option>
+          <option value="DN">Dadra & Nagar Haveli (DN)</option>
+          <option value="GA">Goa (GA)</option>
+          <option value="GJ">Gujarat (GJ)</option>
+          <option value="HR">Haryana (HR)</option>
+          <option value="HP">Himachal Pradesh (HP)</option>
+          <option value="JK">Jammu & Kashmir (JK)</option>
+          <option value="JH">Jharkhand (JH)</option>
+          <option value="KA">Karnataka (KA)</option>
+          <option value="KL">Kerala (KL)</option>
+          <option value="LD">Lakshadweep (LD)</option>
+          <option value="MH">Maharashtra (MH)</option>
+          <option value="MP">Madhya Pradesh (MP)</option>
+          <option value="MN">Manipur (MN)</option>
+          <option value="ML">Meghalaya (ML)</option>
+          <option value="MZ">Mizoram (MZ)</option>
+          <option value="NL">Nagaland (NL)</option>
+          <option value="OD">Odisha (OD)</option>
+          <option value="PY">Puducherry (PY)</option>
+          <option value="PB">Punjab (PB)</option>
+          <option value="RJ">Rajasthan (RJ)</option>
+          <option value="SK">Sikkim (SK)</option>
+          <option value="TN">Tamil Nadu (TN)</option>
+          <option value="TG">Telangana (TG)</option>
+          <option value="TR">Tripura (TR)</option>
+          <option value="UP">Uttar Pradesh (UP)</option>
+          <option value="UK">Uttarakhand (UK)</option>
+          <option value="WB">West Bengal (WB)</option>
+        </select>
+      </div>
+
       <div class="banner err hidden" id="step3-banner" role="alert"></div>
 
       <p class="footnote">
@@ -465,6 +537,27 @@
 
       <div class="actions" style="justify-content: center">
         <button class="primary" id="otp-btn" onclick="submitOTP()">Submit OTP</button>
+      </div>
+    </section>
+
+    <!-- ── CAPTCHA help overlay ──────────────────────────────────────── -->
+    <section id="screen-captcha" class="card hidden">
+      <h2>Help us read the security code</h2>
+      <p class="sub" id="captcha-sub">The portal showed a verification code we couldn't read clearly. Please type the characters you see in the image below.</p>
+
+      <div class="captcha-image-wrap">
+        <img id="captcha-image" alt="Government portal security code" />
+      </div>
+
+      <div class="field">
+        <label>Enter the code</label>
+        <input id="captcha-answer" placeholder="e.g. AbC3kY" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" maxlength="12" />
+        <div class="hint">Letters and numbers are case-sensitive.</div>
+        <div class="field-error hidden" id="captcha-answer-error" role="alert"></div>
+      </div>
+
+      <div class="actions" style="justify-content: center">
+        <button class="primary" id="captcha-btn" onclick="submitCaptcha()">Submit code</button>
       </div>
     </section>
 
@@ -667,7 +760,32 @@ function isValidDOB(s) {
 }
 
 // ─── Step 3: review + start ────────────────────────────────────────────────
+const STATE_NAMES = {
+  AN:"Andaman & Nicobar", AP:"Andhra Pradesh", AR:"Arunachal Pradesh", AS:"Assam",
+  BR:"Bihar", CH:"Chandigarh", CG:"Chhattisgarh", DL:"Delhi", DN:"Dadra & Nagar Haveli",
+  DD:"Daman & Diu", GA:"Goa", GJ:"Gujarat", HR:"Haryana", HP:"Himachal Pradesh",
+  JK:"Jammu & Kashmir", JH:"Jharkhand", KA:"Karnataka", KL:"Kerala", LD:"Lakshadweep",
+  MH:"Maharashtra", MP:"Madhya Pradesh", MN:"Manipur", MZ:"Mizoram", ML:"Meghalaya",
+  NL:"Nagaland", OD:"Odisha", PY:"Puducherry", PB:"Punjab", RJ:"Rajasthan",
+  SK:"Sikkim", TN:"Tamil Nadu", TG:"Telangana", TR:"Tripura", UP:"Uttar Pradesh",
+  UK:"Uttarakhand", WB:"West Bengal",
+};
+
+let manualStateCode = "";    // set when customer overrides the DL-derived state
+
+function effectiveStateCode() {
+  return manualStateCode || (dlNormalised || '').slice(0, 2);
+}
+
+function effectiveStateName() {
+  const code = effectiveStateCode();
+  return STATE_NAMES[code] || code || '—';
+}
+
 function renderReview() {
+  const stateCode = effectiveStateCode();
+  const stateName = effectiveStateName();
+  const stateSource = manualStateCode ? 'you picked this' : (stateCode ? 'from your DL' : '');
   const rows = {
     'DL number':  formatDL(dlNormalised) || document.getElementById('dl_raw').value || '—',
     'DOB':        document.getElementById('dob').value || '—',
@@ -675,9 +793,37 @@ function renderReview() {
     'PIN code':   document.getElementById('pin_code').value || '—',
     'Name':       document.getElementById('name').value || 'Will read from portal',
   };
-  document.getElementById('review-rows').innerHTML = Object.entries(rows).map(([k, v]) =>
+  const reviewHTML = Object.entries(rows).map(([k, v]) =>
     `<div class="row"><b>${k}</b><span>${escapeHtml(v)}</span></div>`
   ).join('');
+  const stateRow = `
+    <div class="row state-row">
+      <b>State</b>
+      <span>
+        ${escapeHtml(stateName)}${stateSource ? ` <span class="hint" style="display:inline">(${stateSource})</span>` : ''}
+        <span class="row-edit" onclick="toggleStateEdit()" id="state-edit-toggle">Change</span>
+      </span>
+    </div>`;
+  document.getElementById('review-rows').innerHTML = reviewHTML + stateRow;
+  // Keep the state-edit dropdown in sync with the current value.
+  const sel = document.getElementById('state-edit-select');
+  if (sel) sel.value = stateCode;
+}
+
+function toggleStateEdit() {
+  const box = document.getElementById('state-edit');
+  if (!box) return;
+  box.classList.toggle('hidden');
+  if (!box.classList.contains('hidden')) {
+    document.getElementById('state-edit-select').focus();
+  }
+}
+
+function onStatePicked(code) {
+  manualStateCode = code || '';
+  const box = document.getElementById('state-edit');
+  if (box) box.classList.add('hidden');
+  renderReview();
 }
 
 async function startJob() {
@@ -726,7 +872,7 @@ async function startJob() {
     dob, mobile_number: mobile, pin_code: pin,
     name:    document.getElementById('name').value.trim(),
     address: extractedSnapshot.address || '',
-    state_code: (dlNormalised || '').slice(0, 2),
+    state_code: effectiveStateCode(),
     service: 'DL_RENEWAL',
     dl_image_path:  dlImagePath,
     ocr_data:       extractedSnapshot,
@@ -855,6 +1001,16 @@ function applyJob(r) {
     });
     showOTP(v);
     console.log('[applyJob] -> showOTP() called');
+  } else if (v.action_type === 'captcha') {
+    stopLiveUpdates();
+    addActivity({
+      phase: 'waiting',
+      title: 'Security code needed',
+      subline: v.subline || 'Please read the code from the image and type it in.',
+      severity: 'action',
+    });
+    showCaptcha(v);
+    console.log('[applyJob] -> showCaptcha() called');
   } else if ((v.action_required && v.action_type !== 'otp') || r.status === 'STUCK_HUMAN_NEEDED') {
     stopLiveUpdates();
     addActivity({
@@ -1239,9 +1395,55 @@ submitHumanResponse = async function(answerOverride) {
 };
 
 function show(id) {
-  ['screen-1','screen-2','screen-3','screen-4','screen-otp','screen-human','screen-done']
+  ['screen-1','screen-2','screen-3','screen-4','screen-otp','screen-captcha','screen-human','screen-done']
     .forEach(s => document.getElementById(s).classList.add('hidden'));
   document.getElementById(id).classList.remove('hidden');
+}
+
+// ─── CAPTCHA help screen ──────────────────────────────────────────────────
+function showCaptcha(v) {
+  const req = v.customer_request || {};
+  const sub = v.subline || req.context || 'The portal showed a verification code we couldn\'t read clearly.';
+  document.getElementById('captcha-sub').textContent = sub;
+  const img = document.getElementById('captcha-image');
+  if (req.image_b64) {
+    img.src = `data:image/png;base64,${req.image_b64}`;
+    img.classList.remove('hidden');
+  } else {
+    img.removeAttribute('src');
+    img.classList.add('hidden');
+  }
+  show('screen-captcha');
+  const input = document.getElementById('captcha-answer');
+  input.value = '';
+  clearFieldError('captcha-answer');
+  setTimeout(() => input.focus(), 50);
+  const btn = document.getElementById('captcha-btn');
+  btn.disabled = false; btn.textContent = 'Submit code';
+}
+
+async function submitCaptcha() {
+  const input = document.getElementById('captcha-answer');
+  const answer = (input.value || '').trim();
+  if (answer.length < 4) {
+    setFieldError('captcha-answer', 'Type at least 4 characters.');
+    input.focus();
+    return;
+  }
+  const btn = document.getElementById('captcha-btn');
+  btn.disabled = true; btn.textContent = 'Submitting…';
+  const res = await fetch(`${API}/jobs/${currentJobId}/human-response`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Secret': SECRET },
+    body: JSON.stringify({ answer }),
+  });
+  if (!res.ok) {
+    btn.disabled = false; btn.textContent = 'Submit code';
+    setFieldError('captcha-answer', "We couldn't submit the code. Try again.");
+    return;
+  }
+  show('screen-4');
+  startPolling();
 }
 
 async function apiJson(path, payload) {

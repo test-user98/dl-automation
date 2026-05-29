@@ -101,7 +101,16 @@ class HumanLoop:
         )
 
         qlower = f"{step_name} {question} {context}".lower()
-        action_type = "otp" if "otp" in qlower else (
+        # CAPTCHA before OTP because step names like "captcha_manual" beat the
+        # generic "otp" substring match.
+        is_captcha_step = (
+            step_name.startswith("captcha")
+            or "captcha image" in qlower
+            or step_name == "captcha"
+        )
+        action_type = (
+            "captcha" if is_captcha_step else
+            "otp" if "otp" in qlower else
             "service_selection" if step_name == "service_selection" else
             "confirmation" if any(
                 term in qlower for term in ("confirm", "verify", "correct", "consent", "review")
@@ -109,13 +118,19 @@ class HumanLoop:
             "choice" if options else
             "text"
         )
-        job.customer_data["_pending_customer_request"] = {
+        pending = {
             "step_name": step_name,
             "question": question,
             "context": context,
             "options": options or [],
             "action_type": action_type,
         }
+        # Surface the visible artifact (CAPTCHA image, screenshot) so the
+        # customer UI can render it. We only embed for captcha today because
+        # full screenshots would bloat the payload; widen later if needed.
+        if action_type == "captcha" and screenshot_b64:
+            pending["image_b64"] = screenshot_b64
+        job.customer_data["_pending_customer_request"] = pending
 
         log.info(
             "human_loop.asking",

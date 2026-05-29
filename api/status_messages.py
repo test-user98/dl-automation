@@ -207,6 +207,13 @@ def customer_job_view(job: Job) -> dict:
         if action_type == "otp":
             title, message = _otp_message(lower, mobile_suffix)
             step_label = "Waiting for the OTP"
+        elif action_type == "captcha":
+            title = "Help us read the security code"
+            message = (
+                pending_request.get("question")
+                or "Type the characters shown in the image so we can continue."
+            )
+            step_label = "Help with security code"
         elif pending_request:
             title = _title_for_customer_request(pending_request)
             message = (
@@ -346,13 +353,18 @@ def _customer_request_payload(request: dict, action_required: bool) -> dict:
     if not request or not action_required:
         return {}
     options = request.get("options") or []
-    return {
+    payload = {
         "step_name": request.get("step_name", ""),
         "question": request.get("question", ""),
         "context": request.get("context", ""),
         "options": options if isinstance(options, list) else [],
         "action_type": request.get("action_type", "human_response"),
     }
+    # CAPTCHA — frontend renders the embedded image so the customer can read it.
+    image_b64 = request.get("image_b64")
+    if image_b64:
+        payload["image_b64"] = image_b64
+    return payload
 
 
 def _failure_message(lower: str) -> tuple[str, str, bool]:

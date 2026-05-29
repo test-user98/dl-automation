@@ -831,3 +831,96 @@ fix landed in this commit:
   `scripts/validate_fixes.py` covers it.
 - `frontend/index.html` still has the diagnostic `console.log` calls in
   `applyJob`. Remove once Bug E is reproduced and root-caused.
+
+## CAPTCHA-to-customer-UI + state confirmation + live polish
+
+User ran the local flow and observed three things in one session:
+
+1. The agent's CAPTCHA retries on the DL-fetch page took ~6 minutes against
+   Sarathi (3 high-confidence solves rejected as "Please provide valid
+   Driving Licence data / Captcha" — Sarathi's deceptive generic error).
+   Eventually the 4th attempt succeeded and the agent reached OTP. But
+   during those 6 minutes the customer UI showed "Filling your application —
+   Setting up verification" with no indication that anything was happening
+   or that they could help. Per user policy ("after 4 attempts, show the
+   image to the customer and let them type"), the CAPTCHA manual fallback
+   must surface in the customer UI, not stdin.
+2. The state ("Rajasthan") on screen-3 was auto-derived from the DL prefix
+   (`tools/dl_normalizer.py`), but never shown on the review card. If the
+   customer mistyped the DL or wanted a different state, there was no
+   visible way to verify or change it before clicking Start.
+3. The live-status card was visually flat — felt "stuck", not "live".
+
+### Bug F — CAPTCHA manual fallback now routes through customer UI
+
+End-to-end path (production):
+
+- `agent/brain.py` stashes the current `Job` as `self._current_job` at the
+  top of `run()` and passes `job=self._current_job, human_loop=self._hl`
+  into every `self._captcha.solve_with_confidence(...)` call site that has
+  `allow_manual=True`. The third call site at line 4421 uses
+  `allow_manual=False` and intentionally does NOT route through the UI —
+  it's the proactive low-confidence tool path, not a fallback.
+- `tools/captcha_solver.py:_solve_manual()` now accepts `job` + `human_loop`
+  kwargs. When BOTH are present, it calls `human_loop.ask(...)` with
+  `step_name="captcha_manual"`, the prompt context, and the CAPTCHA image
+  as `screenshot=image_bytes`. If the human-loop ask returns a valid
+  alphanumeric answer it's returned; if it times out or returns `__timeout__`
+  the code falls through to the legacy stdin/`data/manual_captcha.txt`
+  path, so `run_agent.py` terminal mode still works unchanged.
+- `agent/human_loop.py`: action-type detection now checks
+  `step_name.startswith("captcha")` BEFORE the `"otp" in qlower` rule
+  (because captcha prompt context can contain the word "OTP"). When the
+  step is a captcha and a screenshot was passed, the `_pending_customer_request`
+  payload embeds `image_b64`.
+- `api/status_messages.py`:
+  - `customer_job_view` STUCK_HUMAN_NEEDED branch now handles
+    `action_type == "captcha"` with headline "Help us read the security code"
+    and step_label "Help with security code".
+  - `_customer_request_payload` now propagates `image_b64` from the pending
+    request through to the frontend.
+- `frontend/index.html`:
+  - New `#screen-captcha` section: title, instruction, image, input, submit.
+  - New `showCaptcha(v)` JS sets `<img src="data:image/png;base64,…">` from
+    `v.customer_request.image_b64` and renders the screen.
+  - New `submitCaptcha()` POSTs the customer's answer to
+    `/jobs/{id}/human-response` and resumes polling.
+  - `applyJob` routes `v.action_type === 'captcha'` to `showCaptcha`.
+  - `show()` registers `screen-captcha` so old-screen-hiding works.
+  - CSS for `.captcha-image-wrap` and the centred portrait image.
+
+### State confirmation on screen-3 review
+
+- New `STATE_NAMES` map and `manualStateCode` JS state.
+- `effectiveStateCode()` returns the customer's manual choice if set,
+  otherwise the first 2 chars of `dlNormalised`.
+- `renderReview()` now appends a "State: Rajasthan (from your DL)" row with
+  a "Change" link. Clicking Change reveals a select with all 36 state codes;
+  picking one sets `manualStateCode` and re-renders. The label flips to
+  "(you picked this)".
+- `startJob` payload reads `effectiveStateCode()` instead of
+  `dlNormalised.slice(0,2)`, so the customer's override is what reaches the
+  agent. State row is rendered server-trip-free.
+
+### Live-card visual emphasis
+
+- `.live-head` now has a light blue gradient background, a subtle
+  `c4dafd` border, and a soft `0 2px 10px rgba(14,98,216,.08)` shadow.
+  No structural changes — same elements, more presence.
+
+### Local verification
+
+- `python -m pytest -q` → 51 passed, no regressions.
+- `python scripts/validate_fixes.py` → 32/32 assertions pass across 8
+  scenarios (Bug A, B, C, C+, D, F, F-unit, state confirmation).
+- `python scripts/browser_smoke.py --base http://127.0.0.1:8001` →
+  ok:true, no console issues / failed requests / bad responses /
+  layout issues.
+
+### Loose ends still pending
+
+- Live Playwright SDK/binary mismatch pin in `requirements.txt` — still
+  the next slice. Not bundled here so the live deploy can be verified
+  with a clean diff once we push.
+- Diagnostic `console.log` in `applyJob` is intentionally still present
+  while we wait for Bug E (OTP-screen-not-shown) to repro at least once.

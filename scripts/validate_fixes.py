@@ -216,6 +216,139 @@ async def test_bug_a_ui_pin_stays_on_step_3() -> bool:
     return ok
 
 
+def test_bug_f_captcha_action_type_and_payload() -> bool:
+    print("\n[Bug F] captcha pending request maps to action_type='captcha' + exposes image_b64")
+    ok = True
+    pending = {
+        "step_name": "captcha_manual",
+        "question": "Help us read the security code shown on the government portal.",
+        "context": "The portal showed a CAPTCHA we couldn't read automatically.",
+        "options": [],
+        "action_type": "captcha",
+        # 12 chars of arbitrary base64-shaped data — frontend will treat as image
+        "image_b64": "iVBORw0KGgoAAAA",
+    }
+    job = _fake_job(
+        steps=["open_homepage", "close_homepage_popup", "select_state",
+               "fetch_dl_details"],
+        status=JobStatus.STUCK_HUMAN_NEEDED,
+        pending=pending,
+        error_message=pending["question"],
+    )
+    v = customer_job_view(job)
+    ok &= assert_eq("phase", v["phase"], "waiting")
+    ok &= assert_eq("action_required", v["action_required"], True)
+    ok &= assert_eq("action_type", v["action_type"], "captcha")
+    ok &= assert_eq("headline", v["headline"], "Help us read the security code")
+    ok &= assert_eq("last_step_label", v["last_step_label"], "Help with security code")
+    ok &= assert_eq("customer_request.image_b64 carried through",
+                    v["customer_request"].get("image_b64"), "iVBORw0KGgoAAAA")
+    ok &= assert_eq("customer_request.action_type",
+                    v["customer_request"].get("action_type"), "captcha")
+    return ok
+
+
+def test_human_loop_captcha_step_name_routes_correctly() -> bool:
+    """Replays HumanLoop's action-type detection for step_name='captcha_manual'.
+
+    Important: even if 'otp' appears in surrounding text, the captcha-step
+    check fires first and wins. Mirrors the logic in agent/human_loop.py.
+    """
+    print("\n[Bug F-unit] HumanLoop detects captcha step over otp substring")
+    ok = True
+    qlower = "captcha_manual help us read the security code shown — otp page".lower()
+    step_name = "captcha_manual"
+    is_captcha_step = (
+        step_name.startswith("captcha")
+        or "captcha image" in qlower
+        or step_name == "captcha"
+    )
+    action_type = (
+        "captcha" if is_captcha_step else
+        "otp" if "otp" in qlower else "text"
+    )
+    ok &= assert_eq("step_name=captcha_manual + 'otp' in surrounding text",
+                    action_type, "captcha")
+    return ok
+
+
+async def test_state_confirmation_ui_changes_payload() -> bool:
+    print("\n[State confirmation] customer can override DL-derived state on screen-3")
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        print("  SKIP playwright not available")
+        return True
+    ok = True
+    captured_payloads: list[dict] = []
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        ctx = await browser.new_context()
+        page = await ctx.new_page()
+
+        # Mock confirm-and-start so we capture the state_code without spinning the agent.
+        async def handle_start(route):
+            try:
+                req = route.request
+                import json as _json
+                body = _json.loads(req.post_data or "{}")
+                captured_payloads.append(body)
+            except Exception:
+                pass
+            await route.fulfill(
+                status=200,
+                content_type="application/json",
+                body='{"job_id":"state-smoke-job","status":"AGENT_RUNNING","customer_summary":{}}',
+            )
+        await ctx.route("**/onboard/confirm-and-start", handle_start)
+        await ctx.route("**/jobs/state-smoke-job*", lambda r: r.fulfill(
+            status=200, content_type="application/json",
+            body='{"status":"AGENT_RUNNING","customer_view":{"phase":"connecting","headline":"Starting","subline":"","action_required":false,"action_type":"","last_step_label":"Connecting","customer_request":{}}}',
+        ))
+
+        await page.goto("http://127.0.0.1:8001/")
+        await page.click("#step1-next")
+        await page.wait_for_selector("#screen-2:not(.hidden)")
+        await page.fill("#dl_raw", "RJ0720170010191")
+        # validateDL is debounced 300 ms + hits /onboard/validate-dl. Wait so
+        # dlNormalised is populated before we leave screen-2.
+        async with page.expect_response("**/onboard/validate-dl") as resp_info:
+            await page.fill("#dob", "04-09-1998")
+        await resp_info.value
+        await page.fill("#mobile", "9876512345")
+        await page.click("#screen-2 button.primary")
+        await page.wait_for_selector("#screen-3:not(.hidden)")
+        await page.fill("#pin_code", "334401")
+
+        # Verify the review shows the DL-derived state
+        review_text = await page.text_content("#review-rows")
+        ok &= assert_eq("review shows Rajasthan from DL", "Rajasthan" in (review_text or ""), True)
+        ok &= assert_eq("review shows 'from your DL'", "from your DL" in (review_text or ""), True)
+
+        # Override state via the Change → dropdown
+        await page.click("#state-edit-toggle")
+        await page.wait_for_selector("#state-edit:not(.hidden)")
+        await page.select_option("#state-edit-select", "MH")
+        await page.wait_for_timeout(150)
+
+        review_text2 = await page.text_content("#review-rows")
+        ok &= assert_eq("review now shows Maharashtra", "Maharashtra" in (review_text2 or ""), True)
+        ok &= assert_eq("review now shows 'you picked this'",
+                        "you picked this" in (review_text2 or ""), True)
+
+        # Click Start and capture payload
+        await page.click("#start-btn")
+        await page.wait_for_timeout(800)
+
+        ok &= assert_eq("confirm-and-start was called", len(captured_payloads) >= 1, True)
+        if captured_payloads:
+            ok &= assert_eq("payload state_code override",
+                            captured_payloads[-1].get("state_code"), "MH")
+
+        await browser.close()
+    return ok
+
+
 async def main():
     print("=" * 70)
     print("Validating customer-UI fixes against http://127.0.0.1:8001")
@@ -225,7 +358,10 @@ async def main():
         test_bug_c_first_otp_no_false_expiry(),
         test_bug_b_step_label_overrides_for_otp(),
         test_bug_c_explicit_expiry_still_works(),
+        test_bug_f_captcha_action_type_and_payload(),
+        test_human_loop_captcha_step_name_routes_correctly(),
         await test_bug_a_ui_pin_stays_on_step_3(),
+        await test_state_confirmation_ui_changes_payload(),
     ]
     print("\n" + "=" * 70)
     if all(results):

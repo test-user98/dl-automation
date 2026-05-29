@@ -70,15 +70,25 @@ class CaptchaSolver:
         force_manual: bool = False,
         allow_manual: bool = True,
         prompt_context: str = "",
+        job=None,
+        human_loop=None,
     ) -> Optional[str]:
         """
         Try every available provider in order until we get a valid answer.
         Returns the CAPTCHA text or None if all providers fail.
+
+        When `job` and `human_loop` are provided AND the solver falls back to
+        the manual path, the CAPTCHA image is surfaced to the customer UI via
+        `human_loop.ask(action_type="captcha")` instead of stdin/file. The
+        stdin/file path is kept as a backup so `run_agent.py` terminal mode
+        still works.
         """
         provider = settings.captcha_provider
 
         if force_manual or provider == "manual":
-            return await self._solve_manual(image_bytes, prompt_context)
+            return await self._solve_manual(
+                image_bytes, prompt_context, job=job, human_loop=human_loop,
+            )
 
         # Paid services — reliable, use directly with retries
         if provider in ("2captcha", "capsolver"):
@@ -90,7 +100,9 @@ class CaptchaSolver:
                     return result
                 log.warning("captcha.attempt_failed", provider=provider, attempt=attempt + 1)
                 await asyncio.sleep(2)
-            return await self._solve_manual(image_bytes, prompt_context) if allow_manual else None
+            return await self._solve_manual(
+                image_bytes, prompt_context, job=job, human_loop=human_loop,
+            ) if allow_manual else None
 
         # LLM vision — build the fallback chain based on configured primary/fallback
         llm_chain = self._build_llm_chain(provider)
@@ -121,7 +133,9 @@ class CaptchaSolver:
                 return result
 
         if allow_manual:
-            return await self._solve_manual(image_bytes, prompt_context)
+            return await self._solve_manual(
+                image_bytes, prompt_context, job=job, human_loop=human_loop,
+            )
 
         log.error("captcha.all_providers_failed")
         return None
@@ -133,6 +147,8 @@ class CaptchaSolver:
         force_manual: bool = False,
         allow_manual: bool = True,
         prompt_context: str = "",
+        job=None,
+        human_loop=None,
     ) -> CaptchaResult:
         """
         Return a CAPTCHA solution with a confidence estimate.
@@ -140,11 +156,17 @@ class CaptchaSolver:
         LLM OCR needs agreement from repeated reads before it is considered
         high confidence. Low-confidence guesses are returned to the caller so
         the page can refresh the CAPTCHA instead of submitting weak guesses.
+
+        When `job` and `human_loop` are provided AND the manual fallback fires,
+        the CAPTCHA image is surfaced to the customer UI via
+        `human_loop.ask(action_type="captcha")` instead of stdin/file.
         """
         provider = settings.captcha_provider
 
         if force_manual or provider == "manual":
-            text = await self._solve_manual(image_bytes, prompt_context)
+            text = await self._solve_manual(
+                image_bytes, prompt_context, job=job, human_loop=human_loop,
+            )
             text = _normalize_captcha(text or "")
             if _is_valid_captcha(text):
                 return CaptchaResult(text=text, confidence=1.0, provider="manual")
@@ -169,6 +191,8 @@ class CaptchaSolver:
                     image_bytes,
                     force_manual=True,
                     prompt_context=prompt_context,
+                    job=job,
+                    human_loop=human_loop,
                 )
             return CaptchaResult(provider=provider)
 
@@ -240,6 +264,8 @@ class CaptchaSolver:
                 image_bytes,
                 force_manual=True,
                 prompt_context=prompt_context,
+                job=job,
+                human_loop=human_loop,
             )
             manual.attempts = attempts + manual.attempts
             return manual
@@ -443,12 +469,26 @@ class CaptchaSolver:
 
     # ── Manual human challenge fallback ──────────────────────────────────────
 
-    async def _solve_manual(self, image_bytes: bytes, prompt_context: str = "") -> Optional[str]:
+    async def _solve_manual(
+        self,
+        image_bytes: bytes,
+        prompt_context: str = "",
+        *,
+        job=None,
+        human_loop=None,
+    ) -> Optional[str]:
         """
         Last-resort human-in-the-loop CAPTCHA handling.
 
-        The image is saved to data/latest_captcha.png. The operator can type the
-        value in the terminal or write it to data/manual_captcha.txt.
+        The image is saved to data/latest_captcha.png in all cases (debug
+        artifact, also the fallback if the customer-UI ask fails).
+
+        Order of preference:
+          1. `human_loop.ask` with the CAPTCHA image embedded — customer types
+             the value in the web UI. Used whenever both `job` and `human_loop`
+             are provided (production path).
+          2. stdin / data/manual_captcha.txt — legacy terminal-mode path,
+             still used by run_agent.py and during tests without a job.
         """
         data_dir = Path("data")
         data_dir.mkdir(parents=True, exist_ok=True)
@@ -465,7 +505,49 @@ class CaptchaSolver:
             image_path=str(image_path),
             answer_file=str(answer_path),
             context=prompt_context,
+            via="human_loop" if (job is not None and human_loop is not None) else "stdin",
         )
+
+        # Production path — ask the customer through the web UI.
+        if job is not None and human_loop is not None:
+            try:
+                response = await human_loop.ask(
+                    job=job,
+                    step_name="captcha_manual",
+                    question=(
+                        "Help us read the security code shown on the government "
+                        "portal. Type the characters you see in the image."
+                    ),
+                    context=prompt_context or (
+                        "The portal showed a CAPTCHA we couldn't read automatically. "
+                        "Type the exact characters you see — letters and numbers, "
+                        "case-sensitive."
+                    ),
+                    screenshot=image_bytes,
+                    options=[],
+                    timeout_seconds=settings.captcha_manual_timeout_seconds,
+                )
+            except Exception as e:  # noqa: BLE001
+                log.warning("captcha.manual_human_loop_failed", error=str(e))
+                response = None
+
+            if response is not None:
+                raw = (response.answer or "").strip()
+                if raw and raw != "__timeout__":
+                    value = _normalize_captcha(raw)
+                    if _is_valid_captcha(value):
+                        log.info(
+                            "captcha.manual_received",
+                            source="human_loop",
+                            chars=len(value),
+                        )
+                        return value
+                    log.warning(
+                        "captcha.manual_invalid",
+                        source="human_loop",
+                        preview=raw[:20],
+                    )
+            # Fall through to stdin so an operator can still rescue the run.
 
         print("\n" + "=" * 60, flush=True)
         print("  CAPTCHA NEEDS HUMAN", flush=True)
