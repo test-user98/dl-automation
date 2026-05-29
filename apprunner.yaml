@@ -1,0 +1,17 @@
+version: 1.0
+runtime: docker
+build:
+  commands:
+    build: []
+run:
+  command: uvicorn api.server:app --host 0.0.0.0 --port 8000 --workers 1
+  network:
+    port: 8000
+    env: PORT
+  env:
+    - name: BROWSER_HEADLESS
+      value: "true"
+    - name: HUMAN_LOOP_BACKEND
+      value: "polling"
+    - name: STATE_BACKEND
+      value: "sqlite"

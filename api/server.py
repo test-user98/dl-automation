@@ -236,8 +236,10 @@ async def list_scenarios():
 
 @app.get("/health")
 async def health():
+    import os
     return {
         "status":          "ok",
+        "commit":          os.environ.get("GIT_COMMIT_SHA", "unknown"),
         "llm_primary":     settings.llm_primary,
         "llm_fallback":    settings.llm_fallback,
         "primary_paused":  settings.llm_primary_paused,

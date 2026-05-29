@@ -1,0 +1,216 @@
+name: Build and Deploy to AWS App Runner
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+env:
+  AWS_REGION:        ap-south-1
+  ECR_REPOSITORY:    sarathi-agent
+  APP_RUNNER_SERVICE: sarathi-agent
+  RESOURCE_OWNER:    sipanijai@gmail.com
+
+jobs:
+  deploy:
+    name: Build, Push, Deploy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Ensure ECR repository exists
+        id: ecr
+        run: |
+          set -e
+          if ! aws ecr describe-repositories \
+                --repository-names "$ECR_REPOSITORY" \
+                --region "$AWS_REGION" >/dev/null 2>&1; then
+            echo "Creating ECR repository $ECR_REPOSITORY"
+            aws ecr create-repository \
+              --repository-name "$ECR_REPOSITORY" \
+              --region "$AWS_REGION" \
+              --image-scanning-configuration scanOnPush=true \
+              --tags Key=Owner,Value="$RESOURCE_OWNER"
+          fi
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          echo "registry=$REGISTRY"                                  >> $GITHUB_OUTPUT
+          echo "image=$REGISTRY/$ECR_REPOSITORY:${{ github.sha }}"   >> $GITHUB_OUTPUT
+          echo "image_latest=$REGISTRY/$ECR_REPOSITORY:latest"       >> $GITHUB_OUTPUT
+          echo "account_id=$ACCOUNT_ID"                              >> $GITHUB_OUTPUT
+
+      - name: Log in to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ steps.ecr.outputs.image }}
+            ${{ steps.ecr.outputs.image_latest }}
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+      - name: Ensure App Runner ECR-access role
+        id: role
+        run: |
+          set -e
+          ROLE_NAME="AppRunnerECRAccessRole"
+          if ! aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
+            echo "Creating $ROLE_NAME"
+            printf '%s' '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"build.apprunner.amazonaws.com"},"Action":"sts:AssumeRole"}]}' > trust.json
+            aws iam create-role \
+              --role-name "$ROLE_NAME" \
+              --assume-role-policy-document file://trust.json \
+              --tags Key=Owner,Value="$RESOURCE_OWNER" >/dev/null
+            aws iam attach-role-policy \
+              --role-name "$ROLE_NAME" \
+              --policy-arn arn:aws:iam::aws:policy/service-role/AWSAppRunnerServicePolicyForECRAccess
+            # IAM eventual consistency — give it a moment.
+            sleep 12
+          fi
+          ROLE_ARN=$(aws iam get-role --role-name "$ROLE_NAME" --query 'Role.Arn' --output text)
+          echo "role_arn=$ROLE_ARN" >> $GITHUB_OUTPUT
+
+      - name: Deploy to App Runner (create or update)
+        id: deploy
+        env:
+          IMAGE_URI:        ${{ steps.ecr.outputs.image_latest }}
+          ACCESS_ROLE_ARN:  ${{ steps.role.outputs.role_arn }}
+          OPENAI_API_KEY:        ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY:     ${{ secrets.ANTHROPIC_API_KEY }}    # optional
+          API_SECRET_KEY:        ${{ secrets.API_SECRET_KEY }}
+        run: |
+          set -e
+          SERVICE_NAME="$APP_RUNNER_SERVICE"
+
+          SERVICE_ARN=$(aws apprunner list-services \
+            --region "$AWS_REGION" \
+            --query "ServiceSummaryList[?ServiceName=='$SERVICE_NAME'].ServiceArn | [0]" \
+            --output text)
+
+          ENV_JSON=$(jq -nc \
+            --arg openai "$OPENAI_API_KEY" \
+            --arg anthropic "$ANTHROPIC_API_KEY" \
+            --arg secret "$API_SECRET_KEY" \
+            --arg sha "${{ github.sha }}" \
+            '{
+              OPENAI_API_KEY:     $openai,
+              ANTHROPIC_API_KEY:  $anthropic,
+              API_SECRET_KEY:     $secret,
+              GIT_COMMIT_SHA:     $sha,
+              BROWSER_HEADLESS:   "true",
+              HUMAN_LOOP_BACKEND: "polling",
+              STATE_BACKEND:      "sqlite",
+              LLM_PRIMARY:        "openai",
+              LLM_FALLBACK:       ($anthropic | if . == "" then "openai" else "anthropic" end)
+            }')
+
+          if [ "$SERVICE_ARN" = "None" ] || [ -z "$SERVICE_ARN" ]; then
+            echo "Creating App Runner service $SERVICE_NAME"
+            SOURCE_CFG=$(jq -nc \
+              --arg image "$IMAGE_URI" \
+              --arg role  "$ACCESS_ROLE_ARN" \
+              --argjson env "$ENV_JSON" \
+              '{
+                ImageRepository: {
+                  ImageIdentifier: $image,
+                  ImageRepositoryType: "ECR",
+                  ImageConfiguration: {
+                    Port: "8000",
+                    RuntimeEnvironmentVariables: $env
+                  }
+                },
+                AutoDeploymentsEnabled: true,
+                AuthenticationConfiguration: { AccessRoleArn: $role }
+              }')
+            aws apprunner create-service \
+              --region "$AWS_REGION" \
+              --service-name "$SERVICE_NAME" \
+              --source-configuration "$SOURCE_CFG" \
+              --instance-configuration '{"Cpu":"1024","Memory":"2048"}' \
+              --health-check-configuration '{"Protocol":"HTTP","Path":"/health","Interval":20,"Timeout":10,"HealthyThreshold":1,"UnhealthyThreshold":5}' \
+              --tags Key=Owner,Value="$RESOURCE_OWNER"
+          else
+            echo "Updating App Runner service $SERVICE_ARN"
+            SOURCE_CFG=$(jq -nc \
+              --arg image "$IMAGE_URI" \
+              --arg role  "$ACCESS_ROLE_ARN" \
+              --argjson env "$ENV_JSON" \
+              '{
+                ImageRepository: {
+                  ImageIdentifier: $image,
+                  ImageRepositoryType: "ECR",
+                  ImageConfiguration: {
+                    Port: "8000",
+                    RuntimeEnvironmentVariables: $env
+                  }
+                },
+                AutoDeploymentsEnabled: true,
+                AuthenticationConfiguration: { AccessRoleArn: $role }
+              }')
+            aws apprunner update-service \
+              --region "$AWS_REGION" \
+              --service-arn "$SERVICE_ARN" \
+              --source-configuration "$SOURCE_CFG" >/dev/null
+            # update-service starts a deployment automatically only if config changed;
+            # force a fresh pull of :latest to guarantee a deploy.
+            aws apprunner start-deployment \
+              --region "$AWS_REGION" \
+              --service-arn "$SERVICE_ARN" >/dev/null || true
+          fi
+
+          # Resolve the live URL for the summary
+          SERVICE_ARN=$(aws apprunner list-services \
+            --region "$AWS_REGION" \
+            --query "ServiceSummaryList[?ServiceName=='$SERVICE_NAME'].ServiceArn | [0]" \
+            --output text)
+          SERVICE_URL=$(aws apprunner describe-service \
+            --region "$AWS_REGION" \
+            --service-arn "$SERVICE_ARN" \
+            --query 'Service.ServiceUrl' --output text)
+          echo "service_url=https://$SERVICE_URL" >> $GITHUB_OUTPUT
+
+      - name: Wait for App Runner to serve this commit
+        env:
+          SERVICE_URL: ${{ steps.deploy.outputs.service_url }}
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          set -e
+          echo "Polling $SERVICE_URL/health for commit=$EXPECTED_SHA"
+          for i in $(seq 1 60); do
+            BODY=$(curl -fsS --max-time 10 "$SERVICE_URL/health" 2>/dev/null || true)
+            LIVE_SHA=$(echo "$BODY" | jq -r '.commit // "unknown"' 2>/dev/null || echo "unknown")
+            echo "  attempt $i: live commit=$LIVE_SHA"
+            if [ "$LIVE_SHA" = "$EXPECTED_SHA" ]; then
+              echo "Live deploy confirmed."
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "::warning::Service did not report expected commit within 15 minutes — check App Runner console."
+
+      - name: Summary
+        run: |
+          echo "### Deployed"                                          >> $GITHUB_STEP_SUMMARY
+          echo "- Commit: \`${{ github.sha }}\`"                       >> $GITHUB_STEP_SUMMARY
+          echo "- Image:  \`${{ steps.ecr.outputs.image }}\`"          >> $GITHUB_STEP_SUMMARY
+          echo "- URL:    ${{ steps.deploy.outputs.service_url }}"     >> $GITHUB_STEP_SUMMARY
+          echo "- Verify: \`curl ${{ steps.deploy.outputs.service_url }}/health\`" >> $GITHUB_STEP_SUMMARY
