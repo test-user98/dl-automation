@@ -41,7 +41,10 @@ class Settings(BaseSettings):
     browser_timeout_ms: int = Field(30000, env="BROWSER_TIMEOUT_MS")
     browser_viewport_width: int = Field(1280, env="BROWSER_VIEWPORT_WIDTH")
     browser_viewport_height: int = Field(800, env="BROWSER_VIEWPORT_HEIGHT")
-    browser_channel: str = Field("chrome", env="BROWSER_CHANNEL")
+    # Empty means Playwright's bundled Chromium. This is the safest default for
+    # local demo and Docker because it matches the Playwright package version.
+    # Set BROWSER_CHANNEL=chrome only when you explicitly want system Chrome.
+    browser_channel: str = Field("", env="BROWSER_CHANNEL")
     browser_profile_dir: str = Field("./data/chrome_profile", env="BROWSER_PROFILE_DIR")
     browser_locale: str = Field("en-IN", env="BROWSER_LOCALE")
     browser_timezone_id: str = Field("Asia/Kolkata", env="BROWSER_TIMEZONE_ID")

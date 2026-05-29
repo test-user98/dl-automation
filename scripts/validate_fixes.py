@@ -358,10 +358,17 @@ async def test_state_confirmation_ui_changes_payload() -> bool:
         # Verify the review shows the DL-derived state
         review_text = await page.text_content("#review-rows")
         ok &= assert_eq("review shows Rajasthan from DL", "Rajasthan" in (review_text or ""), True)
-        ok &= assert_eq("review shows 'from your DL'", "from your DL" in (review_text or ""), True)
+        ok &= assert_eq("review asks customer to confirm state",
+                        "please confirm" in (review_text or "").lower(), True)
+        await page.click("#start-btn")
+        await page.wait_for_timeout(300)
+        banner_text = await page.text_content("#step3-banner")
+        ok &= assert_eq("start blocked until filing state confirmed",
+                        "confirm the state" in (banner_text or "").lower(), True)
+        ok &= assert_eq("confirm-and-start not called before state confirm",
+                        len(captured_payloads), 0)
 
         # Override state via the Change → dropdown
-        await page.click("#state-edit-toggle")
         await page.wait_for_selector("#state-edit:not(.hidden)")
         await page.select_option("#state-edit-select", "MH")
         await page.wait_for_timeout(150)

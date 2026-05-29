@@ -108,6 +108,9 @@ async def main() -> int:
         await page.locator("#screen-2 button.primary").click()
         await page.locator("#screen-3:not(.hidden)").wait_for(state="visible", timeout=15000)
         await page.locator("#pin_code").fill("334401")
+        await page.locator("#state-edit-toggle").click()
+        await page.locator("#state-edit:not(.hidden)").wait_for(state="visible", timeout=15000)
+        await page.locator("#state-edit-select").select_option("RJ")
         await page.locator("#start-btn").click()
         await page.locator("#screen-4:not(.hidden)").wait_for(state="visible", timeout=15000)
 

@@ -3,7 +3,7 @@
 Repo: `C:\Users\yashs\OneDrive\Desktop\token26`
 Remote: `https://github.com/test-user98/dl-automation.git`
 Live App Runner URL: `https://thxz3gzmhf.ap-south-1.awsapprunner.com`
-Current local checkpoint commit: latest local `HEAD` (`Pin playwright==1.48.0 to match Docker base image chromium`, `54c9dec`)
+Current local checkpoint commit: latest local `HEAD` (`Stabilize local browser launch and require state confirmation`)
 Previous checkpoint: `674096e` (deploy pipeline), `fc15a82` (customer onboarding + status layer), `52c2100` (agent hardening)
 
 Do not push without explicit user approval. The user wants local proof before
@@ -1132,3 +1132,58 @@ Still not fully proven:
   after this exact patch. Previous runs proved the backend can reach OTP, and
   smoke tests prove the UI bridge posts OTP/human answers correctly, but the
   latest live UI run hit Sarathi 403 before OTP.
+
+## Local demo browser/state stabilization (`Stabilize local browser launch and require state confirmation`)
+
+Triggered by the user's local server log:
+
+- `orchestrator.run_failed ... error='Connection closed while reading from the driver'`
+- Playwright internal `Connection.init: Connection closed while reading from the driver`
+- Windows assertion `Assertion failed: process_title, file src\win\util.c, line 412`
+
+Root cause found:
+
+- `BrowserController.start()` defaulted to `BROWSER_CHANNEL=chrome`, so the real
+  agent launched system Chrome.
+- The browser smoke tests launched Playwright's bundled Chromium, so tests were
+  green while the live local agent could still fail at the driver layer.
+
+Fix:
+
+- `config/settings.py`: default `browser_channel` is now empty, which means
+  Playwright bundled Chromium. `BROWSER_CHANNEL=chrome` remains available as an
+  explicit opt-in.
+- `browser/controller.py`: launch path now retries once and logs
+  `browser.launch_failed` with the selected channel before failing.
+
+Second fix in the same slice:
+
+- Customer filing state is no longer silently inferred from the DL prefix.
+- `frontend/index.html`: screen 3 now shows DL-derived state only as a
+  suggestion and blocks Start until the customer confirms/picks the filing
+  state.
+- `api/onboard.py`: `/onboard/confirm-and-start` now trusts the customer-
+  confirmed `state_code`; it no longer overwrites it with the DL-normalized
+  prefix. Missing state returns a 400 asking the customer to confirm state.
+- Smoke harnesses were updated to pick state before Start.
+
+Validation completed locally:
+
+- `python -m py_compile config\settings.py browser\controller.py api\onboard.py scripts\validate_fixes.py scripts\browser_smoke.py scripts\live_ui_flow.py` -> pass
+- Focused BrowserController start with bundled Chromium, headless -> pass
+- Focused BrowserController start with bundled Chromium, visible -> pass
+- `python -m pytest tests\test_customer_interactions.py tests\test_agent_resilience_helpers.py -q` -> `19 passed`
+- `python scripts\validate_fixes.py` -> `ALL FIXES VALIDATED`
+- `python scripts\browser_smoke.py --base http://127.0.0.1:8001 --out data\browser_smoke_browser_state_fix` -> `ok:true`
+  - no console issues
+  - no failed network requests
+  - no layout issues
+  - confirms selected state in payload: `"state_code":"RJ"`
+  - confirms OTP POST path and human-response POST path still work
+- Full `python -m pytest -q` -> `52 passed`
+
+Still not proven by this slice:
+
+- A fresh real Sarathi OTP validation after these local-browser changes. The
+  local browser can now launch; next validation should run the real customer UI
+  flow and watch `/jobs/{id}` plus server logs.

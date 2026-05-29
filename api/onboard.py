@@ -22,7 +22,7 @@ from pathlib import Path
 from config.settings import get_settings, get_settings as _gs
 from config.portal_rules import get_fee
 from api.deps import state_manager, ocr_service, orchestrator, customer_store
-from tools.dl_normalizer import DLNormalizer, DL_FORMAT_HINT, DL_LOCATION_HINT
+from tools.dl_normalizer import DLNormalizer, DL_FORMAT_HINT, DL_LOCATION_HINT, STATE_CODES
 
 router = APIRouter(prefix="/onboard", tags=["onboarding"])
 settings = get_settings()
@@ -156,7 +156,7 @@ class ConfirmAndStartRequest(BaseModel):
     pin_code:      str = ""
     blood_group:   str = ""
     gender:        str = ""
-    state_code:    str = "RJ"
+    state_code:    str = ""
     rto_code:      str = ""
 
     # Document paths (set by server after upload)
@@ -179,6 +179,14 @@ async def confirm_and_start(req: ConfirmAndStartRequest):
     if not dl_result["valid"]:
         raise HTTPException(status_code=400, detail=dl_result["error"])
 
+    selected_state_code = (req.state_code or "").strip().upper()
+    if not selected_state_code:
+        raise HTTPException(status_code=400, detail="Please confirm the filing state before starting.")
+    selected_state_name = STATE_CODES.get(
+        selected_state_code,
+        {"TG": "Telangana"}.get(selected_state_code, selected_state_code),
+    )
+
     customer_data = {
         "dl_number":     dl_result["normalized"],
         "dob":           req.dob,
@@ -189,8 +197,8 @@ async def confirm_and_start(req: ConfirmAndStartRequest):
         "pin_code":      req.pin_code,
         "blood_group":   req.blood_group,
         "gender":        req.gender,
-        "state_code":    dl_result["state_code"] or req.state_code,
-        "state_name":    dl_result["state_name"],
+        "state_code":    selected_state_code,
+        "state_name":    selected_state_name,
         "rto_code":      req.rto_code or dl_result["rto_code"],
     }
 

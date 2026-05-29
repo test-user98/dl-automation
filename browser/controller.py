@@ -57,25 +57,33 @@ class BrowserController:
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
     async def start(self, saved_cookies: list[dict] = None):
-        self._playwright = await async_playwright().start()
-        try:
-            self._browser = await self._playwright.chromium.launch(
-                headless=settings.browser_headless,
-                slow_mo=settings.browser_slow_mo_ms,
-                channel=settings.browser_channel or None,
-                args=["--start-maximized"],
-            )
-        except Exception as e:
-            log.warning(
-                "browser.channel_launch_failed_falling_back",
-                channel=settings.browser_channel,
-                error=str(e),
-            )
-            self._browser = await self._playwright.chromium.launch(
-                headless=settings.browser_headless,
-                slow_mo=settings.browser_slow_mo_ms,
-                args=["--start-maximized"],
-            )
+        last_error = None
+        channel = (settings.browser_channel or "").strip()
+        for attempt in range(1, 3):
+            try:
+                self._playwright = await async_playwright().start()
+                launch_kwargs = {
+                    "headless": settings.browser_headless,
+                    "slow_mo": settings.browser_slow_mo_ms,
+                    "args": ["--start-maximized"],
+                }
+                if channel:
+                    launch_kwargs["channel"] = channel
+                self._browser = await self._playwright.chromium.launch(**launch_kwargs)
+                break
+            except Exception as e:
+                last_error = e
+                log.warning(
+                    "browser.launch_failed",
+                    attempt=attempt,
+                    channel=channel or "bundled-chromium",
+                    error=str(e),
+                )
+                await self.stop()
+                await asyncio.sleep(1.5 * attempt)
+
+        if not self._browser:
+            raise last_error
         self._context = await self._browser.new_context(
             viewport={
                 "width":  settings.browser_viewport_width,

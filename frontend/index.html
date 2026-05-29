@@ -839,7 +839,7 @@ const STATE_NAMES = {
   UK:"Uttarakhand", WB:"West Bengal",
 };
 
-let manualStateCode = "";    // set when customer overrides the DL-derived state
+let manualStateCode = "";    // set only after customer confirms/picks filing state
 
 function effectiveStateCode() {
   return manualStateCode || (dlNormalised || '').slice(0, 2);
@@ -853,7 +853,7 @@ function effectiveStateName() {
 function renderReview() {
   const stateCode = effectiveStateCode();
   const stateName = effectiveStateName();
-  const stateSource = manualStateCode ? 'you picked this' : (stateCode ? 'from your DL' : '');
+  const stateSource = manualStateCode ? 'you picked this' : (stateCode ? 'suggested from your DL - please confirm' : 'please pick this');
   const rows = {
     'DL number':  formatDL(dlNormalised) || document.getElementById('dl_raw').value || '—',
     'DOB':        document.getElementById('dob').value || '—',
@@ -866,10 +866,10 @@ function renderReview() {
   ).join('');
   const stateRow = `
     <div class="row state-row">
-      <b>State</b>
+      <b>Filing state</b>
       <span>
         ${escapeHtml(stateName)}${stateSource ? ` <span class="hint" style="display:inline">(${stateSource})</span>` : ''}
-        <span class="row-edit" onclick="toggleStateEdit()" id="state-edit-toggle">Change</span>
+        <span class="row-edit" onclick="toggleStateEdit()" id="state-edit-toggle">${manualStateCode ? 'Change' : 'Confirm / Change'}</span>
       </span>
     </div>`;
   document.getElementById('review-rows').innerHTML = reviewHTML + stateRow;
@@ -931,6 +931,17 @@ async function startJob() {
     }
     return;
   }
+  if (!manualStateCode) {
+    setScreenBanner('step3-banner', 'Please confirm the state where you want us to file this application.');
+    const box = document.getElementById('state-edit');
+    if (box) box.classList.remove('hidden');
+    const sel = document.getElementById('state-edit-select');
+    if (sel) {
+      sel.value = effectiveStateCode();
+      sel.focus();
+    }
+    return;
+  }
 
   const btn = document.getElementById('start-btn');
   btn.disabled = true; btn.textContent = 'Starting…';
@@ -940,7 +951,7 @@ async function startJob() {
     dob, mobile_number: mobile, pin_code: pin,
     name:    document.getElementById('name').value.trim(),
     address: extractedSnapshot.address || '',
-    state_code: effectiveStateCode(),
+    state_code: manualStateCode,
     service: 'DL_RENEWAL',
     dl_image_path:  dlImagePath,
     ocr_data:       extractedSnapshot,
