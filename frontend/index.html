@@ -674,7 +674,11 @@ let lastSubline = '';
 let dlImageUploaded = false;
 let extractedSnapshot = {};
 let dlImagePath = '';
+let dlImageS3Url = '';
+let dlImageS3Key = '';
+let dlImageStorageBackend = '';
 let ocrConfidence = 0;
+let ocrRetakeCount = 0;
 let otpSubmitInFlight = false; // prevent duplicate OTP submits while backend is processing
 let activityItems = [];
 let lastActivityKey = '';
@@ -692,8 +696,12 @@ function persistCustomerSession() {
       currentJobId,
       dlNormalised,
       dlImagePath,
+      dlImageS3Url,
+      dlImageS3Key,
+      dlImageStorageBackend,
       extractedSnapshot,
       ocrConfidence,
+      ocrRetakeCount,
       manualStateCode: (typeof manualStateCode === 'string') ? manualStateCode : '',
       form: {
         dl_raw: document.getElementById('dl_raw')?.value || '',
@@ -767,6 +775,7 @@ function goStep(n) {
 // ─── Step 1: OCR upload ─────────────────────────────────────────────────────
 const MAX_UPLOAD_BYTES = 8 * 1024 * 1024;            // 8 MB — comfortably enough for a phone photo
 const ACCEPTED_UPLOAD = ['image/jpeg', 'image/jpg', 'image/png', 'image/heic', 'image/webp', 'application/pdf'];
+const OCR_RETAKE_BUDGET = 2;
 
 async function onDLImage(input) {
   const file = input.files[0];
@@ -791,24 +800,34 @@ async function onDLImage(input) {
   banner.textContent = 'Reading your DL — this takes a few seconds…';
 
   const form = new FormData();
+  const uploadAttempt = ocrRetakeCount + 1;
   form.append('file', file);
+  form.append('attempt', String(uploadAttempt));
   let r;
   try {
     r = await fetch(`${API}/onboard/extract-dl-image`, {
       method: 'POST',
       headers: { 'X-Secret': SECRET },
       body: form,
-    }).then(x => x.json());
+    }).then(async x => {
+      const body = await x.json().catch(() => ({}));
+      if (!x.ok) throw new Error(body?.detail || 'Upload failed');
+      return body;
+    });
   } catch (e) {
     banner.className = 'banner warn';
-    banner.innerHTML = "We couldn't reach the OCR service. <a href='#' onclick='document.getElementById(\"dl-file\").click(); return false'>Try again</a> or continue and type your details.";
+    banner.innerHTML = "We couldn't read that upload. <a href='#' onclick='document.getElementById(\"dl-file\").click(); return false'>Try again</a> or continue and type your details.";
     return;
   }
 
   extractedSnapshot = r.extracted || {};
   dlImageUploaded   = true;
   dlImagePath       = r.dl_image_path || '';
+  dlImageS3Url      = r.dl_image_s3_url || '';
+  dlImageS3Key      = r.dl_image_s3_key || '';
+  dlImageStorageBackend = r.storage_backend || '';
   ocrConfidence     = r.confidence    || 0;
+  ocrRetakeCount    = Number(r.retake_attempt || uploadAttempt);
 
   // Pre-fill what we read
   if (extractedSnapshot.dl_number) document.getElementById('dl_raw').value = extractedSnapshot.dl_number;
@@ -824,14 +843,28 @@ async function onDLImage(input) {
   } else {
     banner.className = 'banner warn';
     const missing = (r.missing_fields || []).join(', ');
-    const reason  = missing ? `we couldn't read: ${missing}` : "the image was blurry";
+    const title = r.rejection_title || 'We could not read this upload';
+    const detail = r.rejection_message || r.message || 'Please retake the photo or type your details.';
+    const remaining = Number.isFinite(Number(r.retakes_remaining))
+      ? Number(r.retakes_remaining)
+      : Math.max(0, OCR_RETAKE_BUDGET - Math.max(0, ocrRetakeCount - 1));
+    const retakeButton = r.can_retake !== false && remaining > 0
+      ? `<button class="ghost" onclick="document.getElementById('dl-file').click()">Retake photo (${remaining} left)</button>`
+      : '';
+    const missingLine = missing
+      ? `<div style="font-size:12px; margin-top:6px">Needed: ${escapeHtml(missing)}</div>`
+      : '';
     banner.innerHTML = `
-      We read part of your DL, but ${reason}.
+      <strong>${escapeHtml(title)}</strong>
+      <div style="margin-top:6px">${escapeHtml(detail)}</div>
+      ${missingLine}
       <div style="margin-top: 10px">
-        <button class="ghost" onclick="document.getElementById('dl-file').click()">Retake photo</button>
+        ${retakeButton}
         <button class="ghost" onclick="goStep(2)">Type details instead</button>
       </div>`;
   }
+  input.value = '';
+  persistCustomerSession();
   await validateDL();
 }
 
@@ -1020,6 +1053,8 @@ async function startJob() {
     state_code: resolvedState,
     service: 'DL_RENEWAL',
     dl_image_path:  dlImagePath,
+    dl_image_s3_url: dlImageS3Url,
+    dl_image_s3_key: dlImageS3Key,
     ocr_data:       extractedSnapshot,
     ocr_confidence: ocrConfidence,
   };
@@ -1828,8 +1863,12 @@ function rehydrateCustomerSession() {
   }
   dlNormalised = snap.dlNormalised || '';
   dlImagePath = snap.dlImagePath || '';
+  dlImageS3Url = snap.dlImageS3Url || '';
+  dlImageS3Key = snap.dlImageS3Key || '';
+  dlImageStorageBackend = snap.dlImageStorageBackend || '';
   extractedSnapshot = snap.extractedSnapshot || {};
   ocrConfidence = snap.ocrConfidence || 0;
+  ocrRetakeCount = snap.ocrRetakeCount || 0;
   if (typeof snap.manualStateCode === 'string') manualStateCode = snap.manualStateCode;
   // If the snapshot has a job id, the customer was already on the live
   // screen — drop them straight back there and resume polling, instead of

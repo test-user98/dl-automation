@@ -93,6 +93,7 @@ class Settings(BaseSettings):
         "claude", env="OCR_PROVIDER"
     )
     ocr_max_attempts: int = Field(2, env="OCR_MAX_ATTEMPTS")
+    ocr_retake_budget: int = Field(2, env="OCR_RETAKE_BUDGET")
     aws_textract_region: str = Field("ap-south-1", env="AWS_TEXTRACT_REGION")
     aws_access_key_id: str = Field("", env="AWS_ACCESS_KEY_ID")
     aws_secret_access_key: str = Field("", env="AWS_SECRET_ACCESS_KEY")

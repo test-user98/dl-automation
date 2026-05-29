@@ -260,6 +260,82 @@ def test_upload_rejects_bad_mime(client):
     assert r.status_code == 415
 
 
+def test_upload_returns_agentic_rejection_payload(client, monkeypatch):
+    import api.onboard
+
+    async def fake_classify(path):
+        assert Path(path).exists()
+        return {
+            "accepted": False,
+            "is_driving_license": False,
+            "document_type": "aadhaar",
+            "image_quality": "clear",
+            "confidence": 0.91,
+            "rejection_reason": "not_dl",
+            "rejection_title": "Upload a driving licence photo",
+            "rejection_message": "That image does not look like a driving licence.",
+            "extracted": {},
+            "missing_fields": [],
+            "needs_manual_review": True,
+        }
+
+    monkeypatch.setattr(api.onboard._ocr, "classify_and_extract_driving_license", fake_classify)
+    r = client.post(
+        "/onboard/extract-dl-image",
+        data={"attempt": "2"},
+        files={"file": ("aadhaar.jpg", b"fake image bytes", "image/jpeg")},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ocr_success"] is False
+    assert body["rejection_reason"] == "not_dl"
+    assert body["retake_attempt"] == 2
+    assert body["retakes_remaining"] == 1
+    assert body["can_retake"] is True
+    assert body["storage_backend"] == "disk"
+    assert body["dl_image_path"]
+
+
+def test_upload_accepts_agentic_dl_payload(client, monkeypatch):
+    import api.onboard
+
+    async def fake_classify(path):
+        assert Path(path).exists()
+        return {
+            "accepted": True,
+            "is_driving_license": True,
+            "document_type": "driving_license",
+            "image_quality": "clear",
+            "confidence": 0.94,
+            "rejection_reason": "",
+            "rejection_title": "",
+            "rejection_message": "",
+            "extracted": {
+                "dl_number": "RJ07 2017 0010191",
+                "dob": "01-01-1990",
+                "name": "Aarav Sharma",
+                "pin_code": "334401",
+            },
+            "missing_fields": [],
+            "needs_manual_review": False,
+        }
+
+    monkeypatch.setattr(api.onboard._ocr, "classify_and_extract_driving_license", fake_classify)
+    r = client.post(
+        "/onboard/extract-dl-image",
+        data={"attempt": "1"},
+        files={"file": ("dl.jpg", b"fake image bytes", "image/jpeg")},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ocr_success"] is True
+    assert body["rejection_reason"] == ""
+    assert body["retakes_remaining"] == 0
+    assert body["dl_normalised"]["normalized"] == "RJ0720170010191"
+    assert body["display"] == "RJ07 2017 0010191"
+    assert body["extracted"]["name"] == "Aarav Sharma"
+
+
 def test_lookup_by_application_number(client):
     """Lookup by application number finds the customer record."""
     # Seeded app numbers include 'RJ-DL-2026-04219'

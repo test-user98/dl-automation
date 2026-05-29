@@ -65,6 +65,49 @@ _ACCEPTED_UPLOAD_TYPES = {
     "application/pdf",
 }
 
+_UPLOAD_REJECTION_COPY = {
+    "invalid_dl_number": (
+        "Check the licence number",
+        "We read a licence number, but it does not match the expected format. Please check it before continuing.",
+    ),
+    "missing_required": (
+        "Some details were not readable",
+        "We need the DL number and date of birth. You can retake the photo or type them.",
+    ),
+    "unreadable": (
+        "Upload a clearer photo",
+        "We could not read the licence clearly. Try a well-lit, uncropped photo.",
+    ),
+    "not_dl": (
+        "Upload a driving licence photo",
+        "That image does not look like a driving licence. Please upload the front side of your DL.",
+    ),
+    "wrong_side": (
+        "Upload the front side",
+        "We need the side that shows your DL number and date of birth.",
+    ),
+    "screenshot": (
+        "Upload the document photo",
+        "This looks like a screen capture. Please upload a clear photo of the physical licence.",
+    ),
+    "low_confidence": (
+        "Check the uploaded photo",
+        "The details were not clear enough to use automatically. Please retake the photo or type them.",
+    ),
+    "unsupported": (
+        "Upload a supported document",
+        "Please upload a clear photo or PDF of your Indian driving licence.",
+    ),
+    "parse_error": (
+        "We could not read this upload",
+        "Please try again with a clearer photo or continue by typing your details.",
+    ),
+    "model_error": (
+        "We could not read this upload",
+        "Please try again with a clearer photo or continue by typing your details.",
+    ),
+}
+
 
 def _safe_filename(name: str) -> str:
     """Strip path separators and dangerous characters; preserve the extension."""
@@ -73,8 +116,29 @@ def _safe_filename(name: str) -> str:
     return _re.sub(r"[^A-Za-z0-9._-]+", "_", name)[-120:] or "upload"
 
 
+def _upload_rejection_copy(reason: str) -> tuple[str, str]:
+    return _UPLOAD_REJECTION_COPY.get(
+        reason,
+        (
+            "We could not read this upload",
+            "Please try again with a clearer photo or continue by typing your details.",
+        ),
+    )
+
+
+def _unique_labels(values: list) -> list[str]:
+    seen = set()
+    labels = []
+    for value in values or []:
+        label = str(value or "").strip()
+        if label and label not in seen:
+            labels.append(label)
+            seen.add(label)
+    return labels
+
+
 @router.post("/extract-dl-image")
-async def extract_dl_image(file: UploadFile = File(...)):
+async def extract_dl_image(file: UploadFile = File(...), attempt: int = Form(1)):
     """
     Customer uploads a photo of their DL.
     We OCR it, extract dl_number and other fields.
@@ -114,38 +178,72 @@ async def extract_dl_image(file: UploadFile = File(...)):
         content_type=file.content_type or "image/jpeg",
     )
 
-    extracted = {}
-    for attempt in range(1, settings.ocr_max_attempts + 1):
-        extracted = await _ocr.extract_driving_license(file_path)
-        if extracted.get("dl_number") or extracted.get("dob"):
-            break
+    assessment = await _ocr.classify_and_extract_driving_license(file_path)
+    extracted = assessment.get("extracted") or {}
 
     # Normalise the DL number if OCR found one
     dl_raw = extracted.get("dl_number", "")
     normalised = _normalizer.normalize(dl_raw) if dl_raw else {"valid": False}
-    missing_fields = [
-        label for label, key in [
-            ("DL number", "dl_number"),
-            ("date of birth", "dob"),
-        ]
-        if not extracted.get(key)
-    ]
-    confidence = 0.95
-    if missing_fields:
-        confidence -= 0.3 * len(missing_fields)
-    if not normalised.get("valid"):
-        confidence -= 0.25
+    missing_fields = _unique_labels(assessment.get("missing_fields") or [])
+    if assessment.get("is_driving_license"):
+        missing_fields = _unique_labels(
+            missing_fields
+            + [
+                label for label, key in [
+                    ("DL number", "dl_number"),
+                    ("date of birth", "dob"),
+                ]
+                if not extracted.get(key)
+            ]
+        )
+
+    confidence = assessment.get("confidence", 0.0)
+    try:
+        confidence = float(confidence)
+    except (TypeError, ValueError):
+        confidence = 0.0
     confidence = max(0.0, min(0.99, confidence))
-    needs_manual_review = bool(missing_fields) or not normalised.get("valid")
+
+    rejection_reason = (assessment.get("rejection_reason") or "").strip()
+    if assessment.get("accepted") and not normalised.get("valid"):
+        rejection_reason = "invalid_dl_number"
+    elif not rejection_reason and (missing_fields or not normalised.get("valid")):
+        rejection_reason = "missing_required"
+    elif not rejection_reason and not extracted:
+        rejection_reason = "unreadable"
+
+    rejection_title = assessment.get("rejection_title") or ""
+    rejection_message = assessment.get("rejection_message") or ""
+    if rejection_reason:
+        rejection_title, rejection_message = _upload_rejection_copy(rejection_reason)
+
+    needs_manual_review = bool(rejection_reason) or bool(missing_fields) or not normalised.get("valid")
+    ocr_success = bool(assessment.get("accepted")) and not needs_manual_review
+
+    retake_attempt = max(1, int(attempt or 1))
+    retake_budget = max(0, int(getattr(settings, "ocr_retake_budget", 2)))
+    retakes_remaining = 0 if ocr_success else max(0, retake_budget - max(0, retake_attempt - 1))
+    response_extracted = extracted
+    extracted = response_extracted if ocr_success else {}
 
     return {
-        "ocr_success":    bool(extracted) and not needs_manual_review,
-        "extracted":      extracted,
+        "ocr_success":    ocr_success,
+        "extracted":      response_extracted,
         "dl_normalised":  normalised,
         "display":        _normalizer.format_for_display(normalised.get("normalized", "")) if normalised.get("valid") else "",
         "confidence":     round(confidence, 2),
         "missing_fields": missing_fields,
         "needs_manual_review": needs_manual_review,
+        "is_driving_license": bool(assessment.get("is_driving_license")),
+        "document_type": assessment.get("document_type", "unknown"),
+        "image_quality": assessment.get("image_quality", "unknown"),
+        "rejection_reason": rejection_reason,
+        "rejection_title": rejection_title,
+        "rejection_message": rejection_message,
+        "retake_attempt": retake_attempt,
+        "retake_budget": retake_budget,
+        "retakes_remaining": retakes_remaining,
+        "can_retake": bool(not ocr_success and retakes_remaining > 0),
         # Path passed through to /onboard/confirm-and-start so we can persist
         # a Document record once we know the customer_id.
         "dl_image_path":  file_path,
