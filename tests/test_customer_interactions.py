@@ -114,3 +114,70 @@ def test_customer_view_maps_otp_wait_to_otp_action():
     assert view["action_required"] is True
     assert view["action_type"] == "otp"
     assert view["mobile_suffix"].endswith("63")
+
+
+def test_answered_customer_request_does_not_keep_prompting():
+    job = _job(JobStatus.STUCK_HUMAN_NEEDED)
+    job.customer_data["_pending_customer_request"] = {
+        "step_name": "service_selection",
+        "question": "Which DL service would you like to apply for?",
+        "context": "Select the DL service you need.",
+        "options": ["DL EXTRACT"],
+        "action_type": "service_selection",
+        "answered": True,
+    }
+
+    view = customer_job_view(job)
+
+    assert view["phase"] == "waiting"
+    assert view["action_required"] is False
+    assert view["customer_request"] == {}
+
+
+def test_customer_view_maps_otp_expired_to_fresh_otp_prompt():
+    job = _job(JobStatus.WAITING_OTP)
+    job.error_message = "OTP expired. Fresh OTP requested via resend."
+
+    view = customer_job_view(job)
+
+    assert view["headline"] == "Enter the fresh OTP"
+    assert "fresh OTP" in view["subline"]
+    assert view["action_required"] is True
+
+
+def test_customer_view_maps_invalid_otp_to_check_otp_prompt():
+    job = _job(JobStatus.WAITING_OTP)
+    job.error_message = "Invalid OTP entered"
+
+    view = customer_job_view(job)
+
+    assert view["headline"] == "Check the OTP"
+    assert "did not accept" in view["subline"]
+    assert view["action_required"] is True
+
+
+def test_customer_view_maps_forbidden_to_customer_safe_retry():
+    job = _job(JobStatus.AGENT_RUNNING)
+    job.step_logs.append(StepLog(
+        step_name="fill_personal_details",
+        status="failed",
+        observation="403 Forbidden",
+        action_taken="retry",
+    ).to_dict())
+
+    view = customer_job_view(job)
+
+    assert view["phase"] == "retrying"
+    assert view["headline"] == "Government portal is slow right now"
+    assert "retry" in view["subline"].lower()
+
+
+def test_customer_view_maps_browser_session_interruption_to_retryable_failure():
+    job = _job(JobStatus.FAILED)
+    job.error_message = "Target page, context or browser has been closed"
+
+    view = customer_job_view(job)
+
+    assert view["phase"] == "failed"
+    assert view["headline"] == "Portal session interrupted"
+    assert view["retryable"] is True

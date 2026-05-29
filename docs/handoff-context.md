@@ -455,3 +455,58 @@ Latest validation for this contract:
   `Latest update: Looking up your DL on the portal`; confirmation request
   rendered `Name/DOB/DL` context and posted `Yes, details are correct` to
   `/human-response`.
+
+## Latest Verification Hardening
+
+Current local checkpoint: `Add resilience regression tests and verification matrix`.
+
+This slice did not change production agent behavior. It added regression tests
+around the failure modes seen during live Sarathi testing so future fixes do
+not silently reintroduce loops or bad customer prompts.
+
+Validated locally:
+
+- `python -m py_compile agent/brain.py api/status_messages.py agent/human_loop.py config/portal_rules.py`
+- Targeted resilience run:
+  `python -m pytest tests/test_agent_resilience_helpers.py tests/test_customer_interactions.py -q`
+  -> 18 passed.
+- Full suite: `python -m pytest -q` -> 51 passed.
+
+Coverage added:
+
+- OTP submit failure classification:
+  - invalid CAPTCHA -> refresh/retry CAPTCHA, keep the same OTP;
+  - expired OTP -> resend and ask for fresh OTP;
+  - invalid OTP -> ask for a new OTP;
+  - unknown unchanged page -> do not mislabel as success.
+- OTP input detection:
+  - visible OTP fields are detected;
+  - hidden OTP fields do not count;
+  - OTP selector candidates do not pick CAPTCHA or DOB fields.
+- Bad navigation guard:
+  - Dashboard/Login/Change State/Home are blocked mid-application so the
+    agent does not restart the portal flow by accident.
+- Portal alert classification:
+  - invalid CAPTCHA / invalid OTP are treated as failures;
+  - "OTP sent successfully" is not treated as a failure.
+- No-progress loop fingerprint:
+  - query-string churn does not hide loops;
+  - real form value changes do alter the signature.
+- Self-learning rule overlay:
+  - `record_discovery()` persists a discovered selector to
+    `data/discovered_rules.json` and applies it live for the current run.
+- Customer-safe status mapping:
+  - answered human prompts stop asking the customer again;
+  - OTP expired/invalid states show the correct customer action;
+  - 403/Forbidden becomes a friendly retrying portal message;
+  - browser/session interruption becomes a retryable customer-safe failure.
+
+Current verification boundary:
+
+- Unit/API/UI-contract smoke coverage is green.
+- A fresh live Sarathi E2E was not run in this slice. Live E2E still requires
+  real OTP/CAPTCHA timing and may be blocked by portal availability, 403s, or
+  RTO/service eligibility. The last known live boundary remains: OTP path can
+  reach service selection, and `CHANGE OF DATE OF BIRTH IN DL` was rejected by
+  Sarathi for `DTO, LONGDING`; that rejection is now treated as a terminal,
+  customer-safe service/RTO eligibility message.
