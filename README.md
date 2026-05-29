@@ -99,3 +99,8 @@ cd C:\Users\yashs\OneDrive\Desktop\token26
 uvicorn api.server:app --host 127.0.0.1 --port 8001 --reload
 ```
 Open: [http://127.0.0.1:8001](http://127.0.0.1:8001)
+
+## Submitted by
+- Jai Sipani
+- Email: sipanijai@gmail.com
+- GitHub username: test-user98
