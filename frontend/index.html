@@ -1092,7 +1092,20 @@ function applyJob(r) {
   // is on the wrong screen for any reason (slow swap, cached payload), the
   // next poll cycle re-applies state. The show* functions guard against
   // wiping user input on re-entry.
-  if (v.action_type === 'otp' || r.status === 'WAITING_OTP') {
+  const otpActionable = (
+    r.status === 'WAITING_OTP' ||
+    (v.action_required === true && v.action_type === 'otp')
+  );
+  const captchaActionable = (
+    v.action_required === true && v.action_type === 'captcha'
+  );
+  const humanActionable = (
+    v.action_required === true &&
+    !!v.action_type &&
+    v.action_type !== 'otp' &&
+    v.action_type !== 'captcha'
+  );
+  if (otpActionable) {
     addActivity({
       phase: 'waiting',
       title: 'OTP needed',
@@ -1101,7 +1114,7 @@ function applyJob(r) {
     });
     showOTP(v);
     console.log('[applyJob] -> showOTP() called');
-  } else if (v.action_type === 'captcha') {
+  } else if (captchaActionable) {
     addActivity({
       phase: 'waiting',
       title: 'Security code needed',
@@ -1112,7 +1125,7 @@ function applyJob(r) {
     console.log('[applyJob] -> showCaptcha() called');
   } else if (v.phase === 'retrying' || r.status === 'FAILED_RETRYING') {
     show('screen-4');
-  } else if (v.action_required && v.action_type && v.action_type !== 'otp' && v.action_type !== 'captcha') {
+  } else if (humanActionable) {
     addActivity({
       phase: 'waiting',
       title: v.headline || 'Your input is needed',
@@ -1151,6 +1164,9 @@ function applyJob(r) {
         <button class="primary" onclick="retryWithSameData()">Try again with the same details</button>
         <button class="ghost"   onclick="location.reload()">Start over</button>
       </div>`;
+  } else {
+    // No customer input pending right now -> keep the user on live progress.
+    show('screen-4');
   }
 }
 

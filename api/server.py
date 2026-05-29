@@ -208,6 +208,10 @@ async def submit_otp(job_id: str, body: OTPSubmission):
     otp = body.otp.strip()
     await _state_manager.store_otp(job_id, otp)
     await _human_loop.submit_response(job_id, otp)
+    # Prevent stale UI loops: once OTP is accepted from customer, the job is no
+    # longer "waiting for OTP" from the frontend point of view. The agent will
+    # continue and can re-open OTP flow if Sarathi rejects/expires it.
+    await _state_manager.transition(job, JobStatus.AGENT_RUNNING)
     return {"message": "OTP received, agent resuming"}
 
 
@@ -216,8 +220,16 @@ async def submit_human_response(job_id: str, body: HumanResponse):
     job = await _state_manager.load(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    if job.status != JobStatus.STUCK_HUMAN_NEEDED:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Job is not waiting for customer input (status={job.status.value})",
+        )
 
     await _human_loop.submit_response(job_id, body.answer)
+    # Same as OTP endpoint: as soon as customer answer is accepted, move UI out
+    # of waiting state. Agent will re-open another question only if truly needed.
+    await _state_manager.transition(job, JobStatus.AGENT_RUNNING)
     return {"message": "Response received, agent resuming"}
 
 
