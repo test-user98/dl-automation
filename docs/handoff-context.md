@@ -3,7 +3,7 @@
 Repo: `C:\Users\yashs\OneDrive\Desktop\token26`
 Remote: `https://github.com/test-user98/dl-automation.git`
 Live App Runner URL: `https://thxz3gzmhf.ap-south-1.awsapprunner.com`
-Current local checkpoint commit: latest local `HEAD` (`Auto-detect UI secret in browser smoke`)
+Current local checkpoint commit: latest local `HEAD` (`Add dynamic customer agent progress UI`)
 Previous checkpoint: `674096e` (deploy pipeline), `fc15a82` (customer onboarding + status layer), `52c2100` (agent hardening)
 
 Do not push without explicit user approval. The user wants local proof before
@@ -567,6 +567,38 @@ Latest tweak:
 
 Screenshots are written to `data/browser_smoke/*.png` during the run and are
 not committed.
+
+## Dynamic Customer Progress UI
+
+The customer live screen is no longer only four static phase buttons. It now
+has:
+
+- richer phase cards with sublabels:
+  `Connecting / Opening portal`,
+  `Filling form / Auto-completing fields`,
+  `Your input / OTP or choice`,
+  `Submitting / Collecting ACK`;
+- green completed states, warning retry states, and red stopped states;
+- a live agent activity panel with current focus, chip (`Live`, `Needs you`,
+  `Retrying`, `Done`, `Stopped`), and a deduped customer-safe activity feed;
+- activity entries generated from `customer_view.last_step_label`,
+  `headline/subline`, and recent `step_logs`;
+- mobile-safe responsive layout for the phase cards and activity rows.
+
+Backend streaming was also improved: `/jobs/{job_id}/stream` now emits when
+`updated_at` or step-log count changes, not only when status/completed-step
+count changes. This means retries within the same Sarathi step can still move
+the customer UI instead of feeling frozen.
+
+Validated locally:
+
+- `python -m py_compile api/server.py scripts/browser_smoke.py`
+- `python -m pytest -q` -> 51 passed
+- `python scripts/browser_smoke.py --base http://127.0.0.1:8000` -> `ok: true`
+- Browser smoke now verifies the live-progress screen before OTP and captures
+  `data/browser_smoke/customer_03_live_progress.png`.
+- In-app browser check confirmed the local UI serves `#agent-panel` and the
+  updated phase labels.
 
 ## Latest Deploy Verification
 

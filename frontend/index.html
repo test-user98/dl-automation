@@ -173,8 +173,84 @@
       background: #f3f5fa; color: var(--muted); text-align: center;
       border: 1px solid var(--line);
     }
-    .ph.on   { background: #e6f0ff; color: var(--primary); border-color: #c4dafd; }
+    .ph.on   { background: #e6f0ff; color: var(--primary); border-color: #c4dafd; box-shadow: inset 0 0 0 1px rgba(14, 98, 216, .08); }
     .ph.done { background: var(--success-bg); color: var(--success); border-color: #b8e1c5; }
+    .ph.warn { background: var(--warn-bg); color: var(--warn); border-color: #ead49a; }
+    .ph.err  { background: var(--err-bg); color: var(--err); border-color: #f1b0b0; }
+    .ph small { display: block; margin-top: 3px; font-size: 10px; line-height: 1.25; font-weight: 500; color: inherit; opacity: .78; }
+
+    .agent-panel {
+      margin-top: 14px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #fbfcff;
+      overflow: hidden;
+    }
+    .agent-focus {
+      display: grid;
+      grid-template-columns: 28px 1fr auto;
+      gap: 10px;
+      align-items: center;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+    }
+    .agent-orb {
+      width: 28px;
+      height: 28px;
+      border-radius: 999px;
+      display: grid;
+      place-items: center;
+      background: #e6f0ff;
+      color: var(--primary);
+      font-size: 14px;
+      font-weight: 800;
+    }
+    .agent-orb.done { background: var(--success-bg); color: var(--success); }
+    .agent-orb.warn { background: var(--warn-bg); color: var(--warn); }
+    .agent-orb.err  { background: var(--err-bg); color: var(--err); }
+    .agent-focus-title { font-size: 13px; font-weight: 700; color: var(--ink); }
+    .agent-focus-sub { margin-top: 2px; font-size: 12px; color: var(--muted); line-height: 1.35; }
+    .agent-chip {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 4px 8px;
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--ink-2);
+      background: #fff;
+      white-space: nowrap;
+    }
+    .activity-list { display: grid; gap: 0; }
+    .activity-item {
+      display: grid;
+      grid-template-columns: 18px 1fr auto;
+      gap: 8px;
+      align-items: start;
+      padding: 10px 14px;
+      border-top: 1px solid rgba(227, 232, 240, .7);
+    }
+    .activity-item:first-child { border-top: 0; }
+    .activity-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      margin-top: 4px;
+      background: var(--primary);
+      box-shadow: 0 0 0 4px rgba(14, 98, 216, .1);
+    }
+    .activity-item.done .activity-dot { background: var(--success); box-shadow: 0 0 0 4px rgba(18, 106, 47, .1); }
+    .activity-item.warn .activity-dot { background: var(--warn); box-shadow: 0 0 0 4px rgba(122, 83, 0, .12); }
+    .activity-item.err  .activity-dot { background: var(--err); box-shadow: 0 0 0 4px rgba(163, 20, 24, .1); }
+    .activity-title { font-size: 13px; font-weight: 650; }
+    .activity-sub { margin-top: 2px; color: var(--muted); font-size: 12px; line-height: 1.35; }
+    .activity-time { color: var(--muted); font-size: 11px; white-space: nowrap; padding-top: 1px; }
+    @media (max-width: 560px) {
+      .phase-track { grid-template-columns: 1fr 1fr; }
+      .agent-focus { grid-template-columns: 28px 1fr; }
+      .agent-chip { grid-column: 2; width: fit-content; }
+      .activity-item { grid-template-columns: 18px 1fr; }
+      .activity-time { grid-column: 2; }
+    }
 
     /* OTP */
     .otp-row { display: flex; gap: 8px; margin: 18px 0 4px; justify-content: center; }
@@ -327,10 +403,22 @@
       </div>
 
       <div class="phase-track" id="phase-track">
-        <div class="ph on"   data-phase="connecting">Connecting</div>
-        <div class="ph"      data-phase="filling">Filling form</div>
-        <div class="ph"      data-phase="waiting">Your OTP</div>
-        <div class="ph"      data-phase="submitting">Submitting</div>
+        <div class="ph on"   data-phase="connecting">Connecting<small>Opening portal</small></div>
+        <div class="ph"      data-phase="filling">Filling form<small>Auto-completing fields</small></div>
+        <div class="ph"      data-phase="waiting">Your input<small>OTP or choice</small></div>
+        <div class="ph"      data-phase="submitting">Submitting<small>Collecting ACK</small></div>
+      </div>
+
+      <div class="agent-panel" id="agent-panel">
+        <div class="agent-focus">
+          <div class="agent-orb" id="agent-orb">•</div>
+          <div>
+            <div class="agent-focus-title" id="agent-focus-title">Preparing secure browser</div>
+            <div class="agent-focus-sub" id="agent-focus-sub">The agent is about to open the government portal.</div>
+          </div>
+          <div class="agent-chip" id="agent-chip">Live</div>
+        </div>
+        <div class="activity-list" id="activity-list"></div>
       </div>
 
       <div class="banner hidden" id="live-banner"></div>
@@ -406,6 +494,34 @@ let dlImageUploaded = false;
 let extractedSnapshot = {};
 let dlImagePath = '';
 let ocrConfidence = 0;
+let activityItems = [];
+let lastActivityKey = '';
+const PHASE_ORDER = ['connecting', 'filling', 'waiting', 'submitting'];
+const PHASE_META = {
+  connecting: { label: 'Connecting', sub: 'Opening portal' },
+  filling:    { label: 'Filling form', sub: 'Auto-completing fields' },
+  waiting:    { label: 'Your input', sub: 'OTP or choice' },
+  submitting: { label: 'Submitting', sub: 'Collecting ACK' },
+};
+const STEP_LABELS = {
+  open_homepage: 'Opening the government portal',
+  close_homepage_popup: 'Closing portal notices',
+  select_state: 'Selecting your state',
+  close_state_popup: 'Reading available services',
+  navigate_to_dl_services: 'Opening DL services',
+  fetch_dl_details: 'Looking up your DL',
+  confirm_dl_details: 'Confirming your details',
+  select_renewal_service: 'Selecting your chosen service',
+  auth_method_selection: 'Setting up verification',
+  fill_personal_details: 'Completing the portal form',
+  accept_alert_popup: 'Handling portal message',
+  mobile_otp_verification: 'Waiting for OTP verification',
+  aadhaar_otp_verification: 'Waiting for Aadhaar OTP',
+  upload_documents: 'Uploading documents',
+  upload_photo_signature: 'Uploading photo and signature',
+  fee_payment: 'Preparing government fee',
+  download_acknowledgment: 'Collecting acknowledgement',
+};
 
 // ─── Step nav ───────────────────────────────────────────────────────────────
 function goStep(n) {
@@ -581,6 +697,7 @@ async function startJob() {
   }
   currentJobId = r.job_id;
   goStep(4);
+  resetActivity();
   setLive({ phase: 'connecting', headline: 'Starting your application', subline: 'Opening the government portal…' });
   startPolling();
 }
@@ -638,22 +755,50 @@ async function poll() {
 
 function applyJob(r) {
   const v = r.customer_view || {};
-  setLive(v);
+  setLive(v, r);
 
   if (v.action_type === 'otp' || r.status === 'WAITING_OTP') {
     stopLiveUpdates();
+    addActivity({
+      phase: 'waiting',
+      title: 'OTP needed',
+      subline: v.subline || 'Enter the OTP sent by the government portal.',
+      severity: 'action',
+    });
     showOTP(v);
   } else if ((v.action_required && v.action_type !== 'otp') || r.status === 'STUCK_HUMAN_NEEDED') {
     stopLiveUpdates();
+    addActivity({
+      phase: 'waiting',
+      title: v.headline || 'Your input is needed',
+      subline: v.subline || 'Please answer so the agent can continue.',
+      severity: 'action',
+    });
     showHumanRequest(v);
   } else if (r.status === 'SUBMITTED' || r.status === 'COMPLETED') {
     stopLiveUpdates();
     document.getElementById('app-number').textContent = r.application_number
       ? `Acknowledgement number: ${r.application_number}`
       : 'Your application was submitted on the portal.';
+    setLive({
+      phase: 'done',
+      headline: 'Application submitted',
+      subline: r.application_number
+        ? `Acknowledgement number ${r.application_number} is ready.`
+        : 'Your application was submitted on the government portal.',
+      last_step_label: 'Acknowledgement collected',
+      severity: 'success',
+    }, r);
     show('screen-done');
   } else if (r.status === 'FAILED') {
     stopLiveUpdates();
+    setLive({
+      phase: 'failed',
+      headline: v.headline || 'Needs attention',
+      subline: v.subline || 'The portal could not complete the request.',
+      last_step_label: v.last_step_label || 'Stopped safely',
+      severity: 'error',
+    }, r);
     const b = document.getElementById('live-banner');
     b.className = 'banner err'; b.classList.remove('hidden');
     b.innerHTML = `${escapeHtml(v.subline || 'Something went wrong.')}
@@ -664,7 +809,7 @@ function applyJob(r) {
   }
 }
 
-function setLive(v) {
+function setLive(v, job = {}) {
   document.getElementById('live-title').textContent = v.headline || 'Working on your application';
   const sub = v.subline || v.message || '';
   if (sub && sub !== lastSubline) {
@@ -683,12 +828,10 @@ function setLive(v) {
   if (v.phase === 'done')     spin.classList.add('done');
   if (v.phase === 'failed')   spin.classList.add('err');
 
-  const order = ['connecting', 'filling', 'waiting', 'submitting'];
-  const cur = order.indexOf(v.phase || 'connecting');
-  document.querySelectorAll('#phase-track .ph').forEach((el, i) => {
-    el.classList.toggle('on',   i === cur);
-    el.classList.toggle('done', i <  cur || v.phase === 'done');
-  });
+  renderPhaseTrack(v);
+  updateAgentFocus(v);
+  addActivity(activityFromView(v, job));
+  appendStepLogActivity(job.step_logs || []);
 
   const banner = document.getElementById('live-banner');
   if (v.phase === 'retrying') {
@@ -699,6 +842,158 @@ function setLive(v) {
   } else {
     banner.classList.add('hidden');
   }
+}
+
+function renderPhaseTrack(v) {
+  const phase = v.phase || 'connecting';
+  const cur = PHASE_ORDER.indexOf(phase);
+  document.querySelectorAll('#phase-track .ph').forEach((el, i) => {
+    const meta = PHASE_META[el.dataset.phase] || {};
+    el.innerHTML = `${meta.label || el.dataset.phase}<small>${meta.sub || ''}</small>`;
+    el.classList.remove('on', 'done', 'warn', 'err');
+    if (phase === 'done') el.classList.add('done');
+    else if (phase === 'failed') {
+      if (i <= Math.max(cur, 1)) el.classList.add(i < Math.max(cur, 1) ? 'done' : 'err');
+    } else if (phase === 'retrying') {
+      if (i < Math.max(cur, 1)) el.classList.add('done');
+      if (i === Math.max(cur, 1)) el.classList.add('warn');
+    } else {
+      el.classList.toggle('on', i === cur);
+      el.classList.toggle('done', i < cur);
+    }
+  });
+}
+
+function updateAgentFocus(v) {
+  const phase = v.phase || 'connecting';
+  const severity = v.severity || '';
+  const orb = document.getElementById('agent-orb');
+  const chip = document.getElementById('agent-chip');
+  const title = document.getElementById('agent-focus-title');
+  const sub = document.getElementById('agent-focus-sub');
+  if (!orb || !chip || !title || !sub) return;
+
+  orb.className = 'agent-orb';
+  if (phase === 'done') orb.classList.add('done');
+  if (phase === 'retrying' || severity === 'warning') orb.classList.add('warn');
+  if (phase === 'failed' || severity === 'error') orb.classList.add('err');
+  orb.textContent = phase === 'done' ? '✓' : phase === 'failed' ? '!' : phase === 'retrying' ? '↻' : '•';
+
+  title.textContent = v.last_step_label || v.headline || 'Working on your application';
+  sub.textContent = v.subline || v.message || 'The agent is making progress in the government portal.';
+  chip.textContent = phase === 'waiting'
+    ? 'Needs you'
+    : phase === 'retrying'
+      ? 'Retrying'
+      : phase === 'done'
+        ? 'Done'
+        : phase === 'failed'
+          ? 'Stopped'
+          : 'Live';
+}
+
+function resetActivity() {
+  activityItems = [];
+  lastActivityKey = '';
+  const list = document.getElementById('activity-list');
+  if (list) list.innerHTML = '';
+}
+
+function activityFromView(v, job = {}) {
+  const phase = v.phase || 'connecting';
+  const label = v.last_step_label || v.headline || 'Working on your application';
+  return {
+    phase,
+    title: label,
+    subline: v.subline || v.message || statusToSubline(job.status, phase),
+    severity: v.severity || '',
+  };
+}
+
+function appendStepLogActivity(logs) {
+  if (!Array.isArray(logs)) return;
+  logs.slice(-3).forEach(log => {
+    const label = STEP_LABELS[log.step_name] || humanizeStep(log.step_name || '');
+    if (!label) return;
+    const status = String(log.status || '').toLowerCase();
+    const isFailure = status.includes('fail') || status.includes('error');
+    const isSkipped = status.includes('skip');
+    addActivity({
+      phase: isFailure ? 'retrying' : 'filling',
+      title: label,
+      subline: isFailure
+        ? 'The portal did not accept that attempt. The agent is trying a safer route.'
+        : isSkipped
+          ? 'This step was not needed for your application.'
+          : 'Completed in the government portal.',
+      severity: isFailure ? 'warning' : 'success',
+      at: log.timestamp || '',
+    });
+  });
+}
+
+function addActivity(item) {
+  if (!item || !item.title) return;
+  const key = [
+    item.phase || '',
+    item.title || '',
+    item.subline || '',
+    item.severity || '',
+  ].join('|');
+  if (key === lastActivityKey || activityItems.some(x => x.key === key)) return;
+  lastActivityKey = key;
+  activityItems.unshift({
+    key,
+    phase: item.phase || 'filling',
+    title: item.title,
+    subline: item.subline || '',
+    severity: item.severity || '',
+    at: item.at || new Date().toISOString(),
+  });
+  activityItems = activityItems.slice(0, 5);
+  renderActivityList();
+}
+
+function renderActivityList() {
+  const list = document.getElementById('activity-list');
+  if (!list) return;
+  list.innerHTML = activityItems.map((item, idx) => {
+    const cls = item.phase === 'done' || item.severity === 'success'
+      ? 'done'
+      : item.phase === 'failed' || item.severity === 'error'
+        ? 'err'
+        : item.phase === 'retrying' || item.severity === 'warning'
+          ? 'warn'
+          : '';
+    return `
+      <div class="activity-item ${cls}">
+        <div class="activity-dot"></div>
+        <div>
+          <div class="activity-title">${escapeHtml(item.title)}</div>
+          <div class="activity-sub">${escapeHtml(item.subline)}</div>
+        </div>
+        <div class="activity-time">${idx === 0 ? 'now' : escapeHtml(formatShortTime(item.at))}</div>
+      </div>`;
+  }).join('');
+}
+
+function statusToSubline(status, phase) {
+  if (status === 'FAILED_RETRYING' || phase === 'retrying') return 'The portal is unstable. We are retrying safely.';
+  if (phase === 'waiting') return 'The agent needs one input from you to continue.';
+  if (phase === 'submitting') return 'Final portal steps are being completed.';
+  return 'Progress saved. The agent is continuing automatically.';
+}
+
+function humanizeStep(step) {
+  return String(step || '')
+    .replace(/_/g, ' ')
+    .replace(/\b\w/g, ch => ch.toUpperCase());
+}
+
+function formatShortTime(iso) {
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  return d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' });
 }
 
 // ─── OTP screen ────────────────────────────────────────────────────────────

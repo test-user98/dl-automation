@@ -124,23 +124,29 @@ async def _layout_issues(page: Page, label: str) -> list[dict[str, Any]]:
     )
 
 
-def _mock_job_payload(status: str, customer_view: dict[str, Any], app_no: str = "") -> dict[str, Any]:
+def _mock_job_payload(
+    status: str,
+    customer_view: dict[str, Any],
+    app_no: str = "",
+    step_logs: list[dict[str, Any]] | None = None,
+    steps_completed: list[str] | None = None,
+) -> dict[str, Any]:
     return {
         "job_id": "smoke-job",
         "status": status,
-        "steps_completed": ["fetch_dl_details"],
+        "steps_completed": steps_completed or ["fetch_dl_details"],
         "application_number": app_no,
         "otp_pending_type": "mobile" if customer_view.get("action_type") == "otp" else "",
         "error_message": "",
         "last_url": "envaction.do",
-        "step_logs": [],
+        "step_logs": step_logs or [],
         "updated_at": "2026-05-29T13:00:00",
         "customer_view": customer_view,
     }
 
 
 async def _install_job_mocks(page: Page, posts: list[dict[str, Any]]) -> None:
-    state = {"phase": "otp"}
+    state = {"phase": "filling"}
 
     async def route_jobs(route, request):
         url = request.url
@@ -180,7 +186,33 @@ async def _install_job_mocks(page: Page, posts: list[dict[str, Any]]) -> None:
             return
 
         if "/jobs/smoke-job" in url and method == "GET":
-            if state["phase"] == "otp":
+            if state["phase"] == "filling":
+                body = _mock_job_payload(
+                    "AGENT_RUNNING",
+                    {
+                        "phase": "filling",
+                        "headline": "Filling your application",
+                        "subline": "The agent is checking your DL details on Sarathi.",
+                        "severity": "info",
+                        "action_required": False,
+                        "action_type": "",
+                        "last_step_label": "Looking up your DL on the portal",
+                        "customer_request": {},
+                    },
+                    step_logs=[
+                        {
+                            "step_name": "select_state",
+                            "status": "success",
+                        },
+                        {
+                            "step_name": "fetch_dl_details",
+                            "status": "success",
+                        },
+                    ],
+                    steps_completed=["select_state", "fetch_dl_details"],
+                )
+                state["phase"] = "otp"
+            elif state["phase"] == "otp":
                 body = _mock_job_payload(
                     "WAITING_OTP",
                     {
@@ -244,6 +276,8 @@ async def _install_job_mocks(page: Page, posts: list[dict[str, Any]]) -> None:
 
 async def run(base: str, secret: str, output_dir: Path) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
+    for old_png in output_dir.glob("*.png"):
+        old_png.unlink()
     cache_bust = int(time.time() * 1000)
     console_issues: list[dict[str, Any]] = []
     failed_requests: list[dict[str, Any]] = []
@@ -315,6 +349,11 @@ async def run(base: str, secret: str, output_dir: Path) -> dict[str, Any]:
         layout += await _layout_issues(page, "customer_review_desktop")
 
         await page.click("#start-btn")
+        await page.wait_for_selector("#activity-list .activity-item", timeout=7_000)
+        activity_text = await page.locator("#activity-list").inner_text()
+        phase_text = await page.locator("#phase-track").inner_text()
+        await page.screenshot(path=output_dir / "customer_03_live_progress.png")
+        layout += await _layout_issues(page, "customer_live_progress_desktop")
         await page.wait_for_selector("#screen-otp:not(.hidden)", timeout=7_000)
         otp_subline = await page.locator("#otp-sub").inner_text()
         await page.locator("#otp-row input").first.fill("123456")
@@ -322,13 +361,13 @@ async def run(base: str, secret: str, output_dir: Path) -> dict[str, Any]:
         await page.wait_for_selector("#screen-human:not(.hidden)", timeout=7_000)
         human_context = await page.locator("#human-context").inner_text()
         human_option = await page.locator("#human-options button").first.inner_text()
-        await page.screenshot(path=output_dir / "customer_03_human_request.png")
+        await page.screenshot(path=output_dir / "customer_04_human_request.png")
         layout += await _layout_issues(page, "customer_human_desktop")
 
         await page.locator("#human-options button").first.click()
         await page.wait_for_selector("#screen-done:not(.hidden)", timeout=7_000)
         done_text = await page.locator("#app-number").inner_text()
-        await page.screenshot(path=output_dir / "customer_04_done.png")
+        await page.screenshot(path=output_dir / "customer_05_done.png")
         layout += await _layout_issues(page, "customer_done_desktop")
 
         # Customer lookup against real local API.
@@ -338,14 +377,14 @@ async def run(base: str, secret: str, output_dir: Path) -> dict[str, Any]:
         await page.get_by_text("Look up", exact=True).click()
         await page.wait_for_selector("#track-result .banner", timeout=7_000)
         track_text = await page.locator("#track-result").inner_text()
-        await page.screenshot(path=output_dir / "customer_05_track_lookup.png")
+        await page.screenshot(path=output_dir / "customer_06_track_lookup.png")
         layout += await _layout_issues(page, "customer_track_desktop")
 
         # Mobile layout quick pass.
         await page.set_viewport_size({"width": 390, "height": 844})
         await page.goto(f"{base}/?smoke={cache_bust + 2}", wait_until="domcontentloaded")
         await page.click("#step1-next")
-        await page.screenshot(path=output_dir / "customer_06_mobile_details.png", full_page=True)
+        await page.screenshot(path=output_dir / "customer_07_mobile_details.png", full_page=True)
         layout += await _layout_issues(page, "customer_details_mobile")
 
         # Admin/operator dashboard against real local API.
@@ -402,6 +441,8 @@ async def run(base: str, secret: str, output_dir: Path) -> dict[str, Any]:
         "human_context": human_context,
         "human_option": human_option,
         "done_text": done_text,
+        "activity_text": activity_text,
+        "phase_text": phase_text,
         "track_excerpt": track_text[:300],
         "admin_summary": summary,
         "admin_application_rows": app_rows,

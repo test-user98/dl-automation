@@ -209,6 +209,8 @@ async def stream_job_status(
     async def event_generator():
         last_step_count = 0
         last_status = None
+        last_updated_at = ""
+        last_log_count = 0
 
         while True:
             job = await _state_manager.load(job_id)
@@ -218,10 +220,19 @@ async def stream_job_status(
 
             current_step_count = len(job.steps_completed)
             current_status     = job.status.value
+            current_updated_at = job.updated_at
+            current_log_count  = len(job.step_logs)
 
-            if current_step_count != last_step_count or current_status != last_status:
+            if (
+                current_step_count != last_step_count
+                or current_status != last_status
+                or current_updated_at != last_updated_at
+                or current_log_count != last_log_count
+            ):
                 last_step_count = current_step_count
                 last_status     = current_status
+                last_updated_at = current_updated_at
+                last_log_count  = current_log_count
 
                 payload = {
                     "status":             current_status,
@@ -230,6 +241,8 @@ async def stream_job_status(
                     "otp_pending_type":   job.otp_pending_type,
                     "last_step":          job.steps_completed[-1] if job.steps_completed else "",
                     "error":              job.error_message,
+                    "step_logs":          job.step_logs[-5:],
+                    "updated_at":         job.updated_at,
                     "customer_view":      customer_job_view(job),
                 }
                 yield f"data: {json.dumps(payload)}\n\n"
