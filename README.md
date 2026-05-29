@@ -1,69 +1,85 @@
-# Sarathi RTO Automation (DL Flow)
+# Sarathi RTO Automation Agent
 
-AI-assisted automation for Sarathi DL workflows with customer-in-the-loop inputs (OTP, captcha, choices) and real-time status updates.
+Live app: [https://thxz3gzmhf.ap-south-1.awsapprunner.com/](https://thxz3gzmhf.ap-south-1.awsapprunner.com/)
 
-## 1) Architecture (short)
+## Problem
+Sarathi is slow, form-heavy, and error-prone for end users.  
+Goal: customer should **not** fill government forms directly. They should upload details once, then the agent completes the workflow with minimal human effort.
 
-```text
-Customer UI (frontend/index.html)
-  <-> FastAPI API (api/server.py)
-      -> Orchestrator (orchestrator.py)
-          -> Agent brain (agent/brain.py)
-              -> Playwright browser (browser/controller.py)
-                  -> Sarathi portal
+## Solution
+This project provides a production-style automation stack:
+- Customer portal for onboarding + live progress + OTP/captcha/customer inputs.
+- Agentic backend that operates Sarathi in Playwright.
+- RTO operator portal (admin) for monitoring, status updates, notes, and application tracking.
+- Customer lookup by phone/customer ID/application number with timeline status.
+
+## Architecture + Flow
+```mermaid
+flowchart LR
+  C["Customer Portal"] --> API["FastAPI API Layer"]
+  API --> O["Orchestrator"]
+  O --> B["Agent Brain + State Machine"]
+  B --> P["Playwright Controller"]
+  P --> S["Sarathi Portal"]
+  B --> M["Memory + Rulebook Overlay"]
+  A["RTO Operator Portal"] --> API
+  API --> C
 ```
 
-- **UI -> API**: customer submits details, OTP, captcha, or other answers.
-- **API -> Agent**: starts/resumes the job.
-- **Agent -> UI**: emits action-needed state (`otp`, `captcha`, `service_selection`, etc.) via `/jobs/{id}` + SSE.
+End-to-end loop:
+1. Customer submits details.
+2. Agent starts Sarathi flow.
+3. If Sarathi needs OTP/captcha/choice, backend emits actionable state.
+4. Customer responds in UI.
+5. Backend resumes agent immediately.
+6. Agent continues until submitted / retried / escalated.
+7. Status is visible to both customer and operator.
 
-## 2) Core flow
+## Why this is strong (unique points)
+- **Self-healing loop**: observe -> reason -> act -> verify -> diagnose -> retry.
+- **No blind loops**: max attempts, retry budgets, and escalation points are enforced.
+- **Dynamic fallback strategy**: selector click fallback chain, modal handling, captcha retries, OTP resend path.
+- **Human-in-loop by design**: only when needed; clear action requests.
+- **Real-time state sync**: customer UI is driven by backend state/action flags, not assumptions.
+- **Memory + rules**:
+  - LearningStore captures what worked.
+  - Rulebook overlay (`data/discovered_rules.json`) enables deterministic next runs with lower latency.
+- **Portal specific today, extensible tomorrow**:
+  orchestration/state/human-loop are reusable; portal rules and flows are configurable.
 
-1. Customer submits details from UI.
-2. API creates job and starts orchestrator.
-3. Agent runs Sarathi steps.
-4. If customer input is needed:
-   - API marks actionable state (`WAITING_OTP` or `STUCK_HUMAN_NEEDED`).
-   - UI switches to the correct input screen.
-5. Customer submits input:
-   - `POST /jobs/{id}/otp` for OTP
-   - `POST /jobs/{id}/human-response` for captcha/service/confirmation/text
-6. API immediately transitions job back to `AGENT_RUNNING` so UI returns to live progress.
-7. Agent continues on Sarathi; on success returns acknowledgement number.
+## Agent Internals (short)
+- Brain: `agent/brain.py`
+- Memory: `agent/learning_store.py`
+- Rulebook: `config/portal_rules.py` (+ discovered overlay)
+- State machine: `agent/state_manager.py`
+- Human loop: `agent/human_loop.py`
+- Orchestration: `orchestrator.py`
+- Browser control: `browser/controller.py`
 
-## 3) State-sync rules (important)
+## Customer <-> Agent <-> Sarathi bidirectional behavior
+- Customer gives input -> agent fills Sarathi.
+- Sarathi asks for input -> agent asks customer in UI with context.
+- Customer replies -> agent resumes and continues.
+- Errors are mapped to customer-safe language (`api/status_messages.py`).
 
-- UI should render OTP only when:
-  - `status == WAITING_OTP`, or
-  - `customer_view.action_required == true` and `action_type == "otp"`.
-- UI should render captcha/human screens only when `action_required == true`.
-- If no action is pending, UI must show live progress (`screen-4`).
-- After input submission, backend transitions to `AGENT_RUNNING` immediately.
+## Two portals
+- **Customer portal**: start application, OTP/captcha inputs, live tracking.
+- **RTO operator portal** (`/admin`): search customers/apps, update status, add notes, view documents/events.
 
-## 4) Run locally
+## CI/CD (short)
+- GitHub Actions workflow: `.github/workflows/deploy.yml`
+- Build container -> push to ECR -> deploy/update AWS App Runner.
+- Health endpoint can be used for deployment verification.
 
-Backend:
+## Next upgrades (roadmap)
+- Persist structured run logs/screenshots to **S3** for traceability + debugging.
+- Add **face match + liveness/confidence scoring** (DL photo vs live capture) with configurable thresholds and rejection policy.
+- Optimize latency/cost by promoting stable learned actions to deterministic rules sooner.
+- Expand service packs beyond DL renewal via configurable flow/rule modules.
 
+## Local run
 ```powershell
 cd C:\Users\yashs\OneDrive\Desktop\token26
 uvicorn api.server:app --host 127.0.0.1 --port 8001 --reload
 ```
-
-Customer UI:
-
-- Open [http://127.0.0.1:8001](http://127.0.0.1:8001)
-
-## 5) Key files
-
-- `api/server.py` - API endpoints + state transitions
-- `api/status_messages.py` - customer-safe status mapping
-- `frontend/index.html` - customer screens + live state rendering
-- `agent/brain.py` - Sarathi automation logic
-- `browser/controller.py` - Playwright interaction layer
-- `agent/human_loop.py` - customer-input pause/resume bridge
-
-## 6) Current scope
-
-Primary focus is reliable two-way sync:
-`customer input -> agent resumes -> Sarathi progresses -> UI updates correctly`.
-
+Open: [http://127.0.0.1:8001](http://127.0.0.1:8001)
