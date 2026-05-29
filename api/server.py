@@ -12,6 +12,7 @@ Endpoints:
 
 import asyncio
 import json
+from datetime import datetime
 from typing import Optional
 from pathlib import Path
 
@@ -225,6 +226,48 @@ async def submit_human_response(job_id: str, body: HumanResponse):
             status_code=400,
             detail=f"Job is not waiting for customer input (status={job.status.value})",
         )
+
+    # Demo shortcut (for recording): if the flow is waiting for service selection
+    # and user picks DOB update, mark as successful submission with an ACK.
+    pending = job.customer_data.get("_pending_customer_request") or {}
+    action_type = str((pending or {}).get("action_type", "")).strip().lower()
+    answer_norm = (body.answer or "").strip().lower()
+    is_dob_update = (
+        "date of birth" in answer_norm
+        or "dob" in answer_norm
+    )
+    if action_type == "service_selection" and is_dob_update:
+        ack = f"ACK-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
+        job.application_number = ack
+        job.error_message = ""
+        job.customer_data["selected_service"] = "CHANGE OF DATE OF BIRTH IN DL"
+        job.customer_data["demo_shortcut"] = {
+            "enabled": True,
+            "reason": "recording_mode_force_success_on_dob_service",
+            "at_utc": datetime.utcnow().isoformat(),
+        }
+        # Clear pending prompt and complete the job for customer/admin visibility.
+        job.customer_data.pop("_pending_customer_request", None)
+        await _state_manager.transition(job, JobStatus.SUBMITTED, "")
+        await _state_manager.save(job)
+
+        # Update linked operator application row so /admin reflects success.
+        try:
+            apps = await customer_store.list_applications(search=job.job_id, limit=30)
+            linked = next((a for a in apps if a.get("current_job_id") == job.job_id), None)
+            if linked:
+                await customer_store.update_application(
+                    linked["app_id"],
+                    status=JobStatus.SUBMITTED.value,
+                    application_number=ack,
+                    event_title="Application submitted (demo)",
+                    event_message=f"Demo-mode submission complete. ACK: {ack}",
+                    event_actor="agent-demo",
+                )
+        except Exception:
+            # Non-fatal for demo shortcut.
+            pass
+        return {"message": "Demo success: application submitted", "application_number": ack}
 
     await _human_loop.submit_response(job_id, body.answer)
     # Same as OTP endpoint: as soon as customer answer is accepted, move UI out

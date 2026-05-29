@@ -840,10 +840,11 @@ const STATE_NAMES = {
   UK:"Uttarakhand", WB:"West Bengal",
 };
 
-let manualStateCode = "";    // set only after customer confirms/picks filing state
+const DEFAULT_FILING_STATE = "RJ";
+let manualStateCode = DEFAULT_FILING_STATE;    // default customer filing state
 
 function effectiveStateCode() {
-  return manualStateCode || (dlNormalised || '').slice(0, 2);
+  return manualStateCode || DEFAULT_FILING_STATE;
 }
 
 function effectiveStateName() {
@@ -854,7 +855,9 @@ function effectiveStateName() {
 function renderReview() {
   const stateCode = effectiveStateCode();
   const stateName = effectiveStateName();
-  const stateSource = manualStateCode ? 'you picked this' : (stateCode ? 'suggested from your DL - please confirm' : 'please pick this');
+  const stateSource = manualStateCode
+    ? 'selected for filing'
+    : 'defaulted to Rajasthan';
   const rows = {
     'DL number':  formatDL(dlNormalised) || document.getElementById('dl_raw').value || '—',
     'DOB':        document.getElementById('dob').value || '—',
