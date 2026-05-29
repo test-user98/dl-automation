@@ -96,6 +96,7 @@ def customer_job_view(job: Job) -> dict:
     severity = "info"
     retryable = True
     portal_down = _is_portal_down(lower)
+    service_rejected = _is_service_rejection(lower)
 
     # Portal-down beats most other states — show the calm retry message.
     if portal_down and job.status not in {
@@ -111,15 +112,35 @@ def customer_job_view(job: Job) -> dict:
         )
         severity = "warning"
 
+    elif service_rejected:
+        phase = PHASE_FAILED
+        title, message, retryable = _service_rejection_message(lower)
+        action_required = False
+        action_type = ""
+        severity = "error"
+
     elif job.status == JobStatus.WAITING_OTP:
         phase = PHASE_WAITING
         action_required = True
         action_type = "otp"
-        title = "Enter the OTP"
-        message = (
-            f"The government portal just sent an OTP to {mobile_suffix}. "
-            "Enter it here so we can submit your application."
-        )
+        if "expired" in lower or "fresh otp" in lower or "resend" in lower:
+            title = "Enter the fresh OTP"
+            message = (
+                f"The previous OTP expired. We requested a fresh OTP on {mobile_suffix}. "
+                "Enter the new code here so we can continue."
+            )
+        elif "invalid otp" in lower or "wrong otp" in lower or "incorrect otp" in lower:
+            title = "Check the OTP"
+            message = (
+                "The government portal did not accept the previous OTP. "
+                f"Please enter the latest OTP sent to {mobile_suffix}."
+            )
+        else:
+            title = "Enter the OTP"
+            message = (
+                f"The government portal just sent an OTP to {mobile_suffix}. "
+                "Enter it here so we can submit your application."
+            )
         severity = "action"
 
     elif job.status == JobStatus.STUCK_HUMAN_NEEDED:
@@ -127,11 +148,24 @@ def customer_job_view(job: Job) -> dict:
         action_required = True
         action_type = "otp" if "otp" in lower else "human_response"
         if action_type == "otp":
-            title = "Enter the OTP"
-            message = (
-                f"The government portal just sent an OTP to {mobile_suffix}. "
-                "Enter it here so we can submit your application."
-            )
+            if "expired" in lower or "fresh otp" in lower or "resend" in lower:
+                title = "Enter the fresh OTP"
+                message = (
+                    f"The previous OTP expired. We requested a fresh OTP on {mobile_suffix}. "
+                    "Enter the new code here so we can continue."
+                )
+            elif "invalid otp" in lower or "wrong otp" in lower or "incorrect otp" in lower:
+                title = "Check the OTP"
+                message = (
+                    "The government portal did not accept the previous OTP. "
+                    f"Please enter the latest OTP sent to {mobile_suffix}."
+                )
+            else:
+                title = "Enter the OTP"
+                message = (
+                    f"The government portal just sent an OTP to {mobile_suffix}. "
+                    "Enter it here so we can submit your application."
+                )
         else:
             title = "We need one detail"
             message = _human_message(lower) or "Please confirm one detail so we can continue."
@@ -210,6 +244,28 @@ def _is_portal_down(lower: str) -> bool:
     return any(p in lower for p in _PORTAL_DOWN_PATTERNS)
 
 
+def _is_service_rejection(lower: str) -> bool:
+    return (
+        "requested service" in lower
+        and (
+            "unable to process your data" in lower
+            or "not legible for requested rto" in lower
+            or "not eligible for requested rto" in lower
+            or "kindly visit the rto/rla authority" in lower
+        )
+    )
+
+
+def _service_rejection_message(lower: str) -> tuple[str, str, bool]:
+    return (
+        "This service is not available at your RTO",
+        "Sarathi says the selected DL service is not available for the RTO linked "
+        "to this licence. Choose another available service or visit the RTO/RLA "
+        "authority for this request.",
+        False,
+    )
+
+
 def _human_message(lower: str) -> str:
     if "otp" in lower:
         return "Enter the OTP sent to your registered mobile number."
@@ -223,6 +279,8 @@ def _human_message(lower: str) -> str:
 
 
 def _failure_message(lower: str) -> tuple[str, str, bool]:
+    if _is_service_rejection(lower):
+        return _service_rejection_message(lower)
     if _is_portal_down(lower):
         return (
             "Government portal is unavailable",

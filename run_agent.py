@@ -62,6 +62,7 @@ async def main():
             "state_name":    "Rajasthan",
             "pin_code":      "334401",     # present address pin code (test value)
             "pincode":       "334401",     # alias used by some form fields
+            "selected_service": "CHANGE OF DATE OF BIRTH IN DL",
         },
         documents     = {},
     )

@@ -105,8 +105,10 @@ PAYMENT_RULES = {
 
 JS_FILL_REQUIRED_SELECTORS = {
     "#otpNumber",       # OTP input — Sarathi disables until EnableDisableOtp() runs
+    "#otpNumberSarathi",
     "#entCaptha",       # CAPTCHA input — CSS-hidden (display:none), not type=hidden
     "#entcaptxt",       # Alternate CAPTCHA field — also CSS-hidden in some flows
+    "#entcaptxt1",
 }
 
 # ── Generate OTP rules ────────────────────────────────────────────────────────
@@ -118,6 +120,8 @@ GENERATE_OTP_RULES = {
     "api_endpoint": "/sarathiservice/getOtpFromSarathi.do",
     "button_selector": "#generateSarathiotp",
     "button_onclick_fn": "gensarathiOTP",       # Sarathi JS function on the button
+    "captcha_image_selector": "#capimg",
+    "captcha_input_selector": "#entcaptxt",
     "resend_button_selector": "#generateResendSarathiotp",
     "resend_button_onclick_fn": "genResendsarathiOTP",
     # After click, Sarathi's AJAX reveals the OTP entry section automatically.
@@ -139,9 +143,12 @@ GENERATE_OTP_RULES = {
 # bypasses the disabled state entirely. Fill OTP with per-character keydown +
 # input + keyup events (with proper keyCode) so the listener sees real typing.
 VERIFY_OTP_RULES = {
-    "otp_input_selector":      "#otpNumber",
-    "captcha_image_selector":  "#capimg",
-    "captcha_input_selector":  "#entcaptxt",
+    "otp_input_selector":      "#otpNumberSarathi",
+    "otp_input_selectors":     ["#otpNumberSarathi", "#otpNumber"],
+    "captcha_image_selector":  "#capimg1",
+    "captcha_image_selectors": ["#capimg1", "#capimg"],
+    "captcha_input_selector":  "#entcaptxt1",
+    "captcha_input_selectors": ["#entcaptxt1", "#entcaptxt"],
     "submit_button_selector":  "#verifySarathi",
     "submit_onclick_fn":       "verifiedBySarathi",
     # The auth-method Submit at the top — NEVER click this for OTP verification.
@@ -157,11 +164,31 @@ VERIFY_OTP_RULES = {
     # Sarathi shows OTP error via JS alert (auto-dismissed by our handler)
     "rejection_dialog_patterns": [
         "invalid otp", "otp expired", "wrong otp", "incorrect otp",
-        "otp mismatch", "please enter valid otp",
+        "otp mismatch", "please enter valid otp", "enter valid otp",
+        "otp verification failed", "otp time", "otp timeout",
+        "otp timed out", "otp has expired", "otp is expired",
+    ],
+    "otp_expired_patterns": [
+        "otp expired", "otp has expired", "otp is expired", "otp time",
+        "otp timeout", "otp timed out", "time expired", "session expired",
+        "otp validity", "validity expired", "resend otp",
+    ],
+    "otp_invalid_patterns": [
+        "invalid otp", "wrong otp", "incorrect otp", "otp mismatch",
+        "please enter valid otp", "enter valid otp", "otp verification failed",
     ],
     "captcha_rejection_patterns": [
         "invalid captcha", "captcha mismatch", "wrong captcha", "captcha not match",
+        "captcha failed", "captcha verification failed", "captcha invalid",
+        "please enter valid captcha", "enter valid captcha", "security code",
     ],
+    # Recovery policy: do not ask for OTP again for CAPTCHA failures. Refresh
+    # CAPTCHA and retry with the same OTP; if the OTP itself expired, click
+    # Resend OTP and ask for the fresh code.
+    "max_same_otp_submit_attempts": 3,
+    "on_captcha_reject": "keep_otp_refresh_captcha",
+    "on_otp_expired": "resend_then_ask_new_otp",
+    "on_otp_invalid": "ask_new_otp_without_resend",
 }
 
 # ── DL fetch page (envaction.do — DL number + DOB + captcha) ─────────────────
@@ -205,6 +232,52 @@ DL_SERVICES_LANDING_RULES = {
     "url_fragment": "dlServicesDet.do",
     "continue_button_texts": ["Continue", "Proceed", "Next"],
     "navigates_to": "envaction.do",
+}
+
+SERVICE_SELECTION_RULES = {
+    "manual_answer_file": "data/manual_service.txt",
+    "default_test_service": "CHANGE OF DATE OF BIRTH IN DL",
+    "proceed_selector": "#trsaction_enve_proceed",
+    "service_input_name": "dlc",
+    "aliases": {
+        "dob update": "CHANGE OF DATE OF BIRTH IN DL",
+        "date of birth update": "CHANGE OF DATE OF BIRTH IN DL",
+        "change dob": "CHANGE OF DATE OF BIRTH IN DL",
+        "change of dob": "CHANGE OF DATE OF BIRTH IN DL",
+        "change of date of birth": "CHANGE OF DATE OF BIRTH IN DL",
+        "change of date of birth in dl": "CHANGE OF DATE OF BIRTH IN DL",
+        "address change": "CHANGE OF ADDRESS IN DL",
+        "change of address": "CHANGE OF ADDRESS IN DL",
+        "name change": "CHANGE OF NAME IN DL",
+        "change of name": "CHANGE OF NAME IN DL",
+    },
+}
+
+SERVICE_REJECTION_RULES = {
+    "rto_service_ineligible_patterns": [
+        "unable to process your data",
+        "holder requested service",
+        "requested service:",
+        "is not legible for requested rto",
+        "kindly visit the rto/rla authority",
+    ],
+    "customer_title": "This service is not available at your RTO",
+    "customer_message": (
+        "Sarathi says the selected DL service is not available for the RTO linked "
+        "to this licence. Choose another available service or visit the RTO/RLA "
+        "authority for this request."
+    ),
+}
+
+CHANGE_DOB_RULES = {
+    "service_value": "CHANGE OF DATE OF BIRTH IN DL",
+    "reason_selector": "#codreasoncd",
+    "manual_reason_selector": "#codreasondesc",
+    "corrected_dob_selector": "#coddob",
+    "confirm_selector": "#codconfirm",
+    "reason_answer_key": "dob_change_reason",
+    "corrected_dob_answer_key": "corrected_dob",
+    "manual_reason_answer_key": "dob_change_manual_reason",
 }
 
 # ── Portal navigation rules ───────────────────────────────────────────────────
@@ -258,6 +331,9 @@ _OVERLAY_TARGETS = {
     "DL_FETCH_RULES":           DL_FETCH_RULES,
     "DL_CONFIRM_RULES":         DL_CONFIRM_RULES,
     "DL_SERVICES_LANDING_RULES":DL_SERVICES_LANDING_RULES,
+    "SERVICE_SELECTION_RULES":  SERVICE_SELECTION_RULES,
+    "SERVICE_REJECTION_RULES":  SERVICE_REJECTION_RULES,
+    "CHANGE_DOB_RULES":         CHANGE_DOB_RULES,
     "NAVIGATION_RULES":         NAVIGATION_RULES,
     "PAYMENT_RULES":            PAYMENT_RULES,
 }

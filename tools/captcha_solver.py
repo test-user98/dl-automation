@@ -15,6 +15,8 @@ import asyncio
 import base64
 import httpx
 import structlog
+from collections import Counter
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -45,6 +47,18 @@ def _is_valid_captcha(text: str) -> bool:
     if any(w in lower for w in _REFUSAL_WORDS):
         return False
     return True
+
+
+@dataclass
+class CaptchaResult:
+    text: str = ""
+    confidence: float = 0.0
+    provider: str = ""
+    attempts: list[dict] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return bool(self.text)
 
 
 class CaptchaSolver:
@@ -111,6 +125,154 @@ class CaptchaSolver:
 
         log.error("captcha.all_providers_failed")
         return None
+
+    async def solve_with_confidence(
+        self,
+        image_bytes: bytes,
+        *,
+        force_manual: bool = False,
+        allow_manual: bool = True,
+        prompt_context: str = "",
+    ) -> CaptchaResult:
+        """
+        Return a CAPTCHA solution with a confidence estimate.
+
+        LLM OCR needs agreement from repeated reads before it is considered
+        high confidence. Low-confidence guesses are returned to the caller so
+        the page can refresh the CAPTCHA instead of submitting weak guesses.
+        """
+        provider = settings.captcha_provider
+
+        if force_manual or provider == "manual":
+            text = await self._solve_manual(image_bytes, prompt_context)
+            text = _normalize_captcha(text or "")
+            if _is_valid_captcha(text):
+                return CaptchaResult(text=text, confidence=1.0, provider="manual")
+            return CaptchaResult(provider="manual")
+
+        if provider in ("2captcha", "capsolver"):
+            for attempt in range(settings.captcha_max_retries):
+                result = await self._solve_once(image_bytes, provider)
+                if result and _is_valid_captcha(result):
+                    result = _normalize_captcha(result)
+                    log.info("captcha.solved", provider=provider, attempt=attempt + 1)
+                    return CaptchaResult(
+                        text=result,
+                        confidence=0.95,
+                        provider=provider,
+                        attempts=[{"provider": provider, "attempt": attempt + 1, "text": result}],
+                    )
+                log.warning("captcha.attempt_failed", provider=provider, attempt=attempt + 1)
+                await asyncio.sleep(2)
+            if allow_manual:
+                return await self.solve_with_confidence(
+                    image_bytes,
+                    force_manual=True,
+                    prompt_context=prompt_context,
+                )
+            return CaptchaResult(provider=provider)
+
+        llm_chain = self._build_llm_chain(provider)
+        attempts: list[dict] = []
+
+        for llm_provider in llm_chain:
+            for attempt in range(2):
+                result = await self._solve_llm(image_bytes, llm_provider)
+                if result and _is_valid_captcha(result):
+                    result = _normalize_captcha(result)
+                    attempts.append({
+                        "provider": llm_provider,
+                        "attempt": attempt + 1,
+                        "text": result,
+                    })
+                    best = self._best_llm_result(attempts)
+                    log.info(
+                        "captcha.llm_candidate",
+                        provider=llm_provider,
+                        attempt=attempt + 1,
+                        text=result,
+                        best=best.text,
+                        confidence=best.confidence,
+                    )
+                    if best.confidence >= settings.captcha_confidence_threshold:
+                        log.info(
+                            "captcha.solved",
+                            provider=best.provider,
+                            confidence=best.confidence,
+                            attempts=len(attempts),
+                        )
+                        return best
+                else:
+                    log.warning(
+                        "captcha.llm_attempt_failed",
+                        provider=llm_provider,
+                        attempt=attempt + 1,
+                        preview=(result or "")[:40],
+                    )
+                await asyncio.sleep(0.5)
+
+        best = self._best_llm_result(attempts)
+        if best.ok:
+            log.warning(
+                "captcha.low_confidence",
+                text=best.text,
+                confidence=best.confidence,
+                threshold=settings.captcha_confidence_threshold,
+                attempts=attempts,
+            )
+
+        if settings.captcha_api_key:
+            fallback_paid = "2captcha"
+            log.warning("captcha.falling_back_to_paid", provider=fallback_paid)
+            result = await self._solve_once(image_bytes, fallback_paid)
+            if result and _is_valid_captcha(result):
+                result = _normalize_captcha(result)
+                log.info("captcha.solved_via_paid_fallback", provider=fallback_paid)
+                return CaptchaResult(
+                    text=result,
+                    confidence=0.95,
+                    provider=fallback_paid,
+                    attempts=attempts + [{"provider": fallback_paid, "attempt": 1, "text": result}],
+                )
+
+        if allow_manual:
+            manual = await self.solve_with_confidence(
+                image_bytes,
+                force_manual=True,
+                prompt_context=prompt_context,
+            )
+            manual.attempts = attempts + manual.attempts
+            return manual
+
+        log.error("captcha.all_providers_failed")
+        return best if best.ok else CaptchaResult(provider="none", attempts=attempts)
+
+    def _best_llm_result(self, attempts: list[dict]) -> CaptchaResult:
+        valid = [
+            {**a, "text": _normalize_captcha(a.get("text", ""))}
+            for a in attempts
+            if _is_valid_captcha(a.get("text", ""))
+        ]
+        if not valid:
+            return CaptchaResult(provider="llm", attempts=attempts)
+
+        counts = Counter(a["text"] for a in valid)
+        best_text, best_count = counts.most_common(1)[0]
+        providers = sorted({a.get("provider", "llm") for a in valid if a["text"] == best_text})
+
+        if best_count >= 3:
+            confidence = 0.97
+        elif best_count >= 2 or len(providers) >= 2:
+            confidence = 0.90
+        else:
+            confidence = 0.65
+
+        return CaptchaResult(
+            text=best_text,
+            confidence=confidence,
+            provider="+".join(providers) if providers else "llm",
+            attempts=attempts,
+        )
 
     def _build_llm_chain(self, configured: str) -> list[str]:
         """

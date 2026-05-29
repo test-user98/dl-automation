@@ -17,7 +17,10 @@ before ever asking a human.
 import json
 import asyncio
 import base64
+import re
 import structlog
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 from config.settings import get_settings
@@ -27,6 +30,9 @@ from config.portal_rules import (
     DL_FETCH_RULES,
     DL_CONFIRM_RULES,
     DL_SERVICES_LANDING_RULES,
+    SERVICE_SELECTION_RULES,
+    CHANGE_DOB_RULES,
+    SERVICE_REJECTION_RULES,
     record_discovery,
 )
 from agent.llm_client import get_llm_client
@@ -95,6 +101,8 @@ class AgentBrain:
         self._generate_otp_attempts: int = 0   # deterministic retries before LLM fallback
         self._cached_otp: str = ""             # OTP cached so retries don't re-ask user
         self._otp_submit_attempts: int = 0     # retries with same OTP (max 3 before re-ask)
+        self._otp_prompt_reason: str = ""      # customer-safe reason for next OTP prompt
+        self._force_otp_handler: bool = False  # stay deterministic after resend/expiry
 
     # ── Main loop ──────────────────────────────────────────────────────────────
 
@@ -169,6 +177,17 @@ class AgentBrain:
             if otp_result == "waiting":
                 break
 
+            auth_selected = await self._maybe_handle_auth_method_page(
+                job=job,
+                current_step=current_step,
+                page_text=page_text,
+                dom_elements=dom_elements,
+            )
+            if auth_selected:
+                step_failures.pop(current_step, None)
+                failure_context = ""
+                continue
+
             generated_otp = await self._maybe_handle_generate_otp_page(
                 job=job,
                 current_step=current_step,
@@ -189,6 +208,8 @@ class AgentBrain:
                 screenshot=screenshot,
             )
             if svc_selected:
+                if job.status in {JobStatus.FAILED, JobStatus.CANCELLED, JobStatus.SUBMITTED, JobStatus.COMPLETED}:
+                    break
                 step_failures.pop(current_step, None)
                 failure_context = ""
                 continue
@@ -823,7 +844,7 @@ class AgentBrain:
           - "waiting": paused for human input / timeout
           - "": not an OTP page
         """
-        if not self._has_otp_input(dom_elements, page_text):
+        if not self._force_otp_handler and not self._has_otp_input(dom_elements, page_text):
             return ""
 
         # ── Guard: OTP already verified this job run ───────────────────────────
@@ -845,12 +866,14 @@ class AgentBrain:
         if not self._cached_otp:
             mobile = job.customer_data.get("mobile_number", "")
             masked  = f"******{mobile[-4:]}" if len(mobile) >= 4 else "your registered number"
+            reason = (self._otp_prompt_reason or "").strip()
+            reason_prefix = f"{reason} " if reason else ""
             question = (
-                f"OTP has been sent to {masked}. "
+                f"{reason_prefix}OTP has been sent to {masked}. "
                 f"Please enter it below, or choose 'Resend OTP' if you did not receive it."
             )
             context = (
-                f"The Sarathi portal sent a 6-digit OTP to your DL-registered mobile {masked}. "
+                f"{reason_prefix}The Sarathi portal sent a 6-digit OTP to your DL-registered mobile {masked}. "
                 f"Check your SMS and type the OTP. If you didn't receive it, select 'Resend OTP'."
             )
             resp = await self._hl.ask(
@@ -870,15 +893,8 @@ class AgentBrain:
             # Customer wants to resend OTP
             if resp.answer.strip().lower() in ("resend otp", "resend", "1"):
                 log.info("brain.otp_resend_requested")
-                self._otp_sent = False          # force generate-OTP handler to run again
-                self._otp_reveal_attempts = 0
-                # Try clicking Sarathi's Resend link directly
-                for resend_text in ["Resend OTP", "Resend", "Resend otp"]:
-                    if await self._browser.click_text(resend_text, exact=False):
-                        log.info("brain.otp_resend_clicked", via=resend_text)
-                        await asyncio.sleep(2.0)
-                        break
-                return "submitted"              # loop back → generate-OTP handler runs
+                await self._resend_current_otp("user_requested_resend")
+                return "submitted"              # loop back and ask for the fresh OTP
 
             digits = "".join(ch for ch in resp.answer if ch.isdigit())
             if not digits:
@@ -887,6 +903,7 @@ class AgentBrain:
 
             self._cached_otp = digits
             self._otp_submit_attempts = 0
+            self._otp_prompt_reason = ""
 
         otp = self._cached_otp
         self._otp_submit_attempts += 1
@@ -895,12 +912,18 @@ class AgentBrain:
         # Keep the same OTP across CAPTCHA retries. "Page unchanged" usually means
         # CAPTCHA failed, not that the user's OTP was wrong. Clear the OTP only
         # when Sarathi explicitly says invalid/expired OTP after submit.
-        if self._otp_submit_attempts > 3:
+        max_same_otp_attempts = VERIFY_OTP_RULES.get(
+            "max_same_otp_submit_attempts",
+            settings.captcha_max_retries,
+        )
+        if self._otp_submit_attempts > max_same_otp_attempts:
             log.warning(
                 "brain.otp_many_attempts_same_otp",
                 attempts=self._otp_submit_attempts,
-                action="keeping_otp_retrying_captcha",
+                action="resending_otp",
             )
+            await self._resend_current_otp("same_otp_submit_attempts_exhausted")
+            return "submitted"
 
         # ── Pull deterministic facts from the runtime rule book ──────────────────
         rulebook_otp_input_sel = VERIFY_OTP_RULES["otp_input_selector"]
@@ -908,9 +931,68 @@ class AgentBrain:
         rulebook_captcha_inp_sel = VERIFY_OTP_RULES["captcha_input_selector"]
         rulebook_submit_sel = VERIFY_OTP_RULES["submit_button_selector"]
         rulebook_submit_fn = VERIFY_OTP_RULES["submit_onclick_fn"]
-        otp_input_sel    = VERIFY_OTP_RULES["otp_input_selector"]
-        captcha_img_sel  = VERIFY_OTP_RULES["captcha_image_selector"]
-        captcha_inp_sel  = VERIFY_OTP_RULES["captcha_input_selector"]
+        otp_input_candidates = VERIFY_OTP_RULES.get("otp_input_selectors", [rulebook_otp_input_sel])
+        captcha_img_candidates = VERIFY_OTP_RULES.get("captcha_image_selectors", [rulebook_captcha_img_sel])
+        captcha_inp_candidates = VERIFY_OTP_RULES.get("captcha_input_selectors", [rulebook_captcha_inp_sel])
+        candidate_probe = await self._browser.evaluate(f"""() => {{
+            const isVisible = (el) => {{
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style.display !== 'none'
+                    && style.visibility !== 'hidden'
+                    && rect.width > 0
+                    && rect.height > 0;
+            }};
+            const probeSelectors = (selectors, kind) => {{
+                const usable = [];
+                for (const sel of selectors) {{
+                    let nodes = [];
+                    try {{ nodes = Array.from(document.querySelectorAll(sel)); }}
+                    catch (_) {{ continue; }}
+                    for (const el of nodes) {{
+                        if (!isVisible(el)) continue;
+                        if (kind === 'input' && (el.disabled || el.readOnly)) continue;
+                        usable.push(sel);
+                        break;
+                    }}
+                }}
+                return usable;
+            }};
+            return {{
+                otp_inputs: probeSelectors({json.dumps(otp_input_candidates)}, 'input'),
+                captcha_imgs: probeSelectors({json.dumps(captcha_img_candidates)}, 'image'),
+                captcha_inputs: probeSelectors({json.dumps(captcha_inp_candidates)}, 'input'),
+            }};
+        }}""")
+
+        def _prefer_probe(probed: list[str] | None, original: list[str]) -> list[str]:
+            ordered: list[str] = []
+            for selector in (probed or []) + original:
+                if selector and selector not in ordered:
+                    ordered.append(selector)
+            return ordered
+
+        otp_visible_candidates = candidate_probe.get("otp_inputs", []) if candidate_probe else []
+        otp_input_candidates = _prefer_probe(otp_visible_candidates, otp_input_candidates)
+        captcha_img_candidates = _prefer_probe(
+            candidate_probe.get("captcha_imgs", []) if candidate_probe else [],
+            captcha_img_candidates,
+        )
+        captcha_inp_candidates = _prefer_probe(
+            candidate_probe.get("captcha_inputs", []) if candidate_probe else [],
+            captcha_inp_candidates,
+        )
+        log.info(
+            "brain.otp_selector_probe",
+            otp_candidates=otp_input_candidates,
+            visible_otp_candidates=otp_visible_candidates,
+            captcha_img_candidates=captcha_img_candidates,
+            captcha_inp_candidates=captcha_inp_candidates,
+        )
+        otp_input_sel    = otp_input_candidates[0]
+        captcha_img_sel  = captcha_img_candidates[0]
+        captcha_inp_sel  = captcha_inp_candidates[0]
         submit_sel       = VERIFY_OTP_RULES["submit_button_selector"]
         forbidden_sel    = VERIFY_OTP_RULES["forbidden_submit_selector"]
         submit_fn_name   = VERIFY_OTP_RULES["submit_onclick_fn"]
@@ -921,10 +1003,15 @@ class AgentBrain:
         submit_btn_id    = submit_sel.lstrip("#")
         forbidden_btn_id = forbidden_sel.lstrip("#")
 
+        # Consume stale alerts before this attempt so only this submit's result
+        # is used for retry classification.
+        await self._browser.get_last_dialog_message()
+
         # ── Refresh OTP captcha before solving (new image each attempt) ──────────
         pre_url = await self._browser.current_url()
         await self._browser.evaluate(f"""() => {{
-            const img = document.getElementById({json.dumps(captcha_img_id)});
+            const selectors = {json.dumps(captcha_img_candidates)};
+            const img = selectors.map(sel => document.querySelector(sel)).find(Boolean);
             if (img && img.src) {{
                 const base = img.src.split('?')[0];
                 img.src = base + '?t=' + Date.now();
@@ -936,18 +1023,22 @@ class AgentBrain:
         # If this fails, the JS block below still acts as the fallback.
         visible_otp_fill = False
         try:
-            await self._browser.scroll_into_view(otp_input_sel)
-            visible_otp_fill = await self._browser.fill(otp_input_sel, otp)
+            for candidate in otp_visible_candidates:
+                await self._browser.scroll_into_view(candidate)
+                visible_otp_fill = await self._browser.fill(candidate, otp)
+                if visible_otp_fill:
+                    otp_input_sel = candidate
+                    break
         except Exception as e:
-            log.warning("brain.otp_visible_fill_failed", selector=otp_input_sel, error=str(e))
+            log.warning("brain.otp_visible_fill_failed", selectors=otp_input_candidates, error=str(e))
         log.info("brain.otp_visible_fill_attempted", selector=otp_input_sel, success=visible_otp_fill)
 
         # ── Fill OTP + find captcha/submit using rule-book selectors ─────────────
         otp_section_info = await self._browser.evaluate(f"""() => {{
             const otp_val   = {json.dumps(otp)};
-            const otpId     = {json.dumps(otp_input_id)};
-            const capImgId  = {json.dumps(captcha_img_id)};
-             const capInpId  = {json.dumps(captcha_inp_id)};
+            const otpSelectors = {json.dumps(otp_input_candidates)};
+            const capImgSelectors = {json.dumps(captcha_img_candidates)};
+             const capInpSelectors = {json.dumps(captcha_inp_candidates)};
              const submitId  = {json.dumps(submit_btn_id)};
              const forbidId  = {json.dumps(forbidden_btn_id)};
              const selectorFor = (el) => {{
@@ -956,10 +1047,48 @@ class AgentBrain:
                  if (el.name) return '[name="' + CSS.escape(el.name) + '"]';
                  return null;
              }};
+             const firstBySelectors = (selectors) => {{
+                 for (const sel of selectors) {{
+                     let nodes = [];
+                     try {{ nodes = Array.from(document.querySelectorAll(sel)); }}
+                     catch (_) {{ continue; }}
+                     for (const el of nodes) if (el) return el;
+                 }}
+                 return null;
+             }};
+             const isVisible = (el) => {{
+                 if (!el) return false;
+                 const style = window.getComputedStyle(el);
+                 const rect = el.getBoundingClientRect();
+                 return style.display !== 'none'
+                     && style.visibility !== 'hidden'
+                     && rect.width > 0
+                     && rect.height > 0;
+             }};
+             const firstUsableInputBySelectors = (selectors) => {{
+                 for (const sel of selectors) {{
+                     let nodes = [];
+                     try {{ nodes = Array.from(document.querySelectorAll(sel)); }}
+                     catch (_) {{ continue; }}
+                     for (const el of nodes) {{
+                         if (el && isVisible(el) && !el.disabled && !el.readOnly) return el;
+                     }}
+                 }}
+                 return null;
+             }};
+             const firstVisibleBySelectors = (selectors) => {{
+                 for (const sel of selectors) {{
+                     let nodes = [];
+                     try {{ nodes = Array.from(document.querySelectorAll(sel)); }}
+                     catch (_) {{ continue; }}
+                     for (const el of nodes) if (el && isVisible(el)) return el;
+                 }}
+                 return null;
+             }};
 
              // Fill OTP input — fire per-character keystrokes so Sarathi's
              // keyup listener (which enables the Submit button) actually runs.
-             const otpEl = document.getElementById(otpId);
+             const otpEl = firstUsableInputBySelectors(otpSelectors) || firstBySelectors(otpSelectors);
             if (!otpEl) return {{ error: 'no_otp_input' }};
             otpEl.disabled = false;
             otpEl.removeAttribute('disabled');
@@ -986,9 +1115,9 @@ class AgentBrain:
             otpEl.dispatchEvent(new Event('blur',   {{bubbles:true}}));
 
             // Captcha image and input — rule-book IDs first, then fallback
-            const captchaImg = document.getElementById(capImgId)
+            const captchaImg = firstVisibleBySelectors(capImgSelectors) || firstBySelectors(capImgSelectors)
                 || document.querySelector('img[src*="captcha" i], img[id*="captha" i]');
-            const captchaInp = document.getElementById(capInpId)
+            const captchaInp = firstUsableInputBySelectors(capInpSelectors) || firstBySelectors(capInpSelectors)
                 || document.querySelector('input[id*="capt" i]:not([type="hidden"])');
 
             // DUMP ALL VISIBLE BUTTONS for debug + finding the right one
@@ -1045,6 +1174,8 @@ class AgentBrain:
                  otp_selector:    selectorFor(otpEl),
                  otp_value:       otpEl.value || '',
                  otp_expected_len: otp_val.length,
+                 otp_visible:     isVisible(otpEl),
+                 otp_disabled:    !!otpEl.disabled,
                  captcha_img_id:  captchaImg ? (captchaImg.id || '') : null,
                  captcha_inp_id:  captchaInp ? (captchaInp.id || captchaInp.name) : null,
                  captcha_img_selector: selectorFor(captchaImg),
@@ -1101,37 +1232,32 @@ class AgentBrain:
         captcha_img_id = otp_section_info.get("captcha_img_id") or ""
         captcha_inp_id = otp_section_info.get("captcha_inp_id") or ""
 
-        # Element screenshots were unreliable here because Sarathi briefly hides
-        # #capimg during refresh. Fetch the exact image bytes from the page
-        # instead; no full-page screenshot fallback because it pollutes CAPTCHA.
-        otp_captcha_bytes = b""
-        if captcha_img_id:
-            data_url = await self._browser.evaluate(f"""async () => {{
-                const img = document.getElementById({json.dumps(captcha_img_id)});
-                if (!img || !img.src) return null;
-                const response = await fetch(img.src, {{
-                    credentials: 'same-origin',
-                    cache: 'no-store',
-                }});
-                if (!response.ok) return null;
-                const blob = await response.blob();
-                return await new Promise((resolve, reject) => {{
-                    const reader = new FileReader();
-                    reader.onloadend = () => resolve(reader.result);
-                    reader.onerror = () => reject(new Error('captcha_file_reader_failed'));
-                    reader.readAsDataURL(blob);
-                }});
-            }}""")
-            if data_url and isinstance(data_url, str) and "," in data_url:
-                try:
-                    otp_captcha_bytes = base64.b64decode(data_url.split(",", 1)[1])
-                    log.info(
-                        "brain.otp_captcha_fetched_from_src",
-                        id=captcha_img_id,
-                        bytes=len(otp_captcha_bytes),
-                    )
-                except Exception as e:
-                    log.warning("brain.otp_captcha_decode_failed", error=str(e))
+        # Screenshot the exact DOM image shown in the browser. Do not fetch
+        # captchaimage.jsp separately; Sarathi may generate a different CAPTCHA
+        # for that extra HTTP request.
+        otp_captcha_selector = (
+            otp_section_info.get("captcha_img_selector")
+            or (f"#{captcha_img_id}" if captcha_img_id else "")
+            or captcha_img_sel
+        )
+        otp_captcha_bytes = await self._fetch_visible_captcha_bytes(
+            image_selector=otp_captcha_selector,
+        )
+        if otp_captcha_bytes:
+            self._save_captcha_attempt(
+                job_id=job.job_id,
+                flow="otp",
+                attempt=self._otp_submit_attempts,
+                stage="fetched",
+                image_bytes=otp_captcha_bytes,
+                solution="",
+                metadata={
+                    "captcha_img_id": captcha_img_id,
+                    "captcha_img_selector": otp_captcha_selector,
+                    "captcha_inp_id": captcha_inp_id,
+                    "otp_cached": bool(self._cached_otp),
+                },
+            )
 
         if not otp_captcha_bytes:
             log.warning("brain.otp_captcha_fetch_failed", id=captcha_img_id)
@@ -1143,10 +1269,11 @@ class AgentBrain:
                 timeout_s = max(15, settings.captcha_timeout_seconds + 15)
                 force_manual_captcha = self._otp_submit_attempts >= settings.captcha_max_retries
                 log.info("brain.otp_captcha_solving_started", timeout_seconds=timeout_s)
-                otp_captcha_sol = await asyncio.wait_for(
-                    self._captcha.solve(
+                captcha_result = await asyncio.wait_for(
+                    self._captcha.solve_with_confidence(
                         otp_captcha_bytes,
                         force_manual=force_manual_captcha,
+                        allow_manual=force_manual_captcha,
                         prompt_context=(
                             "OTP verification CAPTCHA. The OTP is already cached; "
                             "only this CAPTCHA value is needed."
@@ -1155,10 +1282,53 @@ class AgentBrain:
                     timeout=max(timeout_s, settings.captcha_manual_timeout_seconds + 5)
                     if force_manual_captcha else timeout_s,
                 )
+                otp_captcha_sol = captcha_result.text
+                if (
+                    not force_manual_captcha
+                    and captcha_result.confidence < settings.captcha_confidence_threshold
+                ):
+                    log.warning(
+                        "brain.otp_captcha_low_confidence_refreshing",
+                        solution=otp_captcha_sol,
+                        confidence=captcha_result.confidence,
+                        threshold=settings.captcha_confidence_threshold,
+                    )
+                    self._save_captcha_attempt(
+                        job_id=job.job_id,
+                        flow="otp",
+                        attempt=self._otp_submit_attempts,
+                        stage="low_confidence",
+                        image_bytes=otp_captcha_bytes,
+                        solution=otp_captcha_sol,
+                        metadata={
+                            "confidence": captcha_result.confidence,
+                            "provider": captcha_result.provider,
+                            "attempts": captcha_result.attempts,
+                        },
+                    )
+                    await self._refresh_visible_captcha(f"#{captcha_img_id}" if captcha_img_id else "")
+                    return "submitted"
+
                 log.info(
                     "brain.otp_captcha_solved",
                     solution=otp_captcha_sol,
+                    confidence=captcha_result.confidence,
+                    provider=captcha_result.provider,
                     manual=force_manual_captcha,
+                )
+                self._save_captcha_attempt(
+                    job_id=job.job_id,
+                    flow="otp",
+                    attempt=self._otp_submit_attempts,
+                    stage="solved",
+                    image_bytes=otp_captcha_bytes,
+                    solution=otp_captcha_sol,
+                    metadata={
+                        "manual": force_manual_captcha,
+                        "confidence": captcha_result.confidence,
+                        "provider": captcha_result.provider,
+                        "attempts": captcha_result.attempts,
+                    },
                 )
             except asyncio.TimeoutError:
                 log.warning("brain.otp_captcha_solve_timeout")
@@ -1256,6 +1426,80 @@ class AgentBrain:
                 return "submitted"
 
         # ── Click the OTP Submit button (NEVER #submt — that's auth-method Submit) ──
+        readiness = await self._browser.evaluate(f"""() => {{
+            const otp = document.querySelector({json.dumps(otp_section_info.get("otp_selector") or otp_input_sel)});
+            const cap = document.querySelector({json.dumps(otp_section_info.get("captcha_inp_selector") or captcha_inp_sel)});
+            const submit = document.getElementById({json.dumps(otp_section_info.get("submit_btn_id") or submit_btn_id)})
+                || document.querySelector({json.dumps(otp_section_info.get("submit_btn_selector") or submit_sel)});
+            const boxes = Array.from(document.querySelectorAll('input[type="checkbox"]'))
+                .filter(el => {{
+                    const st = window.getComputedStyle(el);
+                    const labelText = (
+                        (el.id || '') + ' ' +
+                        (el.name || '') + ' ' +
+                        (el.value || '') + ' ' +
+                        (el.closest('label') ? el.closest('label').textContent : '') + ' ' +
+                        (el.parentElement ? el.parentElement.textContent : '')
+                    ).toLowerCase();
+                    const visible = !!(el.offsetParent !== null || el.id === 'otpCheckbox');
+                    const otpRelated = labelText.includes('otp') || el.id === 'otpCheckbox';
+                    return !el.disabled
+                        && visible
+                        && otpRelated
+                        && st.display !== 'none'
+                        && st.visibility !== 'hidden';
+                }});
+            for (const el of [otp, cap].filter(Boolean)) {{
+                el.focus();
+                el.dispatchEvent(new Event('input', {{bubbles: true}}));
+                const last = (el.value || '').slice(-1);
+                const code = last ? last.charCodeAt(0) : 0;
+                el.dispatchEvent(new KeyboardEvent('keyup', {{
+                    bubbles: true,
+                    key: last,
+                    keyCode: code,
+                    which: code,
+                }}));
+                el.dispatchEvent(new Event('change', {{bubbles: true}}));
+                el.dispatchEvent(new Event('blur', {{bubbles: true}}));
+            }}
+            for (const fn of ['EnableDisableOtp', 'enableDisableOtp', 'EnableDisableOTP']) {{
+                if (typeof window[fn] === 'function') {{
+                    try {{ window[fn](); }} catch (e) {{}}
+                }}
+            }}
+            if (submit) {{
+                submit.disabled = false;
+                submit.removeAttribute('disabled');
+                submit.removeAttribute('readonly');
+                submit.style.visibility = 'visible';
+            }}
+            return {{
+                otp_value_len: otp ? (otp.value || '').length : 0,
+                otp_value_matches: otp ? otp.value === {json.dumps(otp)} : false,
+                captcha_value_len: cap ? (cap.value || '').length : 0,
+                captcha_value_matches: cap ? cap.value === {json.dumps(otp_captcha_sol)} : false,
+                checkbox_count: boxes.length,
+                checked_count: boxes.filter(x => x.checked).length,
+                unchecked_boxes: boxes.filter(x => !x.checked).map(x => x.id || x.name || '(unnamed)'),
+                submit_id: submit ? (submit.id || '') : '',
+                submit_disabled: submit ? !!submit.disabled : null,
+                submit_visible: submit ? !!(submit.offsetParent !== null || submit.id === {json.dumps(submit_btn_id)}) : false,
+                submit_onclick: submit ? (submit.getAttribute('onclick') || '') : '',
+                verified_fn_exists: typeof window[{json.dumps(submit_fn_name)}] === 'function',
+            }};
+        }}""")
+        log.info("brain.otp_submit_readiness", info=readiness)
+        if not readiness or not readiness.get("otp_value_matches"):
+            log.warning("brain.otp_submit_blocked_bad_otp_readback", info=readiness)
+            return "submitted"
+        if not readiness.get("captcha_value_matches"):
+            log.warning("brain.otp_submit_blocked_bad_captcha_readback", info=readiness)
+            return "submitted"
+        if readiness.get("checkbox_count", 0) and readiness.get("checked_count", 0) < readiness.get("checkbox_count", 0):
+            log.warning("brain.otp_submit_blocked_unchecked_boxes", info=readiness)
+            return "submitted"
+
         submit_btn_id    = otp_section_info.get("submit_btn_id") or ""
         submit_btn_text  = (otp_section_info.get("submit_btn_text") or "").strip()
         submit_btn_score = otp_section_info.get("submit_btn_score", -1)
@@ -1272,12 +1516,14 @@ class AgentBrain:
         # directly — bypasses the disabled state entirely.
         clicked = False
         click_method = "none"
+        submit_strategy = "rulebook_fn"
 
         js_result = await self._browser.evaluate(f"""() => {{
             const target_id    = {json.dumps(submit_btn_id)};
             const primary_fn   = {json.dumps(submit_fn_name)};
             const known_fns    = {json.dumps(known_fns)};
             const forbid_id    = {json.dumps(forbidden_btn_id)};
+            const strategy     = {json.dumps(submit_strategy)};
 
             // Helper: parse function name from onclick attribute
             //   "verifiedBySarathi(); return false;" -> "verifiedBySarathi"
@@ -1286,6 +1532,40 @@ class AgentBrain:
                 const m = str.match(/^\\s*([a-zA-Z_$][\\w$]*)\\s*\\(/);
                 return m ? m[1] : null;
             }};
+
+            const targetButton = target_id ? document.getElementById(target_id) : null;
+            if (targetButton) {{
+                targetButton.disabled = false;
+                targetButton.removeAttribute('disabled');
+                targetButton.removeAttribute('readonly');
+                targetButton.style.display = '';
+                targetButton.style.visibility = 'visible';
+            }}
+
+            if (strategy === 'button_click' && targetButton) {{
+                try {{
+                    targetButton.click();
+                    return 'button_click:' + target_id;
+                }} catch (e) {{
+                    return 'button_click_error:' + target_id + ':' + e.message;
+                }}
+            }}
+
+            if (strategy === 'form_submit' && targetButton) {{
+                const form = targetButton.form || targetButton.closest('form');
+                try {{
+                    if (form && typeof form.requestSubmit === 'function') {{
+                        form.requestSubmit(targetButton);
+                        return 'form_request_submit:' + target_id;
+                    }}
+                    if (form && typeof form.submit === 'function') {{
+                        form.submit();
+                        return 'form_submit:' + target_id;
+                    }}
+                }} catch (e) {{
+                    return 'form_submit_error:' + target_id + ':' + e.message;
+                }}
+            }}
 
             // 1. PRIMARY: call the rule-book function directly
             if (primary_fn && typeof window[primary_fn] === 'function') {{
@@ -1351,10 +1631,11 @@ class AgentBrain:
             click_method = js_result
 
         log.info("brain.otp_submit_attempted", clicked=clicked, method=click_method,
-                 btn_id=submit_btn_id, btn_text=submit_btn_text, type=otp_type)
+                 strategy=submit_strategy, btn_id=submit_btn_id,
+                 btn_text=submit_btn_text, type=otp_type)
 
         # ── Wait and verify OTP submission worked ─────────────────────────────
-        await asyncio.sleep(2.5)
+        await asyncio.sleep(4.0)
         post_url    = await self._browser.current_url()
         post_text   = await self._browser.page_text()
         post_dom    = await self._browser.get_interactive_elements()
@@ -1375,6 +1656,20 @@ class AgentBrain:
 
         if page_changed and not otp_rejected:
             log.info("brain.otp_verified_page_changed", pre=pre_url[-60:], post=post_url[-60:])
+            self._save_captcha_attempt(
+                job_id=job.job_id,
+                flow="otp",
+                attempt=self._otp_submit_attempts,
+                stage="verified",
+                image_bytes=otp_captcha_bytes,
+                solution=otp_captcha_sol,
+                metadata={
+                    "method": click_method,
+                    "strategy": submit_strategy,
+                    "post_url": post_url,
+                    "dialog": dialog_msg[:200],
+                },
+            )
             self._record_otp_rule_discoveries(
                 otp_section_info=otp_section_info,
                 click_method=click_method,
@@ -1395,31 +1690,233 @@ class AgentBrain:
                     observation=f"{otp_type} OTP verified — page navigated",
                     action_taken="otp_js_fill_submit",
                 ))
+            if "auth_method_selection" not in job.steps_completed:
+                job.mark_step_done("auth_method_selection", StepLog(
+                    step_name="auth_method_selection",
+                    status="success",
+                    observation="Authentication method completed before OTP verification",
+                    action_taken="otp_verified_checkpoint",
+                ))
+            if "accept_alert_popup" not in job.steps_completed:
+                job.mark_step_done("accept_alert_popup", StepLog(
+                    step_name="accept_alert_popup",
+                    status="success",
+                    observation="Post-authentication alert/OTP step completed",
+                    action_taken="otp_verified_checkpoint",
+                ))
             job.otp_pending_type = ""
             self._otp_sent = False
             self._otp_reveal_attempts = 0
             self._cached_otp = ""
             self._otp_submit_attempts = 0
+            self._force_otp_handler = False
             await self._sm.transition(job, JobStatus.AGENT_RUNNING)
         else:
             combined = (post_text + " " + dialog_msg).lower()
-            captcha_rejected = any(p in combined for p in captcha_reject_patterns)
-            otp_only_rejected = otp_rejected and not captcha_rejected
-
-            reason = ("portal_rejected_otp" if otp_only_rejected
-                      else "captcha_rejected" if captcha_rejected
-                      else "page_unchanged_after_submit")
+            reason = self._classify_otp_submit_failure(combined)
+            captcha_rejected = reason == "captcha_rejected"
+            otp_expired = reason == "otp_expired"
+            otp_invalid = reason == "otp_invalid"
+            if reason == "unknown" and otp_rejected:
+                reason = "otp_invalid"
+                otp_invalid = True
+            if reason == "unknown":
+                reason = "page_unchanged_after_submit"
             log.warning("brain.otp_submit_unconfirmed", reason=reason,
                         attempt=self._otp_submit_attempts, captcha=otp_captcha_sol,
                         dialog=dialog_msg[:120])
+            self._save_captcha_attempt(
+                job_id=job.job_id,
+                flow="otp",
+                attempt=self._otp_submit_attempts,
+                stage=reason,
+                image_bytes=otp_captcha_bytes,
+                solution=otp_captcha_sol,
+                metadata={
+                    "method": click_method,
+                    "strategy": submit_strategy,
+                    "dialog": dialog_msg[:200],
+                    "post_url": post_url,
+                    "otp_still_present": not otp_gone_now,
+                    "readiness": readiness,
+                },
+            )
 
-            if otp_only_rejected:
-                # Portal explicitly said OTP is wrong — clear cache to re-ask user
+            if otp_expired:
+                await self._resend_current_otp("portal_said_otp_expired")
+            elif otp_invalid:
                 self._cached_otp = ""
                 self._otp_submit_attempts = 0
-            # If captcha rejected (but OTP fine), keep OTP cached; next loop fetches new captcha
+                self._otp_prompt_reason = "The portal said the previous OTP was invalid."
+            elif captcha_rejected:
+                await self._refresh_visible_captcha(f"#{captcha_img_id}" if captcha_img_id else "")
+            elif self._otp_submit_attempts >= max_same_otp_attempts:
+                await self._resend_current_otp("otp_page_unchanged_after_max_attempts")
+            else:
+                await self._refresh_visible_captcha(f"#{captcha_img_id}" if captcha_img_id else "")
 
         return "submitted"
+
+    async def _maybe_handle_auth_method_page(
+        self,
+        job: Job,
+        current_step: str,
+        page_text: str,
+        dom_elements: dict,
+    ) -> bool:
+        """
+        Deterministically select Sarathi's non-Aadhaar/mobile OTP path.
+
+        Leaving this to the LLM caused a slow loop: it clicked Submit before
+        selecting the radio, accepted Sarathi's alert, then waited. This page is
+        stable enough to rule-drive.
+        """
+        lower = (page_text or "").lower()
+        input_ids = {(i.get("id") or "") for i in dom_elements.get("inputs", [])}
+        button_ids = {(b.get("id") or "") for b in dom_elements.get("buttons", [])}
+        has_auth_radio = "aadhaarHoldingType0" in input_ids
+        has_submit = "submt" in button_ids or "#submt" in {
+            b.get("selector", "") for b in dom_elements.get("buttons", [])
+        }
+        otp_done = {"mobile_otp_verification", "aadhaar_otp_verification"}
+        if any(s in job.steps_completed for s in otp_done):
+            return False
+
+        if not has_auth_radio or not has_submit:
+            return False
+        if "generate otp" in lower or self._has_otp_input(dom_elements, page_text):
+            return False
+
+        log.info("brain.auth_method_page_detected", step=current_step)
+        ok = await self._browser.evaluate("""() => {
+            const radio = document.getElementById('aadhaarHoldingType0');
+            if (!radio) return {ok:false, reason:'missing_radio'};
+            radio.disabled = false;
+            radio.removeAttribute('disabled');
+            radio.checked = true;
+            radio.dispatchEvent(new MouseEvent('click', {bubbles:true}));
+            radio.dispatchEvent(new Event('input', {bubbles:true}));
+            radio.dispatchEvent(new Event('change', {bubbles:true}));
+
+            const submit = document.getElementById('submt');
+            if (!submit) return {ok:false, reason:'missing_submit', checked: radio.checked};
+            submit.disabled = false;
+            submit.removeAttribute('disabled');
+            submit.removeAttribute('readonly');
+            submit.click();
+            return {ok:true, checked: radio.checked, submit_id: submit.id};
+        }""")
+        log.info("brain.auth_method_submitted", result=ok)
+        await asyncio.sleep(1.0)
+        dialog_msg = await self._browser.get_last_dialog_message() or ""
+        if dialog_msg:
+            log.info("brain.auth_method_dialog", message=dialog_msg[:160])
+        return bool(ok and ok.get("ok"))
+
+    def _classify_otp_submit_failure(self, combined_text: str) -> str:
+        """Map Sarathi OTP/CAPTCHA messages to deterministic recovery actions."""
+        lower = (combined_text or "").lower()
+        if any(p in lower for p in VERIFY_OTP_RULES.get("captcha_rejection_patterns", [])):
+            return "captcha_rejected"
+        if any(p in lower for p in VERIFY_OTP_RULES.get("otp_expired_patterns", [])):
+            return "otp_expired"
+        if any(p in lower for p in VERIFY_OTP_RULES.get("otp_invalid_patterns", [])):
+            return "otp_invalid"
+        if any(p in lower for p in VERIFY_OTP_RULES.get("rejection_dialog_patterns", [])):
+            return "otp_invalid"
+        return "unknown"
+
+    async def _resend_current_otp(self, reason: str) -> bool:
+        """Click/call Sarathi's Resend OTP rule and reset local OTP cache."""
+        method = await self._browser.evaluate(f"""() => {{
+            const selector = {json.dumps(GENERATE_OTP_RULES["resend_button_selector"])};
+            const fnName = {json.dumps(GENERATE_OTP_RULES["resend_button_onclick_fn"])};
+            const btn = document.querySelector(selector)
+                || document.getElementById('generateResendSarathiotp')
+                || Array.from(document.querySelectorAll('button,input[type="button"],input[type="submit"],a.btn'))
+                    .find(el => {{
+                        const key = ((el.id || '') + ' ' + (el.value || '') + ' '
+                            + (el.textContent || '') + ' ' + (el.getAttribute('onclick') || '')).toLowerCase();
+                        return key.includes('resend') && key.includes('otp');
+                    }});
+            if (btn) {{
+                btn.disabled = false;
+                btn.removeAttribute('disabled');
+                btn.style.display = '';
+                btn.style.visibility = 'visible';
+            }}
+            if (fnName && typeof window[fnName] === 'function') {{
+                try {{ window[fnName](); return 'rulebook_fn:' + fnName; }}
+                catch (e) {{ return 'rulebook_fn_error:' + e.message; }}
+            }}
+            if (btn) {{
+                try {{ btn.click(); return 'button_click:' + (btn.id || btn.value || btn.textContent || btn.tagName); }}
+                catch (e) {{ return 'button_click_error:' + e.message; }}
+            }}
+            return '';
+        }}""")
+        if not method:
+            for resend_text in ["Resend OTP", "Resend", "Resend otp"]:
+                if await self._browser.click_text(resend_text, exact=False):
+                    method = f"text_click:{resend_text}"
+                    break
+
+        self._cached_otp = ""
+        self._otp_submit_attempts = 0
+        self._otp_reveal_attempts = 0
+        self._force_otp_handler = True
+        self._otp_prompt_reason = (
+            "The previous OTP expired, so we requested a fresh OTP."
+            if "expired" in reason or "exhausted" in reason or "unchanged" in reason
+            else "We requested a fresh OTP."
+        )
+        if method:
+            log.info("brain.otp_resend_triggered", method=method, reason=reason)
+            await asyncio.sleep(2.0)
+            return True
+
+        self._otp_sent = False
+        log.warning("brain.otp_resend_unavailable", reason=reason)
+        return False
+
+    def _save_captcha_attempt(
+        self,
+        *,
+        job_id: str,
+        flow: str,
+        attempt: int,
+        stage: str,
+        image_bytes: bytes,
+        solution: str,
+        metadata: dict | None = None,
+    ) -> None:
+        """Persist CAPTCHA evidence so failed runs can be debugged precisely."""
+        try:
+            safe_flow = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in flow)
+            safe_stage = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in stage)
+            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            out_dir = Path("data") / "captcha_attempts" / job_id
+            out_dir.mkdir(parents=True, exist_ok=True)
+            base = out_dir / f"{ts}_{safe_flow}_attempt{attempt}_{safe_stage}"
+            if image_bytes:
+                base.with_suffix(".png").write_bytes(image_bytes)
+            base.with_suffix(".json").write_text(
+                json.dumps(
+                    {
+                        "job_id": job_id,
+                        "flow": flow,
+                        "attempt": attempt,
+                        "stage": stage,
+                        "solution": solution,
+                        "metadata": metadata or {},
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            log.info("brain.captcha_attempt_saved", path=str(base))
+        except Exception as e:
+            log.warning("brain.captcha_attempt_save_failed", error=str(e))
 
     def _record_rule_discovery(
         self,
@@ -1563,6 +2060,10 @@ class AgentBrain:
              using the browser session cookies — server validates CAPTCHA and
              sends OTP to the registered mobile. No UI button needed.
         """
+        otp_done = {"mobile_otp_verification", "aadhaar_otp_verification"}
+        if any(s in job.steps_completed for s in otp_done):
+            return False
+
         lower = page_text.lower()
         visible_buttons = [
             (b.get("text") or "").strip().lower()
@@ -1657,7 +2158,7 @@ class AgentBrain:
 
         fresh_dom = await self._browser.get_interactive_elements()
         captcha_solution = await self._solve_captcha_value(
-            image_selector=VERIFY_OTP_RULES["captcha_image_selector"],
+            image_selector=GENERATE_OTP_RULES["captcha_image_selector"],
             force_manual=self._generate_otp_attempts > settings.captcha_max_retries,
             prompt_context=(
                 "Generate OTP CAPTCHA. Automatic attempts did not produce a valid OTP request; "
@@ -1669,7 +2170,12 @@ class AgentBrain:
             log.warning("brain.generate_otp_captcha_unsolvable", step=current_step)
             return self._generate_otp_attempts <= 4
 
-        captcha_filled = await self._fill_captcha_field(fresh_dom, captcha_solution)
+        captcha_filled = await self._browser.fill(
+            GENERATE_OTP_RULES["captcha_input_selector"],
+            captcha_solution,
+        )
+        if not captcha_filled:
+            captcha_filled = await self._fill_captcha_field(fresh_dom, captcha_solution)
         if not captcha_filled:
             log.warning("brain.generate_otp_captcha_not_filled", step=current_step)
             return self._generate_otp_attempts <= 4
@@ -1930,6 +2436,72 @@ class AgentBrain:
         await self._sm.save(job)
         return True
 
+    async def _fail_if_service_rejected(
+        self,
+        job: Job,
+        page_text: str,
+        current_step: str,
+    ) -> bool:
+        """
+        Sarathi can accept a service selection click, then reject that service
+        for the resolved RTO. That is a terminal portal business-rule result,
+        not a selector failure to retry.
+        """
+        clean = " ".join((page_text or "").split())
+        lower = clean.lower()
+        if not (
+            "requested service" in lower
+            and (
+                "unable to process your data" in lower
+                or "not legible for requested rto" in lower
+                or "not eligible for requested rto" in lower
+                or "kindly visit the rto/rla authority" in lower
+            )
+        ):
+            return False
+
+        selected = job.customer_data.get("selected_service", "")
+        service = selected
+        rto = ""
+        match = re.search(
+            r"Requested Service:\s*(.*?)\s+is not (?:legible|eligible) for Requested RTO:\s*(.*?)(?:\.|Kindly|$)",
+            clean,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            service = match.group(1).strip() or service
+            rto = match.group(2).strip()
+
+        customer_message = SERVICE_REJECTION_RULES["customer_message"]
+        if service and rto:
+            customer_message = (
+                f"Sarathi says {service} is not available for {rto}. "
+                "Choose another available service or visit the RTO/RLA authority for this request."
+            )
+
+        job.customer_data["portal_service_rejection"] = {
+            "service": service,
+            "rto": rto,
+            "raw_message": clean,
+            "customer_message": customer_message,
+        }
+        job.step_logs.append(StepLog(
+            step_name="service_selection",
+            status="failed",
+            observation=customer_message,
+            action_taken="portal_service_rejection",
+            error=clean,
+        ).to_dict())
+        await self._sm.transition(job, JobStatus.FAILED, clean)
+        log.warning(
+            "brain.service_rejected_by_rto",
+            service=service,
+            rto=rto,
+            message=clean[:220],
+            step=current_step,
+        )
+        return True
+
     # ── Service selection page (after OTP verification) ───────────────────────
 
     async def _maybe_handle_service_selection_page(
@@ -1955,6 +2527,9 @@ class AgentBrain:
         if not any(s in job.steps_completed for s in otp_verified):
             return False
 
+        if await self._fail_if_service_rejected(job, page_text, current_step):
+            return True
+
         lower = page_text.lower()
         service_page_signals = [
             "select service", "service selection", "services on dl",
@@ -1967,24 +2542,62 @@ class AgentBrain:
 
         log.info("brain.service_selection_page_detected", step=current_step)
 
-        # Extract available services from checkboxes / radio buttons / links
+        service_items = await self._browser.evaluate(r"""() => {
+            const isVisible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style.display !== 'none'
+                    && style.visibility !== 'hidden'
+                    && rect.width > 0
+                    && rect.height > 0;
+            };
+            const labelText = (inp) => {
+                const byFor = inp.id ? document.querySelector(`label[for="${CSS.escape(inp.id)}"]`) : null;
+                if (byFor) return byFor.innerText || byFor.textContent || '';
+                const wrapping = inp.closest('label');
+                if (wrapping) return wrapping.innerText || wrapping.textContent || '';
+                const row = inp.closest('tr, li, div, p');
+                return row ? (row.innerText || row.textContent || '') : '';
+            };
+            return Array.from(document.querySelectorAll('input[type="checkbox"], input[type="radio"]'))
+                .filter(inp => (inp.name || '').toLowerCase() === 'dlc' || (inp.value || '').toLowerCase().includes('dl'))
+                .map(inp => ({
+                    id: inp.id || '',
+                    name: inp.name || '',
+                    value: inp.value || '',
+                    label: labelText(inp).replace(/\s+/g, ' ').trim(),
+                    selector: inp.id ? `#${CSS.escape(inp.id)}` : '',
+                    visible: isVisible(inp),
+                    checked: !!inp.checked,
+                    disabled: !!inp.disabled,
+                }))
+                .filter(item => item.value || item.label);
+        }""")
+
+        def canonical_service(value: str) -> str:
+            raw = (value or "").strip()
+            key = " ".join(raw.lower().replace("_", " ").split())
+            aliases = SERVICE_SELECTION_RULES.get("aliases", {})
+            if key in aliases:
+                return aliases[key]
+            for alias, canonical in aliases.items():
+                if alias in key or key in alias:
+                    return canonical
+            return raw.upper()
+
         services: list[str] = []
-        known_service_names = [
-            "Renewal of Driving Licence",
-            "Extract of Driving Licence",
-            "Duplicate Driving Licence",
-            "Change of Address",
-            "Addition of Class of Vehicle",
-            "Deletion of Class of Vehicle",
-            "Change of Name in DL",
-            "NOC from State",
-        ]
-        for svc in known_service_names:
-            if svc.lower() in lower:
-                services.append(svc)
+        for item in service_items or []:
+            candidate = (item.get("value") or item.get("label") or "").strip()
+            if candidate and candidate not in services:
+                services.append(candidate)
 
         if not services:
-            services = ["Extract of Driving Licence", "Renewal of Driving Licence", "Duplicate Driving Licence"]
+            services = [
+                "CHANGE OF DATE OF BIRTH IN DL",
+                "CHANGE OF ADDRESS IN DL",
+                "CHANGE OF NAME IN DL",
+            ]
 
         # DL Renewal 365-day validation
         from datetime import datetime as _dt
@@ -2005,64 +2618,181 @@ class AgentBrain:
             except Exception:
                 pass
 
-        options_to_show = services[:4]
+        options_to_show = services[:8]
         context = renewal_note or "Select the DL service you need. The agent will fill the form and submit."
 
-        resp = await self._hl.ask(
-            job=job,
-            step_name="service_selection",
-            question="Which DL service would you like to apply for?",
-            context=context,
-            screenshot=screenshot,
-            options=options_to_show,
-        )
+        selected = (job.customer_data.get("selected_service") or "").strip()
+        if not selected:
+            manual_file = Path(SERVICE_SELECTION_RULES["manual_answer_file"])
+            if manual_file.exists():
+                selected = manual_file.read_text(encoding="utf-8").strip()
+                try:
+                    manual_file.unlink()
+                except OSError:
+                    pass
 
-        if resp.answer in ("__timeout__", ""):
-            log.warning("brain.service_selection_no_answer")
-            return False
+        if not selected:
+            resp = await self._hl.ask(
+                job=job,
+                step_name="service_selection",
+                question="Which DL service would you like to apply for?",
+                context=context,
+                screenshot=screenshot,
+                options=options_to_show,
+            )
+            if resp.answer in ("__timeout__", ""):
+                log.warning("brain.service_selection_no_answer")
+                return True
+            selected = resp.answer
 
-        selected = resp.answer
+        selected = canonical_service(selected)
         job.customer_data["selected_service"] = selected
-        log.info("brain.service_selected", service=selected)
+        log.info("brain.service_selected", service=selected, available=services)
 
         # Click the selected service (checkbox / radio / link)
-        clicked = False
-        # Try text click first
-        for variant in [selected, selected.split(" of ")[0]]:
-            if await self._browser.click_text(variant, exact=False):
-                clicked = True
-                log.info("brain.service_clicked_text", text=variant)
-                break
-
-        if not clicked:
-            # JS: find element containing the service text and click its input
-            result = await self._browser.evaluate(f"""() => {{
-                const needle = {json.dumps(selected.lower())};
-                for (const el of document.querySelectorAll('label, td, li, span')) {{
-                    if (!el.textContent.toLowerCase().includes(needle)) continue;
-                    const inp = el.querySelector('input') ||
-                                el.parentElement?.querySelector('input[type="checkbox"], input[type="radio"]');
-                    if (inp) {{ inp.click(); return inp.id || inp.name || 'input'; }}
-                    el.click();
-                    return 'text-el';
+        result = await self._browser.evaluate(f"""() => {{
+            const selected = {json.dumps(selected)};
+            const selectedLower = selected.toLowerCase();
+            const serviceName = {json.dumps(SERVICE_SELECTION_RULES["service_input_name"])};
+            const isVisible = (el) => {{
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style.display !== 'none'
+                    && style.visibility !== 'hidden'
+                    && rect.width > 0
+                    && rect.height > 0;
+            }};
+            const labelText = (inp) => {{
+                const byFor = inp.id ? document.querySelector(`label[for="${{CSS.escape(inp.id)}}"]`) : null;
+                if (byFor) return byFor.innerText || byFor.textContent || '';
+                const wrapping = inp.closest('label');
+                if (wrapping) return wrapping.innerText || wrapping.textContent || '';
+                const row = inp.closest('tr, li, div, p');
+                return row ? (row.innerText || row.textContent || '') : '';
+            }};
+            const inputs = Array.from(document.querySelectorAll('input[type="checkbox"], input[type="radio"]'));
+            const exactByName = inputs.filter(inp =>
+                (inp.name || '').toLowerCase() === serviceName
+                && (inp.value || '').toLowerCase() === selectedLower
+            );
+            const candidates = inputs.filter(inp => {{
+                const value = (inp.value || '').toLowerCase();
+                const label = labelText(inp).toLowerCase();
+                return (inp.name || '').toLowerCase() === serviceName
+                    || value.includes('dl')
+                    || label.includes('dl');
+            }});
+            let target = exactByName[0]
+                || candidates.find(inp => (inp.value || '').toLowerCase() === selectedLower)
+                || candidates.find(inp => (inp.value || '').toLowerCase().includes(selectedLower))
+                || candidates.find(inp => selectedLower.includes((inp.value || '').toLowerCase()))
+                || candidates.find(inp => labelText(inp).toLowerCase().includes(selectedLower));
+            if (!target) {{
+                return {{
+                    ok: false,
+                    reason: 'service_not_found',
+                    available: candidates.map(inp => inp.value || labelText(inp)).filter(Boolean),
+                }};
+            }}
+            const matchingInputs = inputs.filter(inp => (inp.value || '').toLowerCase() === selectedLower);
+            const touched = [];
+            for (const inp of matchingInputs.length ? matchingInputs : [target]) {{
+                inp.disabled = false;
+                inp.removeAttribute('disabled');
+                if (isVisible(inp)) {{
+                    inp.scrollIntoView({{block: 'center', inline: 'center'}});
+                    if (!inp.checked) inp.dispatchEvent(new MouseEvent('click', {{bubbles: true}}));
                 }}
-                return null;
-            }}""")
-            if result:
-                clicked = True
-                log.info("brain.service_clicked_js", result=result)
+                inp.checked = true;
+                inp.setAttribute('checked', 'checked');
+                inp.dispatchEvent(new Event('input', {{bubbles: true}}));
+                inp.dispatchEvent(new Event('change', {{bubbles: true}}));
+                touched.push({{
+                    id: inp.id || '',
+                    name: inp.name || '',
+                    value: inp.value || '',
+                    visible: isVisible(inp),
+                    checked: !!inp.checked,
+                }});
+            }}
+            if (!touched.some(item => item.checked && item.name === serviceName)) {{
+                const host = target.form || target.closest('form') || document.querySelector('form') || document.body;
+                let canonical = inputs.find(inp =>
+                    (inp.name || '').toLowerCase() === serviceName
+                    && (inp.value || '').toLowerCase() === selectedLower
+                );
+                if (!canonical) {{
+                    canonical = document.createElement('input');
+                    canonical.type = 'checkbox';
+                    canonical.name = serviceName;
+                    canonical.value = selected;
+                    canonical.id = 'agent_' + serviceName + '_' + Date.now();
+                    canonical.style.display = 'none';
+                    host.appendChild(canonical);
+                }}
+                canonical.disabled = false;
+                canonical.removeAttribute('disabled');
+                canonical.checked = true;
+                canonical.setAttribute('checked', 'checked');
+                canonical.dispatchEvent(new Event('input', {{bubbles: true}}));
+                canonical.dispatchEvent(new Event('change', {{bubbles: true}}));
+                touched.push({{
+                    id: canonical.id || '',
+                    name: canonical.name || '',
+                    value: canonical.value || '',
+                    visible: isVisible(canonical),
+                    checked: !!canonical.checked,
+                    injected: true,
+                }});
+            }}
+            return {{
+                ok: touched.some(item => item.checked && item.name === 'dlc') || touched.some(item => item.checked),
+                id: target.id || '',
+                name: target.name || '',
+                value: target.value || '',
+                label: labelText(target).replace(/\\s+/g, ' ').trim(),
+                visible: isVisible(target),
+                checked: !!target.checked,
+                exact_name_matches: exactByName.length,
+                touched,
+            }};
+        }}""")
+        clicked = bool(result and result.get("ok"))
+        if clicked:
+            log.info("brain.service_clicked_rulebook", result=result)
 
         if not clicked:
-            log.warning("brain.service_click_failed", service=selected)
+            log.warning("brain.service_click_failed", service=selected, result=result)
+            job.customer_data.pop("selected_service", None)
+            return True
 
         await asyncio.sleep(0.8)
 
         # Click Proceed / Continue
-        for btn in ["Proceed", "Continue", "Next", "Submit"]:
-            if await self._browser.click_text(btn, exact=True):
-                log.info("brain.service_proceed_clicked", btn=btn)
-                await asyncio.sleep(2.0)
-                break
+        proceed_clicked = await self._browser.click_selector(
+            SERVICE_SELECTION_RULES["proceed_selector"],
+            "Proceed after selecting DL service",
+        )
+        if not proceed_clicked:
+            for btn in ["Proceed", "Continue", "Next", "Submit"]:
+                if await self._browser.click_text(btn, exact=True):
+                    proceed_clicked = True
+                    log.info("brain.service_proceed_clicked", btn=btn)
+                    break
+        await asyncio.sleep(2.0)
+
+        dialog = await self._browser.get_last_dialog_message() or ""
+        post_text = await self._browser.page_text()
+        if await self._fail_if_service_rejected(job, post_text, current_step):
+            return True
+        if "select at least one" in dialog.lower():
+            log.warning("brain.service_selection_rejected", dialog=dialog, selected=selected)
+            job.customer_data.pop("selected_service", None)
+            return True
+        if not proceed_clicked:
+            log.warning("brain.service_proceed_failed", selected=selected)
+            return True
 
         job.mark_step_done("service_selection", StepLog(
             step_name="service_selection",
@@ -2109,8 +2839,80 @@ class AgentBrain:
         log.info("brain.expected_fee", service=selected_service, state=job.state_code, fee_inr=expected_fee)
         job.customer_data["expected_fee_inr"] = expected_fee
 
+        change_dob_handled = False
+        if "date of birth" in selected_service.lower() or "coddob" in lower:
+            reason_opts: list[str] = []
+            for sel in dom_elements.get("selects", []):
+                if (sel.get("id") or "") == CHANGE_DOB_RULES["reason_selector"].lstrip("#"):
+                    reason_opts = [o.get("text", o) if isinstance(o, dict) else str(o)
+                                   for o in (sel.get("options") or [])]
+                    reason_opts = [o for o in reason_opts if o and o.strip() and "select" not in o.lower()]
+                    break
+
+            reason = (job.customer_data.get(CHANGE_DOB_RULES["reason_answer_key"]) or "").strip()
+            if not reason:
+                resp = await self._hl.ask(
+                    job=job,
+                    step_name="service_form_fill",
+                    question="Why do you want to change the date of birth on the DL?",
+                    context="Sarathi requires a reason before it can proceed with DOB correction.",
+                    screenshot=screenshot,
+                    options=reason_opts[:4] or [
+                        "Wrong date of birth entered",
+                        "Date of birth is mismatched with other date of birth proofs",
+                        "Miscellaneous",
+                    ],
+                )
+                if resp.answer in ("__timeout__", ""):
+                    log.warning("brain.change_dob_reason_missing")
+                    return True
+                reason = resp.answer
+                job.customer_data[CHANGE_DOB_RULES["reason_answer_key"]] = reason
+
+            corrected_dob = (job.customer_data.get(CHANGE_DOB_RULES["corrected_dob_answer_key"]) or "").strip()
+            if not corrected_dob:
+                resp = await self._hl.ask(
+                    job=job,
+                    step_name="service_form_fill",
+                    question="Please provide the correct DOB in DD-MM-YYYY format.",
+                    context="This value will be entered in the Sarathi DOB correction form.",
+                    screenshot=screenshot,
+                    options=[],
+                )
+                if resp.answer in ("__timeout__", ""):
+                    log.warning("brain.change_dob_corrected_dob_missing")
+                    return True
+                corrected_dob = resp.answer.strip()
+                job.customer_data[CHANGE_DOB_RULES["corrected_dob_answer_key"]] = corrected_dob
+
+            await self._browser.select_option(CHANGE_DOB_RULES["reason_selector"], label=reason, value=reason)
+            await asyncio.sleep(0.4)
+            await self._browser.fill(CHANGE_DOB_RULES["corrected_dob_selector"], corrected_dob, blur_after=True)
+            log.info("brain.change_dob_fields_filled", reason=reason, corrected_dob=corrected_dob)
+
+            if "miscellaneous" in reason.lower():
+                manual_reason = (
+                    job.customer_data.get(CHANGE_DOB_RULES["manual_reason_answer_key"])
+                    or "DOB correction requested by applicant"
+                )
+                await self._browser.fill(CHANGE_DOB_RULES["manual_reason_selector"], manual_reason, blur_after=True)
+                log.info("brain.change_dob_manual_reason_filled")
+
+            confirm_result = await self._browser.evaluate(f"""() => {{
+                const btn = document.querySelector({json.dumps(CHANGE_DOB_RULES["confirm_selector"])});
+                if (!btn) return {{ok:false, reason:'confirm_missing'}};
+                btn.disabled = false;
+                btn.removeAttribute('disabled');
+                btn.scrollIntoView({{block:'center', inline:'center'}});
+                btn.click();
+                return {{ok:true, id: btn.id || '', value: btn.value || ''}};
+            }}""")
+            log.info("brain.change_dob_confirm_clicked", result=confirm_result)
+            await asyncio.sleep(2.5)
+            change_dob_handled = True
+
         # ── 1. Reason dropdown ────────────────────────────────────────────────
-        if "reason" in lower:
+        if not change_dob_handled and "reason" in lower:
             reason_opts: list[str] = []
             for sel in dom_elements.get("selects", []):
                 key = ((sel.get("id") or "") + (sel.get("name") or "") + (sel.get("label") or "")).lower()
@@ -2399,7 +3201,7 @@ class AgentBrain:
         DL number + DOB form fields are present and not yet confirmed, regardless
         of current_step (handles cases where user skipped or LLM mis-marked).
         """
-        if "confirm_dl_details" in job.steps_completed:
+        if "confirm_dl_details" in job.steps_completed or "fetch_dl_details" in job.steps_completed:
             return False
 
         rules = DL_FETCH_RULES
@@ -2460,8 +3262,8 @@ class AgentBrain:
                 image_selector=rules["captcha_image_selector"],
                 force_manual=attempt >= settings.captcha_max_retries,
                 prompt_context=(
-                    "DL details CAPTCHA. Previous automatic attempts were rejected; "
-                    "please provide the CAPTCHA shown for Get DL Details."
+                    "DL details CAPTCHA failed after automatic retries. Please provide "
+                    "the fresh CAPTCHA currently shown for Get DL Details."
                     if attempt >= settings.captcha_max_retries else ""
                 ),
             )
@@ -2515,20 +3317,18 @@ class AgentBrain:
                 if not has_dl_field:
                     log.warning("brain.dl_fetch_form_disappeared_after_reject")
                     if attempt < settings.captcha_max_retries:
-                        try:
-                            current = await self._browser.current_url()
-                            await self._browser.goto(current)
-                            await asyncio.sleep(1.0)
-                            log.info("brain.dl_fetch_form_reloaded_after_reject", attempt=attempt)
+                        recovered = await self._recover_dl_fetch_page_after_reject()
+                        if recovered:
+                            log.info("brain.dl_fetch_form_recovered_after_reject", attempt=attempt)
                             continue
-                        except Exception as e:
-                            log.warning("brain.dl_fetch_reload_failed", error=str(e))
+                        log.warning("brain.dl_fetch_recovery_failed", attempt=attempt)
                     self._last_deterministic_failure = (
                         f"Portal rejected Get DL Details with alert '{dialog_msg}', "
                         "and the DL form disappeared even after retry/reload. Ask the "
                         "user/operator to inspect DL/DOB or wait before retrying."
                     )
                     return False
+                await self._refresh_visible_captcha(rules["captcha_image_selector"])
                 continue
 
             if dialog_msg:
@@ -2549,6 +3349,58 @@ class AgentBrain:
             "or ask the user/operator instead of clicking navigation links."
         )
         return False
+
+    async def _recover_dl_fetch_page_after_reject(self) -> bool:
+        """
+        Sarathi sometimes clears or navigates away from envaction.do after a
+        rejected DL/CAPTCHA attempt. Recover through the stable DL services
+        landing page instead of repeatedly reloading the broken form URL.
+        """
+        async def has_dl_fetch_fields() -> bool:
+            dom = await self._browser.get_interactive_elements()
+            selectors = {i.get("selector", "") for i in dom.get("inputs", [])}
+            return (
+                DL_FETCH_RULES["dl_input_selector"] in selectors
+                and DL_FETCH_RULES["dob_input_selector"] in selectors
+            )
+
+        try:
+            fetch_url = f"{settings.sarathi_base_url}/envaction.do"
+            landing_url = f"{settings.sarathi_base_url}/dlServicesDet.do"
+
+            await self._browser.goto(landing_url)
+            await asyncio.sleep(0.8)
+            clicked_landing = await self._maybe_handle_dl_services_landing(url=landing_url)
+            await asyncio.sleep(1.2)
+            if await has_dl_fetch_fields():
+                log.info("brain.dl_fetch_recovery_probe", recovered=True, via="landing_continue")
+                return True
+
+            # Some rejected states render dlServicesDet.do without the Continue
+            # control. The session can still accept a direct envaction.do reload.
+            await self._browser.goto(fetch_url)
+            await asyncio.sleep(1.2)
+            if await has_dl_fetch_fields():
+                log.info("brain.dl_fetch_recovery_probe", recovered=True, via="direct_envaction")
+                return True
+
+            dom = await self._browser.get_interactive_elements()
+            text = await self._browser.page_text()
+            url = await self._browser.current_url()
+            log.warning(
+                "brain.dl_fetch_recovery_probe",
+                recovered=False,
+                clicked_landing=clicked_landing,
+                url=url,
+                inputs=[i.get("selector") for i in dom.get("inputs", [])[:8]],
+                buttons=[b.get("text") or b.get("value") for b in dom.get("buttons", [])[:8]],
+                links=[l.get("text") for l in dom.get("links", [])[:8]],
+                text=text[:240],
+            )
+            return False
+        except Exception as e:
+            log.warning("brain.dl_fetch_recovery_exception", error=str(e))
+            return False
 
     async def _dl_fetch_success_visible(self) -> bool:
         """Return True when the page proves Get DL Details worked."""
@@ -2586,15 +3438,24 @@ class AgentBrain:
             for marker in [
                 "driving licence details",
                 "driving license details",
+                "personal details and particulars",
+                "particulars of existing licence",
                 "licence holder",
                 "license holder",
+                "dl holder last endorsed details",
+                "class of vehicles",
+                "validity period",
+                "transport department, government of rajasthan",
                 "class of vehicles",
                 "select category",
                 "applicant details",
             ]
         )
         has_confirm_select = "dispDLDet" in visible_select_ids
-        return (has_confirm_select or has_details_text) and has_confirm_button
+        if has_details_text:
+            log.info("brain.dl_fetch_success_details_text")
+            return True
+        return has_confirm_select and has_confirm_button
 
     async def _solve_and_fill_visible_captcha(
         self,
@@ -2604,41 +3465,93 @@ class AgentBrain:
         force_manual: bool = False,
         prompt_context: str = "",
     ) -> bool:
-        captcha_bytes = await self._fetch_visible_captcha_bytes(image_selector=image_selector)
-        if not captcha_bytes:
-            try:
-                captcha_bytes = await self._browser.screenshot()
-            except Exception as e:
-                log.warning("brain.captcha_fallback_screenshot_failed", error=str(e))
-                return False
-        solution = await self._captcha.solve(
-            captcha_bytes,
+        solution = await self._solve_captcha_value(
+            image_selector=image_selector,
             force_manual=force_manual,
             prompt_context=prompt_context,
         )
-        if solution and force_manual:
-            latest_bytes = await self._fetch_visible_captcha_bytes(image_selector=image_selector)
-            if latest_bytes and latest_bytes != captcha_bytes:
-                log.warning("brain.captcha_changed_after_manual_answer")
-                solution = await self._captcha.solve(
-                    latest_bytes,
-                    force_manual=True,
-                    prompt_context=(
-                        f"{prompt_context}\n"
-                        "The CAPTCHA refreshed while waiting. Use the newly saved image only."
-                    ).strip(),
-                )
         if not solution:
             return False
 
-        return await self._fill_captcha_field(dom_elements, solution)
+        fresh_dom = await self._browser.get_interactive_elements()
+        return await self._fill_captcha_field(fresh_dom or dom_elements, solution)
+
+    async def _refresh_visible_captcha(self, image_selector: str = "") -> bool:
+        """Refresh the current visible CAPTCHA and clear visible CAPTCHA inputs."""
+        try:
+            result = await self._browser.evaluate(f"""() => {{
+                const preferredSelector = {json.dumps(image_selector)};
+                const isVisible = (el) => {{
+                    if (!el) return false;
+                    const st = window.getComputedStyle(el);
+                    return st.display !== 'none' && st.visibility !== 'hidden'
+                        && (el.offsetParent !== null || el.tagName === 'IMG');
+                }};
+                const captchaImgs = Array.from(document.querySelectorAll(
+                    'img[id*="captcha" i], img[src*="captcha" i], img[id*="captha" i], img[src*="captha" i], img[id*="cap" i], img[src*="cap" i]'
+                )).filter(isVisible);
+                let img = preferredSelector ? document.querySelector(preferredSelector) : null;
+                if (!isVisible(img)) img = captchaImgs[0] || null;
+
+                const controls = Array.from(document.querySelectorAll(
+                    'button, input[type="button"], input[type="submit"], a, img'
+                )).filter(isVisible);
+                const refresh = controls.find(el => {{
+                    const key = [
+                        el.id || '',
+                        el.name || '',
+                        el.value || '',
+                        el.textContent || '',
+                        el.alt || '',
+                        el.title || '',
+                        el.getAttribute('onclick') || '',
+                        el.getAttribute('src') || '',
+                    ].join(' ').toLowerCase();
+                    return /refresh|reload|change.*image|captcha|captha/.test(key)
+                        && !/submit|verify|generate|resend|reset|home|cancel/.test(key);
+                }});
+
+                const before = img ? img.src : '';
+                if (refresh && refresh !== img) {{
+                    try {{ refresh.click(); }} catch (e) {{}}
+                }} else if (img && img.src) {{
+                    const u = new URL(img.src, window.location.href);
+                    u.searchParams.set('_agent_refresh', String(Date.now()));
+                    img.src = u.toString();
+                }}
+
+                const inputs = Array.from(document.querySelectorAll(
+                    'input[id*="capt" i]:not([type="hidden"]), input[name*="capt" i]:not([type="hidden"]), input[id*="capth" i]:not([type="hidden"]), input[name*="capth" i]:not([type="hidden"])'
+                ));
+                for (const el of inputs) {{
+                    const nativeSet = Object.getOwnPropertyDescriptor(
+                        window.HTMLInputElement.prototype, 'value').set;
+                    nativeSet.call(el, '');
+                    el.dispatchEvent(new Event('input', {{bubbles:true}}));
+                    el.dispatchEvent(new Event('change', {{bubbles:true}}));
+                }}
+                return {{
+                    ok: !!(refresh || img),
+                    clicked: refresh ? (refresh.id || refresh.value || refresh.textContent || refresh.tagName) : '',
+                    image_id: img ? (img.id || '') : '',
+                    before,
+                    after: img ? img.src : '',
+                    cleared_inputs: inputs.map(el => el.id || el.name || ''),
+                }};
+            }}""")
+            await asyncio.sleep(0.8)
+            log.info("brain.captcha_refreshed_for_retry", result=result)
+            return bool(result and result.get("ok"))
+        except Exception as e:
+            log.warning("brain.captcha_refresh_failed", error=str(e))
+            return False
 
     async def _fetch_visible_captcha_bytes(self, image_selector: str = "") -> bytes:
-        """Fetch the visible CAPTCHA image bytes from its src URL."""
-        data_url = await self._browser.evaluate(f"""async () => {{
+        """Capture the CAPTCHA image exactly as displayed in the browser."""
+        selector_info = await self._browser.evaluate(f"""() => {{
             const preferredSelector = {json.dumps(image_selector)};
             const isVisible = (img) => {{
-                if (!img || !img.src) return false;
+                if (!img) return false;
                 const st = window.getComputedStyle(img);
                 return st.display !== 'none' && st.visibility !== 'hidden';
             }};
@@ -2649,26 +3562,48 @@ class AgentBrain:
             )).filter(isVisible);
             if (!img) {{
                 img = imgs.find(x => x.id === 'captchaimg')
+                   || imgs.find(x => x.id === 'capimg1')
                    || imgs.find(x => x.id === 'capimg')
                    || imgs.find(x => /captcha|captha|cap/i.test((x.id || '') + ' ' + (x.src || '')));
             }}
+            if (!img) return null;
+            if (img.id) return {{ selector: '#' + CSS.escape(img.id), id: img.id || '', src: (img.src || '').slice(0, 120) }};
+            const idx = Array.from(document.images).indexOf(img);
+            return {{ selector: `img:nth-of-type(${{idx + 1}})`, id: '', src: (img.src || '').slice(0, 120) }};
+        }}""")
+
+        if selector_info and isinstance(selector_info, dict):
+            selector = selector_info.get("selector") or ""
+            if selector:
+                cropped = await self._browser.crop_element_screenshot(selector, timeout_ms=2500)
+                if cropped:
+                    log.info(
+                        "brain.captcha_captured_from_element",
+                        id=selector_info.get("id", ""),
+                        selector=selector,
+                        bytes=len(cropped),
+                    )
+                    return cropped
+
+        # Canvas fallback uses the already-loaded DOM image pixels. Do not fetch
+        # img.src; on Sarathi that can rotate the server-side CAPTCHA and make
+        # the browser image differ from the solved image.
+        data_url = await self._browser.evaluate(f"""() => {{
+            const selector = {json.dumps((selector_info or {}).get("selector", "") if isinstance(selector_info, dict) else "")};
+            const img = selector ? document.querySelector(selector) : null;
             if (!img || !img.src) return null;
-            const response = await fetch(img.src, {{
-                credentials: 'same-origin',
-                cache: 'no-store',
-            }});
-            if (!response.ok) return null;
-            const blob = await response.blob();
-            return await new Promise((resolve, reject) => {{
-                const reader = new FileReader();
-                reader.onloadend = () => resolve({{
-                    id: img.id || '',
-                    src: img.src.slice(0, 120),
-                    data: reader.result,
-                }});
-                reader.onerror = () => reject(new Error('captcha_file_reader_failed'));
-                reader.readAsDataURL(blob);
-            }});
+            const w = img.naturalWidth || img.width || 160;
+            const h = img.naturalHeight || img.height || 40;
+            const canvas = document.createElement('canvas');
+            canvas.width = w;
+            canvas.height = h;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(img, 0, 0, w, h);
+            return {{
+                id: img.id || '',
+                src: img.src.slice(0, 120),
+                data: canvas.toDataURL('image/png'),
+            }};
         }}""")
         if not data_url or not isinstance(data_url, dict):
             return b""
@@ -2678,13 +3613,13 @@ class AgentBrain:
         try:
             decoded = base64.b64decode(raw.split(",", 1)[1])
             log.info(
-                "brain.captcha_fetched_from_src",
+                "brain.captcha_captured_from_canvas",
                 id=data_url.get("id", ""),
                 bytes=len(decoded),
             )
             return decoded
         except Exception as e:
-            log.warning("brain.captcha_src_decode_failed", error=str(e))
+            log.warning("brain.captcha_canvas_decode_failed", error=str(e))
             return b""
 
     async def _reveal_otp_section(self) -> int:
@@ -2726,36 +3661,74 @@ class AgentBrain:
         prompt_context: str = "",
     ) -> str:
         """Solve the visible CAPTCHA and return the text solution (not yet filled)."""
-        captcha_bytes = await self._fetch_visible_captcha_bytes(image_selector=image_selector)
-        if not captcha_bytes:
-            try:
-                captcha_bytes = await self._browser.screenshot()
-            except Exception as e:
-                log.warning("brain.captcha_screenshot_failed", error=str(e))
-                return ""
-        solution = await self._captcha.solve(
-            captcha_bytes,
-            force_manual=force_manual,
-            prompt_context=prompt_context,
-        )
-        if solution and force_manual:
-            latest_bytes = await self._fetch_visible_captcha_bytes(image_selector=image_selector)
-            if latest_bytes and latest_bytes != captcha_bytes:
-                log.warning("brain.captcha_changed_after_manual_answer")
-                solution = await self._captcha.solve(
-                    latest_bytes,
-                    force_manual=True,
-                    prompt_context=(
-                        f"{prompt_context}\n"
-                        "The CAPTCHA refreshed while waiting. Use the newly saved image only."
-                    ).strip(),
+        attempts = 1 if force_manual else max(1, settings.captcha_max_retries)
+        last_solution = ""
+
+        for attempt in range(1, attempts + 1):
+            captcha_bytes = await self._fetch_visible_captcha_bytes(image_selector=image_selector)
+            if not captcha_bytes:
+                try:
+                    captcha_bytes = await self._browser.screenshot()
+                except Exception as e:
+                    log.warning("brain.captcha_screenshot_failed", error=str(e))
+                    return ""
+
+            result = await self._captcha.solve_with_confidence(
+                captcha_bytes,
+                force_manual=force_manual,
+                allow_manual=force_manual,
+                prompt_context=prompt_context,
+            )
+            solution = result.text or ""
+            last_solution = solution
+
+            if solution and len(solution) > 12:
+                log.warning(
+                    "brain.captcha_solution_too_long",
+                    chars=len(solution),
+                    preview=solution[:20],
+                    attempt=attempt,
                 )
-        # Refusal filtering also happens inside CaptchaSolver._solve_claude(),
-        # but guard here too in case a different provider returns garbage.
-        if solution and len(solution) > 12:
-            log.warning("brain.captcha_solution_too_long", chars=len(solution), preview=solution[:20])
-            return ""
-        return solution or ""
+                solution = ""
+
+            if force_manual:
+                # Do not re-fetch the CAPTCHA after a human answers. Sarathi's
+                # CAPTCHA endpoint may produce different bytes on every fetch,
+                # even when the visible browser image has not changed. Trust the
+                # saved image the human answered; if it is wrong/stale, the
+                # portal rejection path will refresh and ask again.
+                if solution:
+                    log.info("brain.captcha_manual_solution_received", chars=len(solution))
+                return solution
+
+            if solution and result.confidence >= settings.captcha_confidence_threshold:
+                log.info(
+                    "brain.captcha_high_confidence",
+                    solution=solution,
+                    confidence=result.confidence,
+                    provider=result.provider,
+                    attempt=attempt,
+                )
+                return solution
+
+            log.warning(
+                "brain.captcha_low_confidence_refresh",
+                solution=solution,
+                confidence=result.confidence,
+                provider=result.provider,
+                attempt=attempt,
+                max_attempts=attempts,
+                threshold=settings.captcha_confidence_threshold,
+            )
+            if attempt < attempts:
+                await self._refresh_visible_captcha(image_selector)
+
+        log.warning(
+            "brain.captcha_auto_exhausted",
+            last_solution=last_solution,
+            attempts=attempts,
+        )
+        return ""
 
     async def _fill_captcha_field(self, dom_elements: dict, solution: str) -> bool:
         """Fill a CAPTCHA field with the given solution string."""
@@ -3444,7 +4417,17 @@ KNOWN OBSTACLES: {json.dumps(next_step.known_obstacles if next_step else [])}
         if tool == "captcha_solver":
             sel = args.get("selector", "img[src*='captcha'], img[id*='captcha']")
             captcha_bytes = await self._browser.crop_element_screenshot(sel) or await self._browser.screenshot()
-            solution = await self._captcha.solve(captcha_bytes)
+            result = await self._captcha.solve_with_confidence(captcha_bytes, allow_manual=False)
+            if result.confidence < settings.captcha_confidence_threshold:
+                log.warning(
+                    "brain.tool_captcha_low_confidence",
+                    solution=result.text,
+                    confidence=result.confidence,
+                    threshold=settings.captcha_confidence_threshold,
+                )
+                await self._refresh_visible_captcha(sel)
+                return False
+            solution = result.text
             if solution:
                 # Try selectors in order — Sarathi misspells "captcha" as "captha" (visible id: entCaptha).
                 # Always prefer visible inputs over hidden ones.

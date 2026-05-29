@@ -368,3 +368,26 @@ Once first live URL is up:
 - `POST /onboard/validate-dl` normalizes Rajasthan DL.
 - Fake `STUCK_HUMAN_NEEDED` OTP job maps to customer action type `otp`.
 - Browser UI smoke: form fill → Review details → review screen renders DL+PIN.
+
+## Latest Agent Automation Verification
+
+- Live run `data/live-agent-test-22.out.log`, job
+  `fe3199e6-452b-4c02-bfc7-a6b9a0892328`, validated the flow through OTP:
+  DL fetch → DL confirmation → email confirmation → auth method →
+  Generate OTP → user OTP `003631` → OTP CAPTCHA → `#otpCheckbox` →
+  `#verifySarathi` / `verifiedBySarathi()` → landed on `eKycOTPAuth.do`.
+- CAPTCHA retry limit is now 4 and was exercised in the Generate OTP path:
+  attempts 1–2 failed/rejected, attempt 3 used solver pass 4 with confidence
+  0.9 and generated OTP successfully.
+- Service list after OTP was extracted successfully. Available services
+  included `CHANGE OF DATE OF BIRTH IN DL`, address/name/photo changes,
+  duplicate DL, IDP, DL extract, PSV badge, replacement DL, and surrender COV.
+- Service selection for `CHANGE OF DATE OF BIRTH IN DL` clicked the visible
+  checkbox and injected canonical `name="dlc"` because Sarathi used `dlc1`
+  on the visible input. The portal then rejected the selected service with:
+  `Unable to Process your Data. DL Holder Requested Service: CHANGE OF DATE
+  OF BIRTH IN DL is not legible for Requested RTO: DTO, LONGDING`.
+- This is now treated as a deterministic RTO/service eligibility rejection,
+  not an automation failure or retry loop. The agent marks the job failed with
+  a customer-safe non-retryable message: this service is not available at the
+  resolved RTO; choose another service or visit the RTO/RLA authority.

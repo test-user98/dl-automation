@@ -190,6 +190,13 @@ class HumanLoop:
             while True:
                 if otp_path.exists():
                     raw = otp_path.read_text(encoding="utf-8").strip()
+                    if raw.strip().lower() in {"resend", "resend otp"}:
+                        try:
+                            otp_path.unlink()
+                        except OSError:
+                            pass
+                        print(f"\nAgent received OTP command from {otp_path}: 'resend'\n")
+                        return "resend"
                     digits = "".join(ch for ch in raw if ch.isdigit())
                     if digits:
                         try:
@@ -200,8 +207,32 @@ class HumanLoop:
                         return digits
                 await asyncio.sleep(1)
 
+        async def read_answer_file() -> str:
+            step_slug = "".join(
+                ch if ch.isalnum() or ch in {"_", "-"} else "_"
+                for ch in request.step_name.lower()
+            )
+            paths = [
+                Path(f"data/manual_{step_slug}.txt"),
+                Path("data/manual_answer.txt"),
+            ]
+            while True:
+                for answer_path in paths:
+                    if answer_path.exists():
+                        raw = answer_path.read_text(encoding="utf-8").strip()
+                        if raw:
+                            try:
+                                answer_path.unlink()
+                            except OSError:
+                                pass
+                            print(f"\nAgent received answer from {answer_path}: '{raw}'\n")
+                            return raw
+                await asyncio.sleep(1)
+
         if is_otp:
             print("You can also reply to Codex with the OTP; Codex will write it to data/manual_otp.txt.\n")
+            if not sys.stdin.isatty():
+                return await read_otp_file()
             stdin_task = asyncio.create_task(read_stdin())
             file_task = asyncio.create_task(read_otp_file())
             answer = ""
@@ -216,7 +247,14 @@ class HumanLoop:
                         stdin_task.cancel()
                     break
                 if stdin_task in done:
-                    answer = stdin_task.result() or ""
+                    raw_answer = stdin_task.result()
+                    if raw_answer is None:
+                        # Windows redirected/hidden processes may claim stdin is
+                        # a TTY but still raise EOF. For OTP, keep waiting for
+                        # data/manual_otp.txt instead of timing out immediately.
+                        answer = await file_task
+                        break
+                    answer = raw_answer or ""
                     if answer or sys.stdin.isatty():
                         if not file_task.done():
                             file_task.cancel()
@@ -224,9 +262,16 @@ class HumanLoop:
                     # No interactive stdin. Keep waiting for data/manual_otp.txt.
                     stdin_task = asyncio.create_task(read_stdin())
         else:
-            answer = await read_stdin()
-            if answer is None:
-                return "__timeout__"
+            if not sys.stdin.isatty():
+                print(
+                    "You can also reply to Codex; Codex will write it to "
+                    f"data/manual_{request.step_name.lower()}.txt or data/manual_answer.txt.\n"
+                )
+                answer = await read_answer_file()
+            else:
+                answer = await read_stdin()
+                if answer is None:
+                    answer = await read_answer_file()
 
         if not answer:
             if not sys.stdin.isatty():

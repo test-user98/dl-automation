@@ -31,7 +31,8 @@ class Settings(BaseSettings):
     )
     captcha_api_key: str = Field("", env="CAPTCHA_API_KEY")
     captcha_timeout_seconds: int = Field(60, env="CAPTCHA_TIMEOUT_SECONDS")
-    captcha_max_retries: int = Field(3, env="CAPTCHA_MAX_RETRIES")
+    captcha_max_retries: int = Field(4, env="CAPTCHA_MAX_RETRIES")
+    captcha_confidence_threshold: float = Field(0.85, env="CAPTCHA_CONFIDENCE_THRESHOLD")
     captcha_manual_timeout_seconds: int = Field(300, env="CAPTCHA_MANUAL_TIMEOUT_SECONDS")
 
     # ── BROWSER ───────────────────────────────────────────────────────────────
