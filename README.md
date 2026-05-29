@@ -47,6 +47,22 @@ End-to-end loop:
 - **Portal specific today, extensible tomorrow**:
   orchestration/state/human-loop are reusable; portal rules and flows are configurable.
 
+## Core capabilities (must-know)
+- **Self-learning + self-healing in real time**: when a path fails, agent diagnoses why (DOM/state/error/log context), tries alternate heuristics, and continues until success or safe escalation.
+- **Learns from success**: successful alternate actions are persisted to memory/rule overlay, so next run becomes more deterministic and lower-latency.
+- **Production guardrails**: max attempts, retry caps, loop prevention, actionable customer prompts, and customer-safe error mapping.
+- **Bidirectional operation**: customer input -> agent -> Sarathi -> agent -> customer (OTP/captcha/choices/confirmations) with live status.
+- **Not locked to one flow only**: architecture supports adding new services/workflows by rule + step modules without rewriting the core engine.
+
+## How self-learning works (concrete)
+1. Agent attempts deterministic rule path.
+2. If blocked, it reads live portal context (DOM, URL, visible actions, logs/errors).
+3. It selects a different heuristic path (fallback action chain).
+4. It verifies outcome (URL/state transition / expected element / status change).
+5. On success, it records the winning action in memory and discovered rules.
+6. Future runs prefer the discovered deterministic path first.
+7. If still unresolved after limits, it requests precise human input and resumes.
+
 ## Agent Internals (short)
 - Brain: `agent/brain.py`
 - Memory: `agent/learning_store.py`
