@@ -53,7 +53,7 @@ class Orchestrator:
             log.error("orchestrator.job_not_found", job_id=job_id)
             return
 
-        max_restarts = 3
+        max_restarts = max(0, int(settings.stuck_threshold_retries))
         restart_count = 0
 
         while restart_count <= max_restarts:
@@ -94,6 +94,14 @@ class Orchestrator:
                     break
 
                 log.info("orchestrator.restarting", job_id=job_id, attempt=restart_count)
+                await self._sm.transition(
+                    job,
+                    JobStatus.FAILED_RETRYING,
+                    (
+                        "The government portal session was interrupted. "
+                        f"Retrying with a fresh browser session ({restart_count}/{max_restarts})."
+                    ),
+                )
                 await asyncio.sleep(5)
 
             finally:

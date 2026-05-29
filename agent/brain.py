@@ -150,7 +150,7 @@ class AgentBrain:
                 ).to_dict())
                 await self._sm.save(job)
                 log.error("brain.observe_failed_page_unavailable", error=str(e))
-                break
+                raise PortalTransientError(job.error_message)
 
             await self._sync_steps_from_page(job, url, page_text, dom_elements)
 
@@ -390,58 +390,27 @@ class AgentBrain:
             # ── Escalate to human after too many self-healing attempts ─────────
             if fails >= settings.max_consecutive_step_failures:
                 log.warning(
-                    "brain.escalating_to_human",
+                    "brain.max_retries_exhausted",
                     step=current_step,
                     consecutive_fails=fails,
                     url=url,
                     last_diagnosis=failure_context[:200],
                 )
-                resp = await self._hl.ask(
-                    job=job,
-                    step_name=current_step,
-                    question=(
-                        f"Agent is stuck on '{current_step}' after {fails} attempts.\n"
-                        f"URL: {url}\n"
-                        f"Diagnosis: {failure_context}\n\n"
-                        f"What should it try?"
-                    ),
-                    context=f"Page text: {page_text[:400]}",
-                    screenshot=screenshot,
-                    options=["Retry fresh", "Skip this step", "Abort job"],
+                safe_msg = (
+                    f"Stopped after {fails} repeated attempts on step '{current_step}'. "
+                    "The government portal did not move forward after safe retries."
                 )
-                answer = (resp.answer or "").lower()
-                if answer == "__timeout__":
-                    log.warning("brain.human_escalation_timeout", step=current_step)
-                    break
-                if "skip" in answer:
-                    job.mark_step_done(current_step, StepLog(
-                        step_name=current_step,
-                        status="skipped",
-                        observation="Skipped by human after repeated failures",
-                        action_taken="human_skip",
-                    ))
-                    await self._sm.save(job)
-                    step_failures.pop(current_step, None)
-                    failure_context = ""
-                    log.info("brain.step_skipped_by_human", step=current_step)
-                elif "abort" in answer:
-                    log.info("brain.aborted_by_human", step=current_step)
-                    break
-                else:
-                    step_failures[current_step] = 0
-                    failure_context = ""
-                    # Record human hint in learning store
-                    if resp.answer and len(resp.answer) > 5:
-                        await self._ls.record(Scenario(
-                            scenario_id=LearningStore.make_scenario_id(current_step, failure_context),
-                            step_name=current_step,
-                            description=failure_context[:200],
-                            page_url=url,
-                            solution=resp.answer,
-                            solution_detail={"source": "human_escalation"},
-                            human_provided=True,
-                        ))
-                continue
+                job.error_message = f"{safe_msg} Diagnosis: {failure_context[:500]}"
+                job.customer_data.pop("_pending_customer_request", None)
+                job.mark_step_done(current_step, StepLog(
+                    step_name=current_step,
+                    status="failed",
+                    observation="Stopped after repeated attempts without portal progress.",
+                    action_taken="max_retry_exit",
+                    error=job.error_message,
+                ))
+                await self._sm.transition(job, JobStatus.FAILED, job.error_message)
+                break
 
             # ── Learning store hint ────────────────────────────────────────────
             learned = await self._ls.find_solution(

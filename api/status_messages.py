@@ -574,6 +574,13 @@ def _field_question(field_key: str) -> str:
 def _failure_message(lower: str) -> tuple[str, str, bool]:
     if _is_service_rejection(lower):
         return _service_rejection_message(lower)
+    if "stopped after" in lower and "repeated attempts" in lower:
+        return (
+            "Portal is stuck right now",
+            "The government portal did not move forward after several safe retries. "
+            "Your details are saved and you can retry.",
+            True,
+        )
     if _is_portal_down(lower):
         return (
             "Government portal is unavailable",

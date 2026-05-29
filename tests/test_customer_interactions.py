@@ -238,6 +238,22 @@ def test_customer_view_maps_browser_session_interruption_to_retryable_failure():
     assert view["retryable"] is True
 
 
+def test_customer_view_maps_max_retry_exit_to_clear_failure():
+    job = _job(JobStatus.FAILED)
+    job.error_message = (
+        "Stopped after 4 repeated attempts on step 'fetch_dl_details'. "
+        "The government portal did not move forward after safe retries."
+    )
+
+    view = customer_job_view(job)
+
+    assert view["phase"] == "failed"
+    assert view["headline"] == "Portal is stuck right now"
+    assert "safe retries" in view["subline"]
+    assert view["action_required"] is False
+    assert view["retryable"] is True
+
+
 def test_customer_view_uses_high_confidence_portal_triage(monkeypatch):
     import api.status_messages as status_messages
 
