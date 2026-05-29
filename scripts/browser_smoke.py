@@ -14,18 +14,60 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
+import re
 import time
+import urllib.request
 from pathlib import Path
 from typing import Any
 
 from playwright.async_api import Page, async_playwright
 
 
-DEFAULT_SECRET = "dev-secret-change-in-prod"
+SECRET_RE = re.compile(r"const\s+SECRET\s*=\s*['\"]([^'\"]+)['\"]")
 
 
 def _short_url(url: str) -> str:
     return url.replace("http://127.0.0.1:8000", "")
+
+
+def _mask_secret(secret: str) -> str:
+    if not secret:
+        return ""
+    if len(secret) <= 4:
+        return "***"
+    return f"{secret[:2]}***{secret[-2:]}"
+
+
+def _extract_ui_secret(text: str) -> str:
+    match = SECRET_RE.search(text)
+    return match.group(1) if match else ""
+
+
+def _detect_secret(base: str) -> tuple[str, str]:
+    """Use the same UI secret that the customer frontend sends to the API."""
+    frontend_path = Path(__file__).resolve().parent.parent / "frontend" / "index.html"
+    if frontend_path.exists():
+        secret = _extract_ui_secret(frontend_path.read_text(encoding="utf-8", errors="ignore"))
+        if secret:
+            return secret, str(frontend_path)
+
+    try:
+        with urllib.request.urlopen(f"{base.rstrip('/')}/", timeout=5) as response:
+            secret = _extract_ui_secret(response.read().decode("utf-8", errors="ignore"))
+        if secret:
+            return secret, f"{base.rstrip('/')}/"
+    except Exception:
+        pass
+
+    secret = os.environ.get("API_SECRET_KEY", "")
+    if secret:
+        return secret, "API_SECRET_KEY"
+
+    raise RuntimeError(
+        "Could not detect API secret. Pass --secret, set API_SECRET_KEY, "
+        "or ensure frontend/index.html defines const SECRET."
+    )
 
 
 async def _layout_issues(page: Page, label: str) -> list[dict[str, Any]]:
@@ -377,11 +419,19 @@ async def run(base: str, secret: str, output_dir: Path) -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base", default="http://127.0.0.1:8000")
-    parser.add_argument("--secret", default=DEFAULT_SECRET)
+    parser.add_argument(
+        "--secret",
+        default="",
+        help="Optional override. Defaults to detecting const SECRET from frontend/index.html.",
+    )
     parser.add_argument("--out", default="data/browser_smoke")
     args = parser.parse_args()
 
-    result = asyncio.run(run(args.base.rstrip("/"), args.secret, Path(args.out)))
+    base = args.base.rstrip("/")
+    secret, secret_source = (args.secret, "cli") if args.secret else _detect_secret(base)
+    result = asyncio.run(run(base, secret, Path(args.out)))
+    result["secret_source"] = secret_source
+    result["secret_masked"] = _mask_secret(secret)
     print(json.dumps(result, indent=2))
     return 0 if result["ok"] else 1
 

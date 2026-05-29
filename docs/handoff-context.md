@@ -2,7 +2,7 @@
 
 Repo: `C:\Users\yashs\OneDrive\Desktop\token26`
 Remote: `https://github.com/test-user98/dl-automation.git`
-Current local checkpoint commit: latest local `HEAD` (`Add browser smoke test and fix UI regressions`)
+Current local checkpoint commit: latest local `HEAD` (`Auto-detect UI secret in browser smoke`)
 Previous checkpoint: `674096e` (deploy pipeline), `fc15a82` (customer onboarding + status layer), `52c2100` (agent hardening)
 
 Do not push without explicit user approval. The user wants local proof before
@@ -543,17 +543,26 @@ UI fixes from this browser pass:
 
 Validated locally:
 
-- `python scripts/browser_smoke.py --base http://127.0.0.1:8000 --secret dev-secret-change-in-prod`
+- `python scripts/browser_smoke.py --base http://127.0.0.1:8000`
   -> `ok: true`
 - Browser smoke observed:
   - console issues: `[]`
   - failed requests: `[]`
   - bad responses: `[]`
   - layout issues: `[]`
+  - secret source: `frontend/index.html` (masked in output; full secret is not printed)
   - acknowledgement screen: `SMOKE-ACK-123`
   - admin rows: `8`
 - `python -m py_compile scripts/browser_smoke.py`
 - `python -m pytest -q` -> 51 passed.
+
+Latest tweak:
+
+- Browser smoke no longer hardcodes the UI/API secret. It detects `const SECRET`
+  from `frontend/index.html`, falls back to the served customer page, then
+  `API_SECRET_KEY`, and only requires `--secret` as an explicit override.
+- Do not write cloud credentials into this doc or the repo. Use local env /
+  GitHub secrets / AWS secrets only.
 
 Screenshots are written to `data/browser_smoke/*.png` during the run and are
 not committed.
