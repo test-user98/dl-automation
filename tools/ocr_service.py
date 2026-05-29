@@ -12,9 +12,8 @@ import structlog
 from pathlib import Path
 from typing import Optional
 
-import anthropic
-
 from config.settings import get_settings
+from agent.llm_client import get_llm_client
 
 log = structlog.get_logger(__name__)
 settings = get_settings()
@@ -22,7 +21,7 @@ settings = get_settings()
 
 class OCRService:
     def __init__(self):
-        self._client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        self._llm = None
 
     async def extract_driving_license(self, image_path: str) -> dict:
         """
@@ -109,28 +108,14 @@ class OCRService:
 
     async def _extract(self, image_path: str, prompt: str, doc_type: str) -> dict:
         try:
-            b64, media_type = self._load_image(image_path)
-
-            response = self._client.messages.create(
-                model=settings.llm_model,
-                max_tokens=1024,
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": media_type,
-                                "data": b64,
-                            },
-                        },
-                        {"type": "text", "text": prompt},
-                    ],
-                }],
+            image_bytes = Path(image_path).read_bytes()
+            llm = self._llm or get_llm_client()
+            self._llm = llm
+            raw = await llm.vision(
+                image_bytes,
+                "You extract structured data from Indian identity documents. Return only valid JSON.",
+                prompt,
             )
-
-            raw = response.content[0].text.strip()
             # Strip markdown code blocks if model wraps JSON in them
             if raw.startswith("```"):
                 raw = raw.split("```")[1]

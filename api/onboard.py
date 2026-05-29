@@ -19,21 +19,17 @@ from pydantic import BaseModel
 from typing import Optional
 from pathlib import Path
 
+from config.settings import get_settings
+from api.deps import state_manager, ocr_service, orchestrator
 from tools.dl_normalizer import DLNormalizer, DL_FORMAT_HINT, DL_LOCATION_HINT
-from tools.ocr_service import OCRService
-from agent.state_manager import StateManager
-from orchestrator import Orchestrator
-from agent.learning_store import LearningStore
-from agent.human_loop import HumanLoop
 
 router = APIRouter(prefix="/onboard", tags=["onboarding"])
+settings = get_settings()
 
 _normalizer    = DLNormalizer()
-_ocr           = OCRService()
-_state_manager = StateManager()
-_learning      = LearningStore()
-_human_loop    = HumanLoop(_state_manager)
-_orchestrator  = Orchestrator(_state_manager, _learning, _human_loop)
+_ocr           = ocr_service
+_state_manager = state_manager
+_orchestrator  = orchestrator
 
 import asyncio
 
@@ -74,17 +70,38 @@ async def extract_dl_image(file: UploadFile = File(...)):
     with open(file_path, "wb") as f:
         f.write(await file.read())
 
-    extracted = await _ocr.extract_driving_license(file_path)
+    extracted = {}
+    for attempt in range(1, settings.ocr_max_attempts + 1):
+        extracted = await _ocr.extract_driving_license(file_path)
+        if extracted.get("dl_number") or extracted.get("dob"):
+            break
 
     # Normalise the DL number if OCR found one
     dl_raw = extracted.get("dl_number", "")
     normalised = _normalizer.normalize(dl_raw) if dl_raw else {"valid": False}
+    missing_fields = [
+        label for label, key in [
+            ("DL number", "dl_number"),
+            ("date of birth", "dob"),
+        ]
+        if not extracted.get(key)
+    ]
+    confidence = 0.95
+    if missing_fields:
+        confidence -= 0.3 * len(missing_fields)
+    if not normalised.get("valid"):
+        confidence -= 0.25
+    confidence = max(0.0, min(0.99, confidence))
+    needs_manual_review = bool(missing_fields) or not normalised.get("valid")
 
     return {
-        "ocr_success":    bool(extracted),
+        "ocr_success":    bool(extracted) and not needs_manual_review,
         "extracted":      extracted,
         "dl_normalised":  normalised,
         "display":        _normalizer.format_for_display(normalised.get("normalized", "")) if normalised.get("valid") else "",
+        "confidence":     round(confidence, 2),
+        "missing_fields": missing_fields,
+        "needs_manual_review": needs_manual_review,
         "message":        "Details extracted from your DL image" if extracted else "Could not read DL — please enter details manually",
     }
 

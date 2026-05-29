@@ -21,21 +21,19 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from config.settings import get_settings
-from agent.state_manager import StateManager, JobStatus
-from agent.learning_store import LearningStore
-from agent.human_loop import HumanLoop
-from tools.ocr_service import OCRService
-from orchestrator import Orchestrator
+from agent.state_manager import JobStatus
+from api.deps import state_manager, learning_store, human_loop, ocr_service, orchestrator
+from api.status_messages import customer_job_view
 
 settings = get_settings()
 app = FastAPI(title="Sarathi Agent API", version="1.0.0")
 
 # Singletons — shared across requests
-_state_manager  = StateManager()
-_learning_store = LearningStore()
-_human_loop     = HumanLoop(_state_manager)
-_ocr            = OCRService()
-_orchestrator   = Orchestrator(_state_manager, _learning_store, _human_loop)
+_state_manager  = state_manager
+_learning_store = learning_store
+_human_loop     = human_loop
+_ocr            = ocr_service
+_orchestrator   = orchestrator
 
 # ── Onboarding router ─────────────────────────────────────────────────────────
 from api.onboard import router as onboard_router
@@ -111,6 +109,7 @@ async def get_job(job_id: str):
         "last_url":           job.last_url,
         "step_logs":          job.step_logs[-5:],  # last 5 logs
         "updated_at":         job.updated_at,
+        "customer_view":      customer_job_view(job),
     }
 
 
@@ -119,10 +118,12 @@ async def submit_otp(job_id: str, body: OTPSubmission):
     job = await _state_manager.load(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    if job.status != JobStatus.WAITING_OTP:
+    if job.status not in {JobStatus.WAITING_OTP, JobStatus.STUCK_HUMAN_NEEDED}:
         raise HTTPException(status_code=400, detail=f"Job is not waiting for OTP (status={job.status.value})")
 
-    await _state_manager.store_otp(job_id, body.otp.strip())
+    otp = body.otp.strip()
+    await _state_manager.store_otp(job_id, otp)
+    await _human_loop.submit_response(job_id, otp)
     return {"message": "OTP received, agent resuming"}
 
 
@@ -168,6 +169,7 @@ async def stream_job_status(job_id: str):
                     "otp_pending_type":   job.otp_pending_type,
                     "last_step":          job.steps_completed[-1] if job.steps_completed else "",
                     "error":              job.error_message,
+                    "customer_view":      customer_job_view(job),
                 }
                 yield f"data: {json.dumps(payload)}\n\n"
 
