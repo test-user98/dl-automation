@@ -78,6 +78,22 @@ End-to-end loop:
 - Customer replies -> agent resumes and continues.
 - Errors are mapped to customer-safe language (`api/status_messages.py`).
 
+## OCR/ICR + document intelligence
+- OCR reads DL data (number, DOB, name, etc.) from uploaded document images.
+- The agent validates and normalizes extracted values before portal usage.
+- If extraction quality is low or fields are missing, customer can correct values in UI.
+- Designed to support stronger ICR/OCR classifiers and confidence-gated acceptance.
+
+## OTP intelligence (Aadhaar + mobile)
+- Supports both **Aadhaar OTP** flow and **phone OTP** flow.
+- Backend uses explicit action states (`WAITING_OTP`, `STUCK_HUMAN_NEEDED`) so UI asks at the right time.
+- Wrong/expired OTP handling is mapped into clear customer prompts with resend/retry path.
+
+## CAPTCHA intelligence + human fallback
+- Agent attempts automatic captcha solving with retry strategy.
+- On repeated failure, customer UI receives captcha image and asks manual entry (human-in-loop).
+- Customer answer is fed back instantly and agent resumes from the same flow.
+
 ## Two portals
 - **Customer portal**: start application, OTP/captcha inputs, live tracking.
 - **RTO operator portal** (`/admin`): search customers/apps, update status, add notes, view documents/events.
@@ -94,11 +110,25 @@ End-to-end loop:
 - Expand service packs beyond DL renewal via configurable flow/rule modules.
 
 ## Local run
+Install dependencies:
+```powershell
+cd C:\Users\yashs\OneDrive\Desktop\token26
+pip install -r requirements.txt
+playwright install chromium
+```
+
+Run API + UI:
 ```powershell
 cd C:\Users\yashs\OneDrive\Desktop\token26
 uvicorn api.server:app --host 127.0.0.1 --port 8001 --reload
 ```
 Open: [http://127.0.0.1:8001](http://127.0.0.1:8001)
+
+Run direct backend-agent test:
+```powershell
+cd C:\Users\yashs\OneDrive\Desktop\token26
+python -X utf8 run_agent.py
+```
 
 ## Submitted by
 - Jai Sipani
