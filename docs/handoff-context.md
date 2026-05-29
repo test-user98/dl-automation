@@ -1187,3 +1187,33 @@ Still not proven by this slice:
 - A fresh real Sarathi OTP validation after these local-browser changes. The
   local browser can now launch; next validation should run the real customer UI
   flow and watch `/jobs/{id}` plus server logs.
+
+## OTP loop and stale-prompt guard (local commit)
+
+Live issue observed in logs:
+
+- After OTP submit, agent continued correctly (`brain.otp_verified_page_changed`)
+  and moved to service selection.
+- UI still showed OTP repeatedly in some runs, and `/jobs/{id}/otp` could still
+  be posted while the job was already waiting for a different human prompt
+  (service selection), causing confusing loop/back-jump behavior.
+
+Fixes:
+
+- `api/server.py`:
+  - `/jobs/{job_id}/otp` now rejects OTP when job is `STUCK_HUMAN_NEEDED` for a
+    non-OTP action (`action_type != otp`) with `409` and a clear message.
+  - Keeps accepting OTP only when status is genuinely OTP-related.
+- `frontend/index.html`:
+  - Added `otpSubmitInFlight` lock in `submitOTP()` to prevent duplicate posts.
+  - Shows "Verifying OTP..." subtext immediately after submit.
+  - Handles `409` detail from backend and surfaces that exact message to user.
+  - Keeps existing success path (`show('screen-4') + startPolling()`).
+
+Validation:
+
+- Live API check using a forced `service_selection` pending request:
+  - `POST /jobs/{id}/otp` -> `409`
+  - body: `Job currently needs 'service_selection', not OTP. Please answer the current prompt.`
+- `pytest tests/test_customer_interactions.py -q` -> `12 passed`
+- Server restarted cleanly with latest code (`Started server process [18572]`).

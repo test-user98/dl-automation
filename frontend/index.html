@@ -671,6 +671,7 @@ let dlImageUploaded = false;
 let extractedSnapshot = {};
 let dlImagePath = '';
 let ocrConfidence = 0;
+let otpSubmitInFlight = false; // prevent duplicate OTP submits while backend is processing
 let activityItems = [];
 let lastActivityKey = '';
 const PHASE_ORDER = ['connecting', 'filling', 'waiting', 'submitting'];
@@ -930,6 +931,15 @@ async function startJob() {
       focusFirstError();
     }
     return;
+  }
+  if (!manualStateCode) {
+    const sel = document.getElementById('state-edit-select');
+    // If the dropdown already has a valid selection (e.g. suggested state was
+    // prefilled), accept it as confirmation even when onchange didn't fire.
+    if (sel && sel.value) {
+      manualStateCode = sel.value;
+      renderReview();
+    }
   }
   if (!manualStateCode) {
     setScreenBanner('step3-banner', 'Please confirm the state where you want us to file this application.');
@@ -1410,17 +1420,42 @@ function distributeOTP(digits) {
 }
 
 async function submitOTP() {
+  if (otpSubmitInFlight) return;
   const otp = Array.from(document.querySelectorAll('#otp-row input')).map(x => x.value).join('');
   if (otp.length !== 6) return alert('Please enter all 6 digits.');
   const btn = document.getElementById('otp-btn');
+  otpSubmitInFlight = true;
   btn.disabled = true; btn.textContent = 'Submitting…';
-  const res = await fetch(`${API}/jobs/${currentJobId}/otp`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Secret': SECRET },
-    body: JSON.stringify({ otp }),
-  });
+  const otpSub = document.getElementById('otp-sub');
+  if (otpSub) otpSub.textContent = 'Verifying OTP on the government portal. Please wait...';
+  let res = null;
+  try {
+    res = await fetch(`${API}/jobs/${currentJobId}/otp`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Secret': SECRET },
+      body: JSON.stringify({ otp }),
+    });
+  } catch (_) {
+    otpSubmitInFlight = false;
+    btn.disabled = false; btn.textContent = 'Submit OTP';
+    alert("We couldn't submit the OTP — please try again.");
+    return;
+  }
+  otpSubmitInFlight = false;
   btn.disabled = false; btn.textContent = 'Submit OTP';
-  if (!res.ok) return alert("We couldn't submit the OTP — please try again.");
+  if (!res.ok) {
+    let detail = '';
+    try {
+      const payload = await res.json();
+      detail = payload?.detail || '';
+    } catch (_) {}
+    if (res.status === 409 && detail) {
+      alert(detail);
+    } else {
+      alert("We couldn't submit the OTP — please try again.");
+    }
+    return;
+  }
   show('screen-4');
   startPolling();
 }

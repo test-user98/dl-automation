@@ -185,6 +185,26 @@ async def submit_otp(job_id: str, body: OTPSubmission):
     if job.status not in {JobStatus.WAITING_OTP, JobStatus.STUCK_HUMAN_NEEDED}:
         raise HTTPException(status_code=400, detail=f"Job is not waiting for OTP (status={job.status.value})")
 
+    # Guardrail: STUCK_HUMAN_NEEDED is used for multiple customer prompts
+    # (service selection, confirmations, captcha, etc.). Accept OTP only when
+    # the pending request is genuinely OTP-related.
+    if job.status == JobStatus.STUCK_HUMAN_NEEDED:
+        pending = job.customer_data.get("_pending_customer_request") or {}
+        action_type = str((pending or {}).get("action_type", "")).strip().lower()
+        question_blob = " ".join(
+            str((pending or {}).get(k, "")) for k in ("step_name", "question", "context")
+        ).lower()
+        if action_type and action_type != "otp":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Job currently needs '{action_type}', not OTP. Please answer the current prompt.",
+            )
+        if action_type != "otp" and "otp" not in question_blob:
+            raise HTTPException(
+                status_code=409,
+                detail="Job is waiting for a different customer input, not OTP.",
+            )
+
     otp = body.otp.strip()
     await _state_manager.store_otp(job_id, otp)
     await _human_loop.submit_response(job_id, otp)
