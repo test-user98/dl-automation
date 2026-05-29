@@ -206,11 +206,21 @@
       margin-top: 16px;
     }
     .ph {
-      padding: 8px 8px; border-radius: 8px; font-size: 12px; font-weight: 600;
+      padding: 10px 8px; border-radius: 10px; font-size: 12px; font-weight: 600;
       background: #f3f5fa; color: var(--muted); text-align: center;
       border: 1px solid var(--line);
+      transition: background 0.25s ease, color 0.25s ease, border-color 0.25s ease, transform 0.25s ease, box-shadow 0.25s ease;
     }
-    .ph.on   { background: #e6f0ff; color: var(--primary); border-color: #c4dafd; box-shadow: inset 0 0 0 1px rgba(14, 98, 216, .08); }
+    .ph.on   {
+      /* The active phase pops with a saturated blue gradient + lift so the
+         customer's eye lands here first. Inactive phases stay pale. */
+      background: linear-gradient(135deg, #2b6cff 0%, #4f87ff 100%);
+      color: #fff;
+      border-color: transparent;
+      box-shadow: 0 4px 14px rgba(14, 98, 216, .28), inset 0 0 0 1px rgba(255, 255, 255, .35);
+      transform: translateY(-1px);
+    }
+    .ph.on small { color: #fff; opacity: 0.92; }
     .ph.done { background: var(--success-bg); color: var(--success); border-color: #b8e1c5; }
     .ph.warn { background: var(--warn-bg); color: var(--warn); border-color: #ead49a; }
     .ph.err  { background: var(--err-bg); color: var(--err); border-color: #f1b0b0; }
@@ -248,14 +258,51 @@
     .agent-focus-title { font-size: 13px; font-weight: 700; color: var(--ink); }
     .agent-focus-sub { margin-top: 2px; font-size: 12px; color: var(--muted); line-height: 1.35; }
     .agent-chip {
+      display: inline-flex; align-items: center; gap: 6px;
       border: 1px solid var(--line);
       border-radius: 999px;
-      padding: 4px 8px;
+      padding: 5px 10px 5px 8px;
       font-size: 11px;
       font-weight: 700;
+      letter-spacing: .04em;
       color: var(--ink-2);
       background: #fff;
       white-space: nowrap;
+    }
+    /* LIVE state — pulsing red dot + red text so the customer feels the
+       activity. Other states fall back to the muted chip. */
+    .agent-chip.live {
+      color: #d63b3b;
+      border-color: rgba(214, 59, 59, .35);
+      background: #fff5f5;
+      box-shadow: 0 0 0 3px rgba(214, 59, 59, .07);
+    }
+    .agent-chip.live::before {
+      content: '';
+      width: 8px; height: 8px; border-radius: 999px;
+      background: #d63b3b;
+      box-shadow: 0 0 0 0 rgba(214, 59, 59, .55);
+      animation: liveDot 1.4s ease-out infinite;
+    }
+    @keyframes liveDot {
+      0%   { box-shadow: 0 0 0 0   rgba(214, 59, 59, .55); }
+      60%  { box-shadow: 0 0 0 7px rgba(214, 59, 59, 0);   }
+      100% { box-shadow: 0 0 0 0   rgba(214, 59, 59, 0);   }
+    }
+    .agent-chip.action {
+      color: var(--warn);
+      border-color: rgba(122, 83, 0, .25);
+      background: var(--warn-bg);
+    }
+    .agent-chip.done {
+      color: var(--success);
+      border-color: #b8e1c5;
+      background: var(--success-bg);
+    }
+    .agent-chip.err {
+      color: var(--err);
+      border-color: #f1b0b0;
+      background: var(--err-bg);
     }
     .activity-list { display: grid; gap: 0; }
     .activity-item {
@@ -934,6 +981,11 @@ function inlineAlert(msg) {
 }
 
 // ─── Step 4: live polling ──────────────────────────────────────────────────
+// SSE is the primary channel because it pushes state changes within ~2s, but
+// it can die silently (mobile networks, proxies, tab backgrounded) — so we
+// ALSO run a polling timer every 4s as a backup. If SSE is healthy, polling
+// just re-applies the same state harmlessly. If SSE is dead, polling still
+// surfaces OTP/captcha/human requests within at most 4s. Belt and suspenders.
 function startPolling() {
   stopLiveUpdates();
   if (window.EventSource && currentJobId) {
@@ -947,13 +999,15 @@ function startPolling() {
       }
     };
     liveStream.onerror = () => {
+      // SSE failed; polling backup is already running so we just close the
+      // dead stream and let polling carry the load. We don't try to reopen
+      // because EventSource auto-reconnects on its own.
       if (liveStream) liveStream.close();
       liveStream = null;
-      if (!pollTimer) pollTimer = setInterval(poll, 2500);
     };
-  } else {
-    pollTimer = setInterval(poll, 2500);
   }
+  // Polling runs in parallel with SSE — never depends on SSE health.
+  pollTimer = setInterval(poll, 4000);
   poll();
 }
 
@@ -991,8 +1045,12 @@ function applyJob(r) {
   } catch (_) {}
   setLive(v, r);
 
+  // For OTP / captcha / human-needed branches we DELIBERATELY do not call
+  // stopLiveUpdates() — keeping polling alive guarantees that if the customer
+  // is on the wrong screen for any reason (slow swap, cached payload), the
+  // next poll cycle re-applies state. The show* functions guard against
+  // wiping user input on re-entry.
   if (v.action_type === 'otp' || r.status === 'WAITING_OTP') {
-    stopLiveUpdates();
     addActivity({
       phase: 'waiting',
       title: 'OTP needed',
@@ -1002,7 +1060,6 @@ function applyJob(r) {
     showOTP(v);
     console.log('[applyJob] -> showOTP() called');
   } else if (v.action_type === 'captcha') {
-    stopLiveUpdates();
     addActivity({
       phase: 'waiting',
       title: 'Security code needed',
@@ -1012,7 +1069,6 @@ function applyJob(r) {
     showCaptcha(v);
     console.log('[applyJob] -> showCaptcha() called');
   } else if ((v.action_required && v.action_type !== 'otp') || r.status === 'STUCK_HUMAN_NEEDED') {
-    stopLiveUpdates();
     addActivity({
       phase: 'waiting',
       title: v.headline || 'Your input is needed',
@@ -1126,15 +1182,26 @@ function updateAgentFocus(v) {
 
   title.textContent = v.last_step_label || v.headline || 'Working on your application';
   sub.textContent = v.subline || v.message || 'The agent is making progress in the government portal.';
-  chip.textContent = phase === 'waiting'
-    ? 'Needs you'
-    : phase === 'retrying'
-      ? 'Retrying'
-      : phase === 'done'
-        ? 'Done'
-        : phase === 'failed'
-          ? 'Stopped'
-          : 'Live';
+
+  // Reset chip styling then set the right variant — the LIVE variant has a
+  // pulsing red dot via .agent-chip.live::before in CSS.
+  chip.className = 'agent-chip';
+  if (phase === 'waiting') {
+    chip.textContent = 'Needs you';
+    chip.classList.add('action');
+  } else if (phase === 'retrying') {
+    chip.textContent = 'Retrying';
+    chip.classList.add('action');
+  } else if (phase === 'done') {
+    chip.textContent = 'Done';
+    chip.classList.add('done');
+  } else if (phase === 'failed') {
+    chip.textContent = 'Stopped';
+    chip.classList.add('err');
+  } else {
+    chip.textContent = 'LIVE';
+    chip.classList.add('live');
+  }
 }
 
 function resetActivity() {
@@ -1243,12 +1310,18 @@ function formatShortTime(iso) {
 
 // ─── OTP screen ────────────────────────────────────────────────────────────
 function showOTP(v) {
+  const screen = document.getElementById('screen-otp');
+  const alreadyOnScreen = screen && !screen.classList.contains('hidden');
   document.getElementById('otp-sub').textContent = v.subline
     || 'Enter the OTP the government portal sent to your phone.';
   show('screen-otp');
   wireOTPInputs();
-  const first = document.querySelector('#otp-row input');
-  if (first) { first.value = ''; first.focus(); }
+  // Only clear + focus on FIRST entry. If polling re-fires while the customer
+  // is typing, we must not wipe their input or steal focus.
+  if (!alreadyOnScreen) {
+    const first = document.querySelector('#otp-row input');
+    if (first) { first.value = ''; first.focus(); }
+  }
 }
 
 function wireOTPInputs() {
@@ -1402,12 +1475,17 @@ function show(id) {
 
 // ─── CAPTCHA help screen ──────────────────────────────────────────────────
 function showCaptcha(v) {
+  const screen = document.getElementById('screen-captcha');
+  const alreadyOnScreen = screen && !screen.classList.contains('hidden');
   const req = v.customer_request || {};
   const sub = v.subline || req.context || 'The portal showed a verification code we couldn\'t read clearly.';
   document.getElementById('captcha-sub').textContent = sub;
   const img = document.getElementById('captcha-image');
   if (req.image_b64) {
-    img.src = `data:image/png;base64,${req.image_b64}`;
+    const newSrc = `data:image/png;base64,${req.image_b64}`;
+    // Only swap the src if it changed (a refreshed captcha) — avoids reload
+    // flicker on every poll.
+    if (img.src !== newSrc) img.src = newSrc;
     img.classList.remove('hidden');
   } else {
     img.removeAttribute('src');
@@ -1415,11 +1493,15 @@ function showCaptcha(v) {
   }
   show('screen-captcha');
   const input = document.getElementById('captcha-answer');
-  input.value = '';
-  clearFieldError('captcha-answer');
-  setTimeout(() => input.focus(), 50);
-  const btn = document.getElementById('captcha-btn');
-  btn.disabled = false; btn.textContent = 'Submit code';
+  // Only clear + focus + reset button on FIRST entry. Don't wipe customer
+  // input or steal focus while they're typing on a re-poll.
+  if (!alreadyOnScreen) {
+    input.value = '';
+    clearFieldError('captcha-answer');
+    setTimeout(() => input.focus(), 50);
+    const btn = document.getElementById('captcha-btn');
+    btn.disabled = false; btn.textContent = 'Submit code';
+  }
 }
 
 async function submitCaptcha() {

@@ -78,16 +78,26 @@ _frontend_dir = Path(__file__).parent.parent / "frontend"
 if _frontend_dir.exists():
     app.mount("/static", StaticFiles(directory=str(_frontend_dir)), name="static")
 
+# Disable HTML caching so a deploy reaches every open customer tab on next
+# reload — frontend JS lives inline in these files, and a stale cached copy
+# would silently miss OTP/captcha screen renders.
+_NO_CACHE_HEADERS = {
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+    "Pragma": "no-cache",
+    "Expires": "0",
+}
+
+
 @app.get("/", include_in_schema=False)
 async def serve_ui():
-    return FileResponse(str(_frontend_dir / "index.html"))
+    return FileResponse(str(_frontend_dir / "index.html"), headers=_NO_CACHE_HEADERS)
 
 
 @app.get("/admin", include_in_schema=False)
 async def serve_admin_ui():
     """RTO operator dashboard. The HTML itself is public — every data fetch
     inside it requires the X-Admin-Secret header, so showing the shell is fine."""
-    return FileResponse(str(_frontend_dir / "admin.html"))
+    return FileResponse(str(_frontend_dir / "admin.html"), headers=_NO_CACHE_HEADERS)
 
 
 # Tiny transparent PNG so browsers stop logging 404 on every page load.
