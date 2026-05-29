@@ -566,3 +566,38 @@ Latest tweak:
 
 Screenshots are written to `data/browser_smoke/*.png` during the run and are
 not committed.
+
+## Latest Deploy Verification
+
+GitHub Actions run for commit `6917a19`
+(`Auto-detect UI secret in browser smoke`) started correctly and passed:
+
+- checkout
+- AWS credential configuration
+- ECR repository lookup/create
+- ECR login
+- Docker build and push
+- App Runner ECR-access role
+
+It failed in `Deploy to App Runner (create or update)` with exit code `254`.
+Public GitHub logs do not expose the underlying AWS exception without signing
+in, but runs #5, #6, and #7 failed in the same deploy step while run #4 was the
+last successful deploy. The likely failure class is App Runner rejecting a
+service update/deployment operation while the service is not yet `RUNNING` or
+while another operation is in progress.
+
+Workflow hardening added after this failure:
+
+- serialized deploys with a `concurrency` group per branch;
+- wait for App Runner service `RUNNING` before `update-service`;
+- retry `update-service` only for operation-in-progress/conflict errors;
+- wait after `update-service` before `start-deployment`;
+- treat `start-deployment` rejection as acceptable only if the service returns
+  to `RUNNING`;
+- omit optional blank `ANTHROPIC_API_KEY` from App Runner env vars;
+- explicitly fail with a clear message if required GitHub secrets
+  `OPENAI_API_KEY` or `API_SECRET_KEY` are empty.
+
+Validated locally before pushing this workflow fix:
+
+- `python -c "import yaml; yaml.safe_load(open('.github/workflows/deploy.yml', encoding='utf-8')); print('workflow yaml ok')"`

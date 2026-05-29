@@ -5,6 +5,10 @@ on:
     branches: [main]
   workflow_dispatch: {}
 
+concurrency:
+  group: apprunner-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   AWS_REGION:        ap-south-1
   ECR_REPOSITORY:    sarathi-agent
@@ -102,6 +106,50 @@ jobs:
           set -e
           SERVICE_NAME="$APP_RUNNER_SERVICE"
 
+          wait_for_service_running() {
+            local service_arn="$1"
+            local label="$2"
+            for i in $(seq 1 45); do
+              st=$(aws apprunner describe-service \
+                --region "$AWS_REGION" --service-arn "$service_arn" \
+                --query 'Service.Status' --output text)
+              echo "  $label status=$st (try $i)"
+              [ "$st" = "RUNNING" ] && return 0
+              sleep 10
+            done
+            echo "::error::App Runner service did not become RUNNING while $label"
+            return 1
+          }
+
+          update_service_with_retry() {
+            local service_arn="$1"
+            local source_cfg="$2"
+            local err_file
+            err_file="$(mktemp)"
+            for i in $(seq 1 6); do
+              echo "  update-service attempt $i"
+              if aws apprunner update-service \
+                  --region "$AWS_REGION" \
+                  --service-arn "$service_arn" \
+                  --source-configuration "$source_cfg" 2>"$err_file"; then
+                rm -f "$err_file"
+                return 0
+              fi
+              err="$(cat "$err_file")"
+              echo "$err"
+              if echo "$err" | grep -Eiq 'operation.*progress|OperationInProgress|ConflictException|currently.*deploy'; then
+                echo "  App Runner operation still in progress; waiting before retry."
+                wait_for_service_running "$service_arn" "before retrying update-service"
+                continue
+              fi
+              rm -f "$err_file"
+              return 1
+            done
+            rm -f "$err_file"
+            echo "::error::update-service failed after retries"
+            return 1
+          }
+
           SERVICE_ARN=$(aws apprunner list-services \
             --region "$AWS_REGION" \
             --query "ServiceSummaryList[?ServiceName=='$SERVICE_NAME'].ServiceArn | [0]" \
@@ -113,9 +161,11 @@ jobs:
             --arg secret "$API_SECRET_KEY" \
             --arg admin "$ADMIN_SECRET" \
             --arg sha "${{ github.sha }}" \
-            '{
+            '
+            if $openai == "" then error("OPENAI_API_KEY GitHub secret is empty") else . end |
+            if $secret == "" then error("API_SECRET_KEY GitHub secret is empty") else . end |
+            {
               OPENAI_API_KEY:     $openai,
-              ANTHROPIC_API_KEY:  $anthropic,
               API_SECRET_KEY:     $secret,
               ADMIN_SECRET:       ($admin | if . == "" then $secret else . end),
               GIT_COMMIT_SHA:     $sha,
@@ -124,7 +174,9 @@ jobs:
               STATE_BACKEND:      "sqlite",
               LLM_PRIMARY:        "openai",
               LLM_FALLBACK:       ($anthropic | if . == "" then "openai" else "anthropic" end)
-            }')
+            }
+            + (if $anthropic == "" then {} else {ANTHROPIC_API_KEY: $anthropic} end)
+            ')
           # Note: CAPTCHA_PROVIDER stays at the Settings default ("claude").
           # With no Anthropic key, captcha_solver._build_llm_chain naturally
           # falls back to gpt4v-only, so we are still OpenAI-only without
@@ -157,6 +209,7 @@ jobs:
               --tags Key=Owner,Value="$RESOURCE_OWNER"
           else
             echo "Updating App Runner service $SERVICE_ARN"
+            wait_for_service_running "$SERVICE_ARN" "before update-service"
             SOURCE_CFG=$(jq -nc \
               --arg image "$IMAGE_URI" \
               --arg role  "$ACCESS_ROLE_ARN" \
@@ -173,29 +226,19 @@ jobs:
                 AutoDeploymentsEnabled: true,
                 AuthenticationConfiguration: { AccessRoleArn: $role }
               }')
-            # update-service must succeed AND propagate the new env vars.
-            # The previous version silenced errors with `>/dev/null` and
-            # `|| true` — that hid a real failure once. Run loudly now.
-            aws apprunner update-service \
-              --region "$AWS_REGION" \
-              --service-arn "$SERVICE_ARN" \
-              --source-configuration "$SOURCE_CFG"
+            update_service_with_retry "$SERVICE_ARN" "$SOURCE_CFG"
             # update-service returns immediately while the service rolls.
             # Wait for it to leave OPERATION_IN_PROGRESS before we trigger
             # a deployment, otherwise start-deployment races and may use
             # stale env vars.
-            for i in $(seq 1 30); do
-              st=$(aws apprunner describe-service \
-                --region "$AWS_REGION" --service-arn "$SERVICE_ARN" \
-                --query 'Service.Status' --output text)
-              echo "  describe-service status=$st (try $i)"
-              [ "$st" = "RUNNING" ] && break
-              sleep 10
-            done
+            wait_for_service_running "$SERVICE_ARN" "after update-service"
             # Force a fresh pull of :latest to guarantee the new image is
             # served (auto-deploy only fires on digest change, not sha tag).
-            aws apprunner start-deployment \
-              --region "$AWS_REGION" --service-arn "$SERVICE_ARN"
+            if ! aws apprunner start-deployment \
+                --region "$AWS_REGION" --service-arn "$SERVICE_ARN"; then
+              echo "start-deployment was rejected; checking whether update-service already started the rollout."
+              wait_for_service_running "$SERVICE_ARN" "after start-deployment rejection"
+            fi
           fi
 
           # Resolve the live URL for the summary
