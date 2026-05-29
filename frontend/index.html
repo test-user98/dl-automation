@@ -1655,8 +1655,27 @@ async function submitHumanResponse() {
 // ─── helpers ───────────────────────────────────────────────────────────────
 function showHumanRequest(v) {
   const req = v.customer_request || {};
-  const title = v.headline || (req.action_type === 'service_selection' ? 'Choose a DL service' : 'We need one detail');
-  const question = req.question || v.subline || 'Please confirm one detail so we can continue.';
+  const options = Array.isArray(req.options) ? req.options : [];
+  const fieldLabel = humanFieldLabel(req.field_key || '');
+  const hasConcretePrompt = Boolean(
+    (req.question || '').trim() ||
+    (req.context || '').trim() ||
+    fieldLabel ||
+    options.length
+  );
+  if (!hasConcretePrompt) {
+    show('screen-4');
+    const banner = document.getElementById('live-banner');
+    if (banner) {
+      banner.className = 'banner warn';
+      banner.classList.remove('hidden');
+      banner.textContent = v.subline || 'The agent is checking what the portal needs. You do not need to type anything yet.';
+    }
+    return;
+  }
+
+  const title = v.headline || (fieldLabel ? `Confirm your ${fieldLabel}` : (req.action_type === 'service_selection' ? 'Choose a DL service' : 'We need your input'));
+  const question = req.question || (fieldLabel ? `Please enter your ${fieldLabel}.` : req.context || 'Please answer the question below so we can continue.');
   document.getElementById('human-title').textContent = title;
   document.getElementById('human-sub').textContent = question;
   document.getElementById('human-answer').value = '';
@@ -1667,7 +1686,6 @@ function showHumanRequest(v) {
   contextBox.classList.toggle('hidden', !context);
 
   const optionsBox = document.getElementById('human-options');
-  const options = Array.isArray(req.options) ? req.options : [];
   optionsBox.innerHTML = '';
   optionsBox.classList.toggle('hidden', options.length === 0);
   options.forEach((opt) => {
@@ -1680,6 +1698,21 @@ function showHumanRequest(v) {
 
   show('screen-human');
   if (!options.length) document.getElementById('human-answer').focus();
+}
+
+function humanFieldLabel(fieldKey) {
+  const key = String(fieldKey || '').trim().toLowerCase();
+  const labels = {
+    dl_number: 'DL number',
+    dob: 'date of birth',
+    pin_code: 'PIN code',
+    mobile_number: 'mobile number',
+    email: 'email address',
+    address: 'address',
+    state_code: 'state',
+    rto_code: 'RTO',
+  };
+  return labels[key] || (key ? key.replace(/_/g, ' ') : '');
 }
 
 resendOTP = function() {

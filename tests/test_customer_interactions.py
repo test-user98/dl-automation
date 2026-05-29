@@ -54,6 +54,37 @@ def test_customer_view_exposes_text_question():
     assert view["customer_request"]["question"] == "Why do you want to change the DOB?"
 
 
+def test_customer_view_exposes_field_key_when_agent_needs_specific_detail():
+    job = _job(JobStatus.STUCK_HUMAN_NEEDED)
+    job.customer_data["_pending_customer_request"] = {
+        "step_name": "fill_personal_details",
+        "question": "",
+        "context": "",
+        "options": [],
+        "action_type": "text",
+        "field_key": "pin_code",
+    }
+
+    view = customer_job_view(job)
+
+    assert view["action_required"] is True
+    assert view["headline"] == "Confirm your PIN code"
+    assert view["subline"] == "Please enter your PIN code so we can continue."
+    assert view["customer_request"]["field_key"] == "pin_code"
+
+
+def test_customer_view_does_not_ask_generic_question_without_pending_request():
+    job = _job(JobStatus.STUCK_HUMAN_NEEDED)
+
+    view = customer_job_view(job)
+
+    assert view["action_required"] is False
+    assert view["action_type"] == ""
+    assert view["customer_request"] == {}
+    assert view["headline"] == "Checking portal requirement"
+    assert "Please confirm one detail" not in view["subline"]
+
+
 def test_customer_view_exposes_confirmation_request():
     job = _job(JobStatus.STUCK_HUMAN_NEEDED)
     job.customer_data["_pending_customer_request"] = {
@@ -230,6 +261,29 @@ def test_customer_view_uses_high_confidence_portal_triage(monkeypatch):
     assert "portal did not accept" in view["subline"].lower()
     assert view["portal_triage"]["issue_type"] == "validation_rejected"
     assert "raw technical" not in view["subline"]
+
+
+def test_customer_view_maps_security_code_triage_without_generic_detail_copy(monkeypatch):
+    import api.status_messages as status_messages
+
+    monkeypatch.setattr(status_messages.settings, "portal_triage_mode", "assist")
+    monkeypatch.setattr(status_messages.settings, "portal_triage_min_confidence", 0.70)
+    job = _job(JobStatus.AGENT_RUNNING)
+    job.customer_data["portal_triage"] = {
+        "issue_type": "missing_customer_data",
+        "confidence": 0.91,
+        "recommended_next_action": "solve_captcha",
+        "field_key": "",
+        "evidence": ["Captcha field is empty", "Terms checkbox is unchecked"],
+        "at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    view = customer_job_view(job)
+
+    assert view["action_required"] is False
+    assert view["headline"] == "Working through the portal verification"
+    assert "one detail" not in view["headline"].lower()
+    assert "additional detail" not in view["subline"].lower()
 
 
 def test_customer_view_ignores_low_confidence_portal_triage(monkeypatch):

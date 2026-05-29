@@ -80,6 +80,7 @@ class HumanLoop:
         screenshot: Optional[bytes] = None,
         options: list[str] = None,
         timeout_seconds: Optional[int] = None,
+        field_key: str = "",
     ) -> HumanResponse:
         """
         Block until the human responds or the timeout expires.
@@ -124,6 +125,7 @@ class HumanLoop:
             "context": context,
             "options": options or [],
             "action_type": action_type,
+            "field_key": field_key or "",
         }
         # Surface the visible artifact (CAPTCHA image, screenshot) so the
         # customer UI can render it. We only embed for captcha today because

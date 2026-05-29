@@ -210,11 +210,14 @@ def customer_job_view(job: Job) -> dict:
 
     elif job.status == JobStatus.STUCK_HUMAN_NEEDED:
         phase = PHASE_WAITING
-        action_required = not pending_answered
-        action_type = (
-            pending_request.get("action_type")
-            or ("otp" if _otp_in_question(pending_request, lower) else "human_response")
-        )
+        has_customer_prompt = _has_customer_prompt(pending_request)
+        action_required = bool(has_customer_prompt and not pending_answered)
+        action_type = ""
+        if has_customer_prompt:
+            action_type = (
+                pending_request.get("action_type")
+                or ("otp" if _otp_in_question(pending_request, lower) else "human_response")
+            )
         if action_type == "otp":
             title, message = _otp_message(lower, mobile_suffix)
             step_label = "Waiting for the OTP"
@@ -225,19 +228,24 @@ def customer_job_view(job: Job) -> dict:
                 or "Type the characters shown in the image so we can continue."
             )
             step_label = "Help with security code"
-        elif pending_request:
+        elif has_customer_prompt:
             title = _title_for_customer_request(pending_request)
             message = (
                 pending_request.get("question")
                 or pending_request.get("context")
-                or "Please confirm one detail so we can continue."
+                or _field_question(pending_request.get("field_key", ""))
             )
             step_label = title
         else:
-            title = "We need one detail"
-            message = _human_message(lower) or "Please confirm one detail so we can continue."
+            title = "Checking portal requirement"
+            message = _human_message(lower) or (
+                "The portal paused on a step that needs review. "
+                "You do not need to type anything yet."
+            )
             step_label = title
-        severity = "action"
+            action_required = False
+            action_type = ""
+        severity = "action" if action_required else "info"
 
     elif job.status in {JobStatus.SUBMITTED, JobStatus.COMPLETED}:
         phase = PHASE_DONE
@@ -375,6 +383,14 @@ def _fresh_portal_triage(job: Job) -> dict:
 
 def _triage_status_overlay(triage: dict) -> dict:
     issue_type = (triage.get("issue_type") or "unknown").strip().lower()
+    recommended = (triage.get("recommended_next_action") or "").strip().lower()
+    evidence_blob = " ".join(
+        str(item or "") for item in (triage.get("evidence") or [])
+    ).lower()
+    if issue_type == "missing_customer_data" and (
+        "captcha" in recommended or "captcha" in evidence_blob
+    ):
+        issue_type = "captcha_required"
     templates = {
         "portal_slow": {
             "phase": PHASE_RETRYING,
@@ -489,6 +505,9 @@ def _human_message(lower: str) -> str:
 def _title_for_customer_request(request: dict) -> str:
     action_type = request.get("action_type", "")
     step_name = request.get("step_name", "")
+    field_label = _friendly_field_label(request.get("field_key", ""))
+    if field_label:
+        return f"Confirm your {field_label}"
     if action_type == "service_selection" or step_name == "service_selection":
         return "Choose a DL service"
     if action_type == "confirmation":
@@ -501,6 +520,8 @@ def _title_for_customer_request(request: dict) -> str:
 def _customer_request_payload(request: dict, action_required: bool) -> dict:
     if not request or not action_required:
         return {}
+    if not _has_customer_prompt(request):
+        return {}
     options = request.get("options") or []
     payload = {
         "step_name": request.get("step_name", ""),
@@ -508,12 +529,46 @@ def _customer_request_payload(request: dict, action_required: bool) -> dict:
         "context": request.get("context", ""),
         "options": options if isinstance(options, list) else [],
         "action_type": request.get("action_type", "human_response"),
+        "field_key": request.get("field_key", ""),
     }
     # CAPTCHA — frontend renders the embedded image so the customer can read it.
     image_b64 = request.get("image_b64")
     if image_b64:
         payload["image_b64"] = image_b64
     return payload
+
+
+def _has_customer_prompt(request: dict) -> bool:
+    if not isinstance(request, dict) or not request:
+        return False
+    options = request.get("options") or []
+    return bool(
+        str(request.get("question", "")).strip()
+        or str(request.get("context", "")).strip()
+        or str(request.get("field_key", "")).strip()
+        or request.get("image_b64")
+        or (isinstance(options, list) and options)
+    )
+
+
+def _friendly_field_label(field_key: str) -> str:
+    key = str(field_key or "").strip().lower()
+    labels = {
+        "dl_number": "DL number",
+        "dob": "date of birth",
+        "pin_code": "PIN code",
+        "mobile_number": "mobile number",
+        "email": "email address",
+        "address": "address",
+        "state_code": "state",
+        "rto_code": "RTO",
+    }
+    return labels.get(key, key.replace("_", " ") if key else "")
+
+
+def _field_question(field_key: str) -> str:
+    label = _friendly_field_label(field_key)
+    return f"Please enter your {label} so we can continue." if label else ""
 
 
 def _failure_message(lower: str) -> tuple[str, str, bool]:

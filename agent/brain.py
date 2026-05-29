@@ -4709,6 +4709,7 @@ KNOWN OBSTACLES: {json.dumps(next_step.known_obstacles if next_step else [])}
     async def _handle_stuck(self, job: Job, action: AgentAction, screenshot: bytes):
         q_text, ctx, opts = HumanLoop.build_stuck_question(action.observation, action.thought)
         question = action.human_question or q_text
+        field_key = action.tool_args.get("field_key") or action.tool_args.get("customer_data_key")
 
         resp = await self._hl.ask(
             job=job,
@@ -4717,6 +4718,7 @@ KNOWN OBSTACLES: {json.dumps(next_step.known_obstacles if next_step else [])}
             context=ctx,
             screenshot=screenshot,
             options=opts,
+            field_key=field_key,
         )
 
         answer = resp.answer
@@ -4724,7 +4726,6 @@ KNOWN OBSTACLES: {json.dumps(next_step.known_obstacles if next_step else [])}
             log.warning("brain.human_loop_timeout", job_id=job.job_id)
             return
 
-        field_key = action.tool_args.get("field_key") or action.tool_args.get("customer_data_key")
         if field_key and answer and answer.lower() not in {"skip", "abort job", "cancel"}:
             job.customer_data[field_key] = answer
             await self._sm.save(job)
