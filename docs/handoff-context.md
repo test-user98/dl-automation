@@ -163,6 +163,22 @@ Portal-down detection: status_messages scans recent step logs for `5xx`,
 "service unavailable", "bad gateway", DNS failures — and surfaces a calm
 "government portal is slow, we will retry" message instead of an error.
 
+Project-wide copy/state-detection rule:
+
+- Do not put raw state-detection keywords in customer-facing copy. Examples:
+  `403`, `Forbidden`, `captcha`, `invalid OTP`, `OTP expired`,
+  `service unavailable`, `bad gateway`, `browser`, `context`,
+  `TargetClosedError`.
+- Reason: backend status mapping and agent classifiers intentionally scan raw
+  portal/log text for these words. If UI copy later gets logged or reflected
+  into `_raw_context`, it can create false state detection.
+- Keep raw keywords in structured enums, debug logs, tests, and internal
+  diagnostics. Customer copy should say things like "government portal is
+  slow", "verification code", or "try again".
+- Exception: use the literal word only when the UI is asking for that exact
+  item, for example an OTP input label. Even then, do not feed that copy back
+  into state-classification input.
+
 ## Operator + Customer-lookup layer (SHIPPED)
 
 This batch landed alongside the live deploy. NOT mocked — actual aiosqlite

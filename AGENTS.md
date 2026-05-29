@@ -25,6 +25,19 @@ judgment it cannot infer.
 - Portal validation alerts are failures unless explicitly classified as a valid
   branch, such as "Application already exists..." after confirming DL details.
 
+## Customer-Facing Copy Rules
+
+- Do not ship customer-facing text that contains raw state-detection keywords
+  used by backend/agent classifiers, such as `403`, `Forbidden`, `captcha`,
+  `invalid OTP`, `OTP expired`, `service unavailable`, `bad gateway`,
+  `browser`, `context`, or `TargetClosedError`, unless the UI is intentionally
+  asking for that exact item, such as an OTP input label.
+- Keep raw portal/log keywords in structured enums, debug logs, tests, or
+  internal diagnostics. Customer copy should use product-safe language like
+  "government portal is slow", "verification code", or "try again".
+- If a raw keyword must appear in UI copy, make sure that text is not fed back
+  into `_raw_context`, step logs, or status/state-classification input.
+
 ## Known Test Data
 
 - Present address PIN code for the test customer: `334401`
