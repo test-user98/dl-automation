@@ -120,9 +120,12 @@ jobs:
               HUMAN_LOOP_BACKEND: "polling",
               STATE_BACKEND:      "sqlite",
               LLM_PRIMARY:        "openai",
-              LLM_FALLBACK:       ($anthropic | if . == "" then "openai" else "anthropic" end),
-              CAPTCHA_PROVIDER:   "gpt4v"
+              LLM_FALLBACK:       ($anthropic | if . == "" then "openai" else "anthropic" end)
             }')
+          # Note: CAPTCHA_PROVIDER stays at the Settings default ("claude").
+          # With no Anthropic key, captcha_solver._build_llm_chain naturally
+          # falls back to gpt4v-only, so we are still OpenAI-only without
+          # tripping the pydantic Literal validator.
 
           if [ "$SERVICE_ARN" = "None" ] || [ -z "$SERVICE_ARN" ]; then
             echo "Creating App Runner service $SERVICE_NAME"
