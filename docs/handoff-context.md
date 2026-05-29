@@ -13,6 +13,9 @@ remote updates.
 Two LLMs are working on this repo in parallel (one focused on the customer
 layer + Sarathi flow, one focused on infra/deploy). To stay coherent:
 
+- **Ground rule:** if you make a change and you validated it works, commit
+  it AND update this handoff doc in the same change. This doc is the source
+  of truth between the two agents.
 - Whoever commits last updates this doc to point at the latest meaningful
   checkpoint and adds a one-line summary of what changed.
 - Both follow the same "no push without approval" rule.
@@ -22,6 +25,21 @@ layer + Sarathi flow, one focused on infra/deploy). To stay coherent:
 - Live verification of *what's actually deployed* uses `/health.commit` —
   it returns the git SHA the running container was built from. This is the
   source of truth for "is my commit live yet?".
+
+## Logging + redaction
+
+`config/logging_setup.py` is the single structlog config. Both `api/server.py`
+and `run_agent.py` import `configure_logging()` at startup. A redaction
+processor runs BEFORE the timestamp processor and masks:
+
+- API keys: `sk-…`, `sk-ant-…`, `AKIA…`, `Bearer …`
+- 10-digit numbers (mobile), 12-digit (Aadhaar), 6-digit (OTP/PIN) inside
+  free-text strings;
+- any value whose key matches `_SENSITIVE_KEYS` (otp, mobile, dl_number,
+  dob, api_key, secret, password, token, aws_*, …) — masked to first2+***+last2
+  so support can still correlate.
+
+If you log a new sensitive field, add its key to `_SENSITIVE_KEYS`.
 
 ## Product Goal
 

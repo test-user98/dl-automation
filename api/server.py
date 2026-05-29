@@ -21,11 +21,15 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from config.settings import get_settings
+from config.logging_setup import configure_logging
 from agent.state_manager import JobStatus
 from api.deps import state_manager, learning_store, human_loop, ocr_service, orchestrator
 from api.status_messages import customer_job_view
 
 settings = get_settings()
+# Redacts API keys, OTPs, mobile/DL/Aadhaar numbers before they reach stdout.
+configure_logging(level="INFO", json_output=False)
+
 app = FastAPI(title="Sarathi Agent API", version="1.0.0")
 
 # Singletons — shared across requests

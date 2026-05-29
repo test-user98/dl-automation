@@ -5,8 +5,6 @@ Watch the Chromium window to see exactly what the agent does.
 
 import asyncio
 import sys
-import structlog
-import logging
 
 # Windows console needs UTF-8 to handle Unicode in Playwright error messages
 if hasattr(sys.stdout, "reconfigure"):
@@ -14,14 +12,10 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-structlog.configure(
-    wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
-    processors=[
-        structlog.dev.ConsoleRenderer(colors=True),
-    ],
-)
-
 sys.path.insert(0, ".")
+
+from config.logging_setup import configure_logging
+configure_logging(level="INFO", json_output=False)
 
 import os
 os.environ.setdefault("HUMAN_LOOP_BACKEND", "console")  # show stuck questions in terminal

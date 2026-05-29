@@ -120,7 +120,8 @@ jobs:
               HUMAN_LOOP_BACKEND: "polling",
               STATE_BACKEND:      "sqlite",
               LLM_PRIMARY:        "openai",
-              LLM_FALLBACK:       ($anthropic | if . == "" then "openai" else "anthropic" end)
+              LLM_FALLBACK:       ($anthropic | if . == "" then "openai" else "anthropic" end),
+              CAPTCHA_PROVIDER:   "gpt4v"
             }')
 
           if [ "$SERVICE_ARN" = "None" ] || [ -z "$SERVICE_ARN" ]; then
