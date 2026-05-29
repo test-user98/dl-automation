@@ -100,6 +100,21 @@ class HumanLoop:
             options       = options or [],
         )
 
+        action_type = "otp" if (
+            "otp" in question.lower() or "otp" in step_name.lower()
+        ) else (
+            "service_selection" if step_name == "service_selection" else
+            "choice" if options else
+            "text"
+        )
+        job.customer_data["_pending_customer_request"] = {
+            "step_name": step_name,
+            "question": question,
+            "context": context,
+            "options": options or [],
+            "action_type": action_type,
+        }
+
         log.info(
             "human_loop.asking",
             job_id   = job.job_id,
@@ -140,12 +155,25 @@ class HumanLoop:
             log.warning("human_loop.timeout", job_id=job.job_id, step=step_name)
             return HumanResponse(answer="__timeout__", raw={})
 
+        job.customer_data.pop("_pending_customer_request", None)
+        await self._sm.save(job)
         log.info("human_loop.response_received", job_id=job.job_id, answer=response)
         return HumanResponse(answer=response, raw={"raw": response})
 
     async def submit_response(self, job_id: str, answer: str):
         """Called by the API when the customer submits their answer."""
         self._pending[job_id] = answer
+        try:
+            job = await self._sm.load(job_id)
+            if job:
+                pending = job.customer_data.get("_pending_customer_request")
+                if isinstance(pending, dict):
+                    pending["answered"] = True
+                    pending["answer_preview"] = "******" if pending.get("action_type") == "otp" else answer[:80]
+                    job.customer_data["_pending_customer_request"] = pending
+                    await self._sm.save(job)
+        except Exception as e:
+            log.warning("human_loop.pending_request_mark_answered_failed", job_id=job_id, error=str(e))
 
     async def _poll_for_response(self, job_id: str, timeout_seconds: int) -> Optional[str]:
         deadline = asyncio.get_event_loop().time() + timeout_seconds

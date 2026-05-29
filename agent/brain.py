@@ -2598,6 +2598,7 @@ class AgentBrain:
                 "CHANGE OF ADDRESS IN DL",
                 "CHANGE OF NAME IN DL",
             ]
+        job.customer_data["available_services"] = services
 
         # DL Renewal 365-day validation
         from datetime import datetime as _dt

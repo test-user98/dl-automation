@@ -208,9 +208,11 @@ def test_status_update_endpoint(client):
     )
     assert r.status_code == 200
     assert r.json()["application"]["status"] == "CANCELLED"
+    assert any(e["status"] == "CANCELLED" for e in r.json()["events"])
     # Note is visible in detail
     d = client.get(f"/admin/applications/{app_id}", headers=_hdr(client))
     assert any("operator cancelled" in n["text"] for n in d.json()["notes"])
+    assert any(e["status"] == "CANCELLED" for e in d.json()["events"])
 
 
 def test_doc_preview_query_secret(client):
@@ -259,6 +261,7 @@ def test_lookup_by_application_number(client):
     assert body["found"] is True
     assert any(a["application_number"] == "RJ-DL-2026-04219"
                for a in body["applications"])
+    assert all("timeline" in a for a in body["applications"])
 
 
 def test_favicon_served(client):

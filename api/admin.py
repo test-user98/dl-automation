@@ -132,6 +132,7 @@ async def application_detail(app_id: str, x_admin_secret: str = Header(None)):
     cust = await store.get_customer(app.customer_id)
     docs = await store.list_documents(app_id=app_id)
     notes = await store.list_notes(app_id)
+    events = await store.list_application_events(app_id)
 
     job_view = None
     if app.current_job_id:
@@ -166,6 +167,7 @@ async def application_detail(app_id: str, x_admin_secret: str = Header(None)):
         "customer":  cust.to_dict() if cust else None,
         "documents": docs,
         "notes":     notes,
+        "events":    events,
         "job":       job_view,
     }
 
@@ -194,12 +196,29 @@ async def update_status(app_id: str, body: StatusBody, x_admin_secret: str = Hea
     app = await store.get_application(app_id)
     if not app:
         raise HTTPException(status_code=404, detail="Application not found")
-    updated = await store.update_application(app_id, status=body.status)
+    updated = await store.update_application(
+        app_id,
+        status=body.status,
+        event_message=body.note,
+        event_actor=body.operator_id,
+    )
     note_text = f"Status set to {body.status} by operator"
     if body.note:
         note_text = f"{note_text}: {body.note}"
     await store.add_note(app_id, note_text, operator_id=body.operator_id)
-    return {"application": {"app_id": updated.app_id, "status": updated.status}}
+    cust = await store.get_customer(app.customer_id)
+    if cust and cust.email:
+        from tools.email_notifier import send_email
+        await send_email(
+            cust.email,
+            f"RTO application update: {body.status.replace('_', ' ').title()}",
+            body.note or f"Your {app.service_type.replace('_', ' ')} application status is now {body.status}.",
+        )
+    events = await store.list_application_events(app_id)
+    return {
+        "application": {"app_id": updated.app_id, "status": updated.status},
+        "events": events,
+    }
 
 
 @router.get("/documents/{doc_id}")

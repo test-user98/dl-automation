@@ -83,6 +83,10 @@ def customer_job_view(job: Job) -> dict:
     )
 
     mobile_suffix = _mask_mobile(job.customer_data.get("mobile_number", ""))
+    pending_request = job.customer_data.get("_pending_customer_request") or {}
+    if not isinstance(pending_request, dict):
+        pending_request = {}
+    pending_answered = bool(pending_request.get("answered"))
 
     action_required = False
     action_type = ""
@@ -145,8 +149,11 @@ def customer_job_view(job: Job) -> dict:
 
     elif job.status == JobStatus.STUCK_HUMAN_NEEDED:
         phase = PHASE_WAITING
-        action_required = True
-        action_type = "otp" if "otp" in lower else "human_response"
+        action_required = not pending_answered
+        action_type = (
+            pending_request.get("action_type")
+            or ("otp" if "otp" in lower else "human_response")
+        )
         if action_type == "otp":
             if "expired" in lower or "fresh otp" in lower or "resend" in lower:
                 title = "Enter the fresh OTP"
@@ -166,6 +173,13 @@ def customer_job_view(job: Job) -> dict:
                     f"The government portal just sent an OTP to {mobile_suffix}. "
                     "Enter it here so we can submit your application."
                 )
+        elif pending_request:
+            title = _title_for_customer_request(pending_request)
+            message = (
+                pending_request.get("question")
+                or pending_request.get("context")
+                or "Please confirm one detail so we can continue."
+            )
         else:
             title = "We need one detail"
             message = _human_message(lower) or "Please confirm one detail so we can continue."
@@ -224,6 +238,8 @@ def customer_job_view(job: Job) -> dict:
         "action_type":      action_type,
         "retryable":        retryable,
         "last_step_label":  step_label,
+        "customer_request": _customer_request_payload(pending_request, action_required),
+        "available_services": job.customer_data.get("available_services", []),
     }
 
 
@@ -276,6 +292,29 @@ def _human_message(lower: str) -> str:
     if "pin" in lower or "address" in lower:
         return "Please confirm your present address PIN code."
     return ""
+
+
+def _title_for_customer_request(request: dict) -> str:
+    action_type = request.get("action_type", "")
+    step_name = request.get("step_name", "")
+    if action_type == "service_selection" or step_name == "service_selection":
+        return "Choose a DL service"
+    if action_type == "choice" or request.get("options"):
+        return "Choose an option"
+    return "We need one detail"
+
+
+def _customer_request_payload(request: dict, action_required: bool) -> dict:
+    if not request or not action_required:
+        return {}
+    options = request.get("options") or []
+    return {
+        "step_name": request.get("step_name", ""),
+        "question": request.get("question", ""),
+        "context": request.get("context", ""),
+        "options": options if isinstance(options, list) else [],
+        "action_type": request.get("action_type", "human_response"),
+    }
 
 
 def _failure_message(lower: str) -> tuple[str, str, bool]:

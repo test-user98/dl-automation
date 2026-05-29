@@ -105,6 +105,14 @@ class Settings(BaseSettings):
     api_port: int = Field(8000, env="API_PORT")
     api_secret_key: str = Field("change-this-in-production", env="API_SECRET_KEY")
 
+    # ── EMAIL NOTIFICATIONS ──────────────────────────────────────────────────
+    email_notifications_enabled: bool = Field(False, env="EMAIL_NOTIFICATIONS_ENABLED")
+    smtp_host: str = Field("", env="SMTP_HOST")
+    smtp_port: int = Field(587, env="SMTP_PORT")
+    smtp_username: str = Field("", env="SMTP_USERNAME")
+    smtp_password: str = Field("", env="SMTP_PASSWORD")
+    smtp_from: str = Field("", env="SMTP_FROM")
+
     # ── AGENT BEHAVIOUR ───────────────────────────────────────────────────────
     max_steps_per_job: int = Field(100, env="MAX_STEPS_PER_JOB")
     max_consecutive_step_failures: int = Field(4, env="MAX_CONSECUTIVE_STEP_FAILURES")

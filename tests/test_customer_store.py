@@ -83,14 +83,20 @@ async def test_application_lifecycle(store):
     )
     assert a.status == "CREATED"
     assert a.metadata["dl"] == "RJ07X"
+    events = await store.list_application_events(a.app_id)
+    assert events[-1]["title"] == "Application received"
 
     a2 = await store.update_application(
         a.app_id, status="WAITING_OTP",
         metadata_patch={"otp_sent_at": "now"},
+        event_message="OTP sent to customer",
     )
     assert a2.status == "WAITING_OTP"
     assert a2.metadata["dl"] == "RJ07X"            # preserved
     assert a2.metadata["otp_sent_at"] == "now"     # patched
+    events = await store.list_application_events(a.app_id)
+    assert events[-1]["status"] == "WAITING_OTP"
+    assert events[-1]["message"] == "OTP sent to customer"
 
     # Unknown app_id -> None
     assert await store.update_application("APP-NONE", status="FAILED") is None

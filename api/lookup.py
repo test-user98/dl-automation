@@ -76,6 +76,7 @@ async def lookup(
     apps = await store.list_applications(customer_id=cust.customer_id)
     out_apps = []
     for a in apps:
+        timeline = await store.list_application_events(a["app_id"])
         view = None
         if a.get("current_job_id"):
             try:
@@ -91,6 +92,7 @@ async def lookup(
             "application_number": a.get("application_number", ""),
             "created_at":         a.get("created_at", ""),
             "updated_at":         a.get("updated_at", ""),
+            "timeline":           timeline or _fallback_timeline(a),
             "customer_view":      view or {
                 "headline": _headline_for(a["status"]),
                 "subline":  _subline_for(a["status"], a.get("application_number")),
@@ -149,3 +151,30 @@ def _subline_for(status: str, app_no: str) -> str:
     if status == "FAILED":
         return "Your details are saved — please restart the application."
     return "Your application is in progress."
+
+
+def _fallback_timeline(app: dict) -> list[dict]:
+    """Older rows may predate application_events; keep lookup useful."""
+    created = app.get("created_at") or ""
+    updated = app.get("updated_at") or created
+    items = [{
+        "event_id": 0,
+        "app_id": app.get("app_id", ""),
+        "status": "CREATED",
+        "title": "Application received",
+        "message": "We received your request.",
+        "actor": "system",
+        "created_at": created,
+    }]
+    status = app.get("status", "")
+    if status and status != "CREATED":
+        items.append({
+            "event_id": 0,
+            "app_id": app.get("app_id", ""),
+            "status": status,
+            "title": _headline_for(status),
+            "message": _subline_for(status, app.get("application_number", "")),
+            "actor": "system",
+            "created_at": updated,
+        })
+    return items

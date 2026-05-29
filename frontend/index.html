@@ -181,6 +181,16 @@
       font-size: 22px; font-weight: 700; padding: 0;
     }
     .resend { color: var(--primary); cursor: pointer; font-size: 13px; }
+    .option-list { display: grid; gap: 8px; margin-top: 12px; }
+    .option-list button {
+      width: 100%;
+      min-height: 42px;
+      text-align: left;
+      justify-content: flex-start;
+      background: #f7f9fc;
+      border: 1px solid var(--line);
+    }
+    .option-list button:hover { border-color: var(--primary); background: #eef5ff; }
 
     .footnote { color: var(--muted); font-size: 12px; line-height: 1.5; margin-top: 14px; }
     a { color: var(--primary); }
@@ -344,6 +354,8 @@
     <section id="screen-human" class="card hidden">
       <h2 id="human-title">We need one detail</h2>
       <p class="sub" id="human-sub">The agent needs your input to continue.</p>
+
+      <div class="option-list hidden" id="human-options"></div>
 
       <div class="field">
         <label>Your answer</label>
@@ -589,11 +601,9 @@ function applyJob(r) {
   if (v.action_type === 'otp' || r.status === 'WAITING_OTP') {
     clearInterval(pollTimer);
     showOTP(v);
-  } else if (v.action_type === 'human_response' || r.status === 'STUCK_HUMAN_NEEDED') {
+  } else if ((v.action_required && v.action_type !== 'otp') || r.status === 'STUCK_HUMAN_NEEDED') {
     clearInterval(pollTimer);
-    document.getElementById('human-title').textContent = v.headline || 'We need one detail';
-    document.getElementById('human-sub').textContent   = v.subline  || 'Please confirm one detail so we can continue.';
-    show('screen-human');
+    showHumanRequest(v);
   } else if (r.status === 'SUBMITTED' || r.status === 'COMPLETED') {
     clearInterval(pollTimer);
     document.getElementById('app-number').textContent = r.application_number
@@ -744,6 +754,54 @@ async function submitHumanResponse() {
 }
 
 // ─── helpers ───────────────────────────────────────────────────────────────
+function showHumanRequest(v) {
+  const req = v.customer_request || {};
+  const title = v.headline || (req.action_type === 'service_selection' ? 'Choose a DL service' : 'We need one detail');
+  const question = req.question || v.subline || 'Please confirm one detail so we can continue.';
+  document.getElementById('human-title').textContent = title;
+  document.getElementById('human-sub').textContent = question;
+  document.getElementById('human-answer').value = '';
+
+  const optionsBox = document.getElementById('human-options');
+  const options = Array.isArray(req.options) ? req.options : [];
+  optionsBox.innerHTML = '';
+  optionsBox.classList.toggle('hidden', options.length === 0);
+  options.forEach((opt) => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = opt;
+    btn.onclick = () => submitHumanResponse(opt);
+    optionsBox.appendChild(btn);
+  });
+
+  show('screen-human');
+  if (!options.length) document.getElementById('human-answer').focus();
+}
+
+resendOTP = function() {
+  fetch(`${API}/jobs/${currentJobId}/otp`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Secret': SECRET },
+    body: JSON.stringify({ otp: 'resend' }),
+  }).finally(() => {
+    show('screen-4');
+    startPolling();
+  });
+};
+
+submitHumanResponse = async function(answerOverride) {
+  const answer = (answerOverride || document.getElementById('human-answer').value).trim();
+  if (!answer) return alert('Please type your answer.');
+  const res = await fetch(`${API}/jobs/${currentJobId}/human-response`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Secret': SECRET },
+    body: JSON.stringify({ answer }),
+  });
+  if (!res.ok) return alert("We couldn't send your answer - please try again.");
+  show('screen-4');
+  startPolling();
+};
+
 function show(id) {
   ['screen-1','screen-2','screen-3','screen-4','screen-otp','screen-human','screen-done']
     .forEach(s => document.getElementById(s).classList.add('hidden'));
@@ -801,8 +859,33 @@ async function lookupTrack() {
         ${escapeHtml(a.service_type.replace(/_/g, ' '))} • ${escapeHtml(a.customer_view?.subline || '')}
       </div>
       ${a.application_number ? `<div style="font-size:13px; margin-top:6px"><b>App #</b>: ${escapeHtml(a.application_number)}</div>` : ''}
+      ${renderTrackTimeline(a.timeline || [])}
     </div>
   `).join('');
+}
+
+function renderTrackTimeline(events) {
+  if (!events.length) return '';
+  return `
+    <div style="margin-top:10px; display:grid; gap:8px">
+      ${events.map((e, idx) => `
+        <div style="display:grid; grid-template-columns:18px 1fr; gap:8px; align-items:start">
+          <div style="width:10px;height:10px;border-radius:999px;margin-top:4px;background:${idx === events.length - 1 ? 'var(--accent)' : '#cbd5e1'}"></div>
+          <div>
+            <div style="font-size:13px;font-weight:600">${escapeHtml(e.title || e.status || 'Application updated')}</div>
+            <div style="font-size:12px;color:var(--muted)">${escapeHtml(e.message || '')}</div>
+            <div style="font-size:11px;color:var(--muted);margin-top:2px">${escapeHtml(formatEventTime(e.created_at))}</div>
+          </div>
+        </div>
+      `).join('')}
+    </div>
+  `;
+}
+
+function formatEventTime(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  return isNaN(d.getTime()) ? iso : d.toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' });
 }
 </script>
 </body>

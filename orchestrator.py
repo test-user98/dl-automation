@@ -121,11 +121,23 @@ class Orchestrator:
             apps = await cs.list_applications(limit=200)
             for a in apps:
                 if a.get("current_job_id") == job_id:
-                    await cs.update_application(
+                    updated = await cs.update_application(
                         a["app_id"],
                         status=job.status.value,
                         application_number=job.application_number or a.get("application_number") or "",
                     )
+                    cust = await cs.get_customer(updated.customer_id) if updated else None
+                    if cust and cust.email:
+                        from tools.email_notifier import send_email
+                        ack = updated.application_number if updated else ""
+                        await send_email(
+                            cust.email,
+                            "Your RTO application update",
+                            (
+                                f"Your {updated.service_type.replace('_', ' ')} application is {updated.status}."
+                                + (f"\nAcknowledgement number: {ack}" if ack else "")
+                            ),
+                        )
                     break
         except Exception as e:
             log.warning("orchestrator.app_sync_failed", job_id=job_id, error=str(e))

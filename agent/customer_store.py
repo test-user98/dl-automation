@@ -63,6 +63,42 @@ def _normalize_phone(phone: str) -> str:
     return digits[-10:] if len(digits) >= 10 else digits
 
 
+def _event_title_for_status(status: str) -> str:
+    return {
+        "CREATED": "Application received",
+        "OCR_PROCESSING": "Reading documents",
+        "AGENT_QUEUED": "Application queued",
+        "AGENT_RUNNING": "Filling Sarathi form",
+        "WAITING_OTP": "Waiting for OTP",
+        "STUCK_HUMAN_NEEDED": "Customer input needed",
+        "PAYMENT_PENDING": "Payment pending",
+        "SUBMITTED": "Application submitted",
+        "COMPLETED": "Application completed",
+        "FAILED_RETRYING": "Retrying government portal",
+        "FAILED": "Could not complete automatically",
+        "CANCELLED": "Application cancelled",
+    }.get(status, status.replace("_", " ").title() if status else "Application updated")
+
+
+def _event_message_for_status(status: str, application_number: str = "") -> str:
+    if status in {"SUBMITTED", "COMPLETED"} and application_number:
+        return f"Acknowledgement number {application_number} was generated."
+    return {
+        "CREATED": "We received the customer's request and created an application record.",
+        "OCR_PROCESSING": "Documents are being read and validated.",
+        "AGENT_QUEUED": "The browser agent is waiting to start.",
+        "AGENT_RUNNING": "The browser agent is filling the government portal.",
+        "WAITING_OTP": "The customer needs to enter the OTP received on their phone.",
+        "STUCK_HUMAN_NEEDED": "The agent needs one customer answer before it can continue.",
+        "PAYMENT_PENDING": "The application is waiting for payment confirmation.",
+        "SUBMITTED": "The application was submitted to Sarathi.",
+        "COMPLETED": "The application flow is complete.",
+        "FAILED_RETRYING": "The government portal had a temporary issue; retry is in progress.",
+        "FAILED": "The attempt could not be completed automatically. Customer details are saved.",
+        "CANCELLED": "The application was cancelled.",
+    }.get(status, "The application status changed.")
+
+
 # ── Schema ────────────────────────────────────────────────────────────────────
 
 SCHEMA = """
@@ -120,6 +156,18 @@ CREATE TABLE IF NOT EXISTS notes (
   FOREIGN KEY (app_id) REFERENCES applications(app_id)
 );
 CREATE INDEX IF NOT EXISTS idx_notes_app ON notes(app_id);
+
+CREATE TABLE IF NOT EXISTS application_events (
+  event_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+  app_id      TEXT NOT NULL,
+  status      TEXT NOT NULL DEFAULT '',
+  title       TEXT NOT NULL,
+  message     TEXT NOT NULL DEFAULT '',
+  actor       TEXT NOT NULL DEFAULT 'system',
+  created_at  TEXT NOT NULL,
+  FOREIGN KEY (app_id) REFERENCES applications(app_id)
+);
+CREATE INDEX IF NOT EXISTS idx_events_app ON application_events(app_id, created_at);
 """
 
 
@@ -166,6 +214,17 @@ class Document:
     ocr_data:    dict = field(default_factory=dict)
     confidence:  float = 0.0
     uploaded_at: str = ""
+
+
+@dataclass
+class ApplicationEvent:
+    event_id: int
+    app_id: str
+    status: str
+    title: str
+    message: str = ""
+    actor: str = "system"
+    created_at: str = ""
 
 
 # ── Store ─────────────────────────────────────────────────────────────────────
@@ -281,6 +340,16 @@ class CustomerStore:
                 (app_id, customer_id, service_type, current_job_id,
                  state_code, fee_inr, md, now, now),
             )
+            await db.execute(
+                "INSERT INTO application_events(app_id, status, title, message, actor, created_at) "
+                "VALUES (?, 'CREATED', ?, ?, 'system', ?)",
+                (
+                    app_id,
+                    "Application received",
+                    "We received the customer's request and created an application record.",
+                    now,
+                ),
+            )
             await db.commit()
         return Application(
             app_id=app_id, customer_id=customer_id, service_type=service_type,
@@ -296,6 +365,9 @@ class CustomerStore:
         application_number: Optional[str] = None,
         current_job_id: Optional[str] = None,
         metadata_patch: Optional[dict] = None,
+        event_title: str = "",
+        event_message: str = "",
+        event_actor: str = "system",
     ) -> Optional[Application]:
         async with aiosqlite.connect(self._path) as db:
             db.row_factory = aiosqlite.Row
@@ -317,6 +389,32 @@ class CustomerStore:
                 "metadata=?, updated_at=? WHERE app_id=?",
                 (new_status, new_app_no, new_job, json.dumps(existing_md), now, app_id),
             )
+            if status is not None and new_status != row["status"]:
+                await db.execute(
+                    "INSERT INTO application_events(app_id, status, title, message, actor, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        app_id,
+                        new_status,
+                        event_title or _event_title_for_status(new_status),
+                        event_message or _event_message_for_status(new_status, new_app_no),
+                        event_actor or "system",
+                        now,
+                    ),
+                )
+            elif application_number is not None and new_app_no and new_app_no != row["application_number"]:
+                await db.execute(
+                    "INSERT INTO application_events(app_id, status, title, message, actor, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        app_id,
+                        new_status,
+                        event_title or "Acknowledgement generated",
+                        event_message or f"Acknowledgement number {new_app_no} was generated.",
+                        event_actor or "system",
+                        now,
+                    ),
+                )
             await db.commit()
             return await self.get_application(app_id)
 
@@ -468,6 +566,47 @@ class CustomerStore:
             db.row_factory = aiosqlite.Row
             rows = await (await db.execute(
                 "SELECT * FROM notes WHERE app_id=? ORDER BY created_at DESC",
+                (app_id,),
+            )).fetchall()
+            return [dict(r) for r in rows]
+
+    # ── Customer-visible application timeline ───────────────────────────────
+
+    async def add_application_event(
+        self,
+        app_id: str,
+        *,
+        status: str = "",
+        title: str,
+        message: str = "",
+        actor: str = "system",
+    ) -> dict:
+        title = (title or "").strip()
+        if not title:
+            raise ValueError("Empty event title")
+        async with aiosqlite.connect(self._path) as db:
+            now = _now()
+            cur = await db.execute(
+                "INSERT INTO application_events(app_id, status, title, message, actor, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (app_id, status or "", title, message or "", actor or "system", now),
+            )
+            await db.commit()
+            return {
+                "event_id": cur.lastrowid,
+                "app_id": app_id,
+                "status": status or "",
+                "title": title,
+                "message": message or "",
+                "actor": actor or "system",
+                "created_at": now,
+            }
+
+    async def list_application_events(self, app_id: str) -> list[dict]:
+        async with aiosqlite.connect(self._path) as db:
+            db.row_factory = aiosqlite.Row
+            rows = await (await db.execute(
+                "SELECT * FROM application_events WHERE app_id=? ORDER BY created_at ASC, event_id ASC",
                 (app_id,),
             )).fetchall()
             return [dict(r) for r in rows]

@@ -2,7 +2,7 @@
 
 Repo: `C:\Users\yashs\OneDrive\Desktop\token26`
 Remote: `https://github.com/test-user98/dl-automation.git`
-Current local checkpoint commit: latest local `HEAD` (`Add live-deploy verification + handoff sync`)
+Current local checkpoint commit: latest local `HEAD` (`Add customer timeline and operator status bridge`)
 Previous checkpoint: `674096e` (deploy pipeline), `fc15a82` (customer onboarding + status layer), `52c2100` (agent hardening)
 
 Do not push without explicit user approval. The user wants local proof before
@@ -174,6 +174,8 @@ tables, async CRUD, 25 pytest tests passing, smoke-verified locally.
 - `applications(app_id PK APP-XXXXXXXXXX, customer_id FK, service_type,
   status, application_number, current_job_id, state_code, fee_inr,
   metadata JSON, created_at, updated_at)`
+- `application_events(event_id PK, app_id FK, status, title, message,
+  actor, created_at)` — customer-visible timeline, oldest to newest
 - `documents(doc_id PK DOC-XXXXXXXXXX, customer_id FK, app_id FK NULL,
   doc_type, file_path, mime_type, size_bytes, ocr_data JSON, confidence,
   uploaded_at)`
@@ -361,6 +363,22 @@ Once first live URL is up:
 
 ## Latest Local Verification
 
+- Timeline/status slice:
+  - durable `application_events` rows are created for application creation,
+    status changes, and acknowledgement generation;
+  - `/lookup` returns `timeline` per application for customer tracking;
+  - `/admin/applications/{app_id}` returns `events`;
+  - `/admin/applications/{app_id}/status` updates status, writes an operator
+    note, appends a customer-visible event, and optionally sends SMTP email;
+  - admin drawer renders timeline + manual status control;
+  - customer lookup renders order-delivery-style timeline entries.
+- Optional email config: `EMAIL_NOTIFICATIONS_ENABLED=true`,
+  `SMTP_HOST=smtp.gmail.com`, `SMTP_PORT=587`, `SMTP_USERNAME`,
+  `SMTP_PASSWORD` (Gmail app password), `SMTP_FROM`.
+- Validated this slice with `python -m py_compile ...`, `python -m pytest`
+  (37 passed), and a fresh local browser smoke against `127.0.0.1:8000`
+  rendering customer timeline + `SMOKE-ACK-002` and admin timeline/status UI.
+
 - `python -c "from api import server"` → imports cleanly, all routes registered.
 - `python -c "import yaml; yaml.safe_load(open('.github/workflows/deploy.yml'))"`
   → workflow YAML parses.
@@ -391,3 +409,32 @@ Once first live URL is up:
   not an automation failure or retry loop. The agent marks the job failed with
   a customer-safe non-retryable message: this service is not available at the
   resolved RTO; choose another service or visit the RTO/RLA authority.
+
+## Bidirectional Customer-Agent Contract
+
+The customer app is now a two-way bridge between Sarathi and the user:
+
+- Agent asks through `HumanLoop.ask(...)`.
+- `HumanLoop` stores a structured
+  `job.customer_data["_pending_customer_request"]`:
+  `step_name`, `question`, `context`, `options`, `action_type`.
+- `api.status_messages.customer_job_view(job)` exposes that as
+  `customer_view.customer_request` and sets `action_required/action_type`.
+- Frontend renders:
+  - `action_type="otp"` as the OTP screen;
+  - `service_selection` / `choice` / `text` as the human-needed screen;
+  - option buttons for Sarathi choices like available DL services;
+  - free text for missing details like DOB-change reason.
+- Customer answers go back to:
+  - `/jobs/{job_id}/otp` for OTP and resend (`{"otp":"resend"}`);
+  - `/jobs/{job_id}/human-response` for service choices and other details.
+
+Validated edge cases:
+
+- OTP wait maps to `action_type="otp"` with masked mobile suffix.
+- OTP resend button posts `{"otp":"resend"}`.
+- Service-selection request carries options and the UI posts the clicked
+  service text back to `/human-response`.
+- Portal-down / 5xx messages map to retrying with a calm customer message.
+- RTO/service ineligibility maps to a terminal, non-retryable friendly
+  message instead of a loop.
