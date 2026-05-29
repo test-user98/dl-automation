@@ -2,6 +2,7 @@
 
 Repo: `C:\Users\yashs\OneDrive\Desktop\token26`
 Remote: `https://github.com/test-user98/dl-automation.git`
+Live App Runner URL: `https://thxz3gzmhf.ap-south-1.awsapprunner.com`
 Current local checkpoint commit: latest local `HEAD` (`Auto-detect UI secret in browser smoke`)
 Previous checkpoint: `674096e` (deploy pipeline), `fc15a82` (customer onboarding + status layer), `52c2100` (agent hardening)
 
@@ -605,12 +606,16 @@ Validated locally before pushing this workflow fix:
 Final deploy result:
 
 - Fix commit: `4aad131` (`Harden App Runner deploy workflow`)
+- Live URL: `https://thxz3gzmhf.ap-south-1.awsapprunner.com`
 - GitHub Actions run: `#8`
 - Status: `Success`
 - Duration: about 9m14s
 - Every step passed, including `Wait for App Runner to serve this commit`.
   That step polls the live App Runner `/health` endpoint and only succeeds
   when `.commit == 4aad131...`, so the live app was verified as updated.
+- Manual check after the run:
+  `GET https://thxz3gzmhf.ap-south-1.awsapprunner.com/health`
+  returned `status=ok`, `commit=4aad131cf8fca54572d06d1713c1e0b38a7f18cd`.
 - Only remaining warning: GitHub's Node.js 20 deprecation warning for upstream
   actions (`actions/checkout`, AWS credential action, Docker actions). This is
   not blocking today, but should be upgraded later.
