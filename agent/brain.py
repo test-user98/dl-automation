@@ -2524,12 +2524,40 @@ class AgentBrain:
         }
         job.step_logs.append(StepLog(
             step_name="service_selection",
-            status="failed",
+            status="warning",
             observation=customer_message,
-            action_taken="portal_service_rejection",
+            action_taken="portal_service_rejection_recoverable",
             error=clean,
         ).to_dict())
-        await self._sm.transition(job, JobStatus.FAILED, clean)
+        # Self-healing path:
+        # 1) don't fail terminally,
+        # 2) clear prior selected service,
+        # 3) ask customer to pick another available service.
+        rejected_canonical = (service or "").strip()
+        available = job.customer_data.get("available_services", []) or []
+        options = []
+        for s in available:
+            if not rejected_canonical or s.strip().upper() != rejected_canonical.upper():
+                options.append(s)
+        if not options:
+            options = available[:]
+        if not options:
+            options = [
+                "CHANGE OF DATE OF BIRTH IN DL",
+                "CHANGE OF ADDRESS IN DL",
+                "CHANGE OF NAME IN DL",
+            ]
+        job.customer_data.pop("selected_service", None)
+        job.customer_data["_pending_customer_request"] = {
+            "step_name": "service_selection",
+            "action_type": "service_selection",
+            "question": customer_message + " Please choose another service.",
+            "context": "Select another service from the available list.",
+            "options": options[:8],
+            "answered": False,
+        }
+        await self._sm.transition(job, JobStatus.STUCK_HUMAN_NEEDED, customer_message)
+        await self._sm.save(job)
         log.warning(
             "brain.service_rejected_by_rto",
             service=service,
