@@ -62,7 +62,8 @@ STEP_LABELS = {k: v[1] for k, v in STEP_TO_PHASE.items()}
 
 
 _PORTAL_DOWN_PATTERNS = (
-    "503", "502", "504", "service unavailable", "bad gateway",
+    "503", "502", "504", "403", "forbidden",
+    "service unavailable", "bad gateway",
     "gateway timeout", "site can't be reached", "site cannot be reached",
     "err_connection", "name not resolved", "net::err",
 )
@@ -169,9 +170,11 @@ def customer_job_view(job: Job) -> dict:
     service_rejected = _is_service_rejection(lower)
 
     # Portal-down beats most other states — show the calm retry message.
+    # Important: it also beats a generic STUCK_HUMAN_NEEDED prompt. The LLM
+    # may ask the customer/operator what to do with a raw 403/Forbidden page,
+    # but that is not actionable customer input; it is a portal retry state.
     if portal_down and job.status not in {
-        JobStatus.SUBMITTED, JobStatus.COMPLETED,
-        JobStatus.WAITING_OTP, JobStatus.STUCK_HUMAN_NEEDED,
+        JobStatus.SUBMITTED, JobStatus.COMPLETED, JobStatus.WAITING_OTP,
     }:
         phase = PHASE_RETRYING
         title = "Government portal is slow right now"
@@ -181,6 +184,8 @@ def customer_job_view(job: Job) -> dict:
             "You don't need to do anything."
         )
         severity = "warning"
+        action_required = False
+        action_type = ""
 
     elif service_rejected:
         phase = PHASE_FAILED

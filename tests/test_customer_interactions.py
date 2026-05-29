@@ -172,6 +172,28 @@ def test_customer_view_maps_forbidden_to_customer_safe_retry():
     assert "retry" in view["subline"].lower()
 
 
+def test_customer_view_hides_forbidden_even_when_agent_asked_human():
+    job = _job(JobStatus.STUCK_HUMAN_NEEDED)
+    job.error_message = "The page is showing a 403 Forbidden error."
+    job.customer_data["_pending_customer_request"] = {
+        "step_name": "unknown",
+        "question": "The page is showing a 403 Forbidden error.",
+        "context": "The agent is currently seeing: 403 Forbidden error page is displayed.",
+        "options": ["Try again from this step", "Skip this step if optional"],
+        "action_type": "confirmation",
+    }
+
+    view = customer_job_view(job)
+
+    assert view["phase"] == "retrying"
+    assert view["headline"] == "Government portal is slow right now"
+    assert view["action_required"] is False
+    assert view["action_type"] == ""
+    assert view["customer_request"] == {}
+    assert "403" not in view["subline"]
+    assert "Forbidden" not in view["subline"]
+
+
 def test_customer_view_maps_browser_session_interruption_to_retryable_failure():
     job = _job(JobStatus.FAILED)
     job.error_message = "Target page, context or browser has been closed"

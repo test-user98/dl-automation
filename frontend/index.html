@@ -186,6 +186,27 @@
       background: linear-gradient(135deg, #f1f6ff 0%, #ffffff 60%);
       border: 1px solid #c4dafd;
       box-shadow: 0 2px 10px rgba(14, 98, 216, .08);
+      transition: background 0.25s ease, border-color 0.25s ease, box-shadow 0.25s ease;
+    }
+    .live-head.waiting {
+      background: linear-gradient(135deg, #fff7e2 0%, #ffffff 68%);
+      border-color: #ead49a;
+      box-shadow: 0 3px 12px rgba(161, 111, 0, .10);
+    }
+    .live-head.retrying {
+      background: linear-gradient(135deg, #fff7e2 0%, #fffdf6 64%);
+      border-color: #e2c26c;
+      box-shadow: 0 3px 12px rgba(161, 111, 0, .13);
+    }
+    .live-head.done {
+      background: linear-gradient(135deg, #eaf8ef 0%, #ffffff 68%);
+      border-color: #b8e1c5;
+      box-shadow: 0 3px 12px rgba(22, 128, 65, .10);
+    }
+    .live-head.failed {
+      background: linear-gradient(135deg, #fff0f0 0%, #ffffff 68%);
+      border-color: #f1b0b0;
+      box-shadow: 0 3px 12px rgba(185, 28, 28, .10);
     }
     .spin {
       width: 18px; height: 18px;
@@ -528,7 +549,7 @@
 
     <!-- ── STEP 4 ── Live agent status ────────────────────────────────── -->
     <section id="screen-4" class="card hidden">
-      <div class="live-head">
+      <div class="live-head" id="live-head">
         <div class="spin" id="spin"></div>
         <div>
           <div class="live-title" id="live-title">Starting your application</div>
@@ -1068,7 +1089,9 @@ function applyJob(r) {
     });
     showCaptcha(v);
     console.log('[applyJob] -> showCaptcha() called');
-  } else if ((v.action_required && v.action_type !== 'otp') || r.status === 'STUCK_HUMAN_NEEDED') {
+  } else if (v.phase === 'retrying' || r.status === 'FAILED_RETRYING') {
+    show('screen-4');
+  } else if (v.action_required && v.action_type && v.action_type !== 'otp' && v.action_type !== 'captcha') {
     addActivity({
       phase: 'waiting',
       title: v.headline || 'Your input is needed',
@@ -1111,6 +1134,11 @@ function applyJob(r) {
 }
 
 function setLive(v, job = {}) {
+  const phase = v.phase || 'connecting';
+  const liveHead = document.getElementById('live-head');
+  if (liveHead) {
+    liveHead.className = `live-head ${phase}`;
+  }
   document.getElementById('live-title').textContent = v.headline || 'Working on your application';
   const sub = v.subline || v.message || '';
   if (sub && sub !== lastSubline) {

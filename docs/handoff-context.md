@@ -3,7 +3,7 @@
 Repo: `C:\Users\yashs\OneDrive\Desktop\token26`
 Remote: `https://github.com/test-user98/dl-automation.git`
 Live App Runner URL: `https://thxz3gzmhf.ap-south-1.awsapprunner.com`
-Current local checkpoint commit: latest local `HEAD` (`Add dynamic customer agent progress UI`)
+Current local checkpoint commit: latest local `HEAD` (`Pin playwright==1.48.0 to match Docker base image chromium`, `54c9dec`)
 Previous checkpoint: `674096e` (deploy pipeline), `fc15a82` (customer onboarding + status layer), `52c2100` (agent hardening)
 
 Do not push without explicit user approval. The user wants local proof before
@@ -924,3 +924,211 @@ End-to-end path (production):
   with a clean diff once we push.
 - Diagnostic `console.log` in `applyJob` is intentionally still present
   while we wait for Bug E (OTP-screen-not-shown) to repro at least once.
+
+## Customer-UI hardening + live polish (commit `21765e6`)
+
+Triggered by a follow-up local run where the agent reached OTP and Sarathi
+sent the OTP, but the customer UI stayed on "Setting up verification"
+indefinitely — despite the backend payload at `/jobs/{id}` correctly
+emitting `action_type:"otp"`, `action_required:true`, `headline:"Enter the
+OTP"` (Bug C fix proved working in production). Three independent failure
+modes were collapsing into the same symptom:
+
+1. **SSE could die silently.** The frontend depended on EventSource as
+   the only live channel and only started a polling fallback inside
+   `onerror`. Stale-but-not-errored connections (mobile networks, proxies,
+   backgrounded tabs) never fired `onerror`, so the customer was frozen
+   indefinitely. **Fix:** `startPolling` now runs `setInterval(poll, 4000)`
+   unconditionally alongside SSE. Polling is the safety net — it re-applies
+   the same payload harmlessly when SSE is healthy, and surfaces transitions
+   within at most 4s when SSE is dead.
+2. **Browser cache held stale HTML/JS.** Inline JS lives in `index.html`,
+   so a previously-loaded tab kept running the old `applyJob` that didn't
+   know about the new branches. **Fix:** `GET /` and `GET /admin` now
+   set `Cache-Control: no-store, no-cache, must-revalidate, max-age=0` plus
+   `Pragma`/`Expires`. Confirmed via curl. Every reload pulls fresh JS.
+3. **`show*` functions wiped user input on re-poll.** Once polling stays
+   alive while the customer is on an OTP/captcha/human screen, every 4s
+   `applyJob` re-enters its branch. The original `showOTP` did
+   `first.value = '' ; first.focus()` on every call — that wiped what the
+   customer was typing and stole focus mid-input. **Fix:** `applyJob` no
+   longer calls `stopLiveUpdates()` on OTP/captcha/human branches; polling
+   stays alive so state can never drift stale. `showOTP` and `showCaptcha`
+   read `alreadyOnScreen` and only run the clear+focus path on FIRST entry.
+   `showCaptcha` also compares `img.src` before swapping to avoid reload
+   flicker on every poll.
+
+UI polish in the same commit:
+
+- Phase track: active phase (`.ph.on`) now uses a saturated 135° blue
+  gradient, white text, soft drop shadow `0 4px 14px rgba(14,98,216,.28)`,
+  and a 1-pixel lift via `translateY(-1px)`. Inactive phases stay pale.
+  Transitions tuned to `0.25s ease` so the swap reads as motion.
+- LIVE chip in the agent panel: `.agent-chip.live` renders a pulsing red
+  dot via a `::before` pseudo-element with a `liveDot` keyframe (expanding
+  ring), red text, soft red background. `.action / .done / .err` variants
+  added for the other phases. `updateAgentFocus` resets `chip.className`
+  and applies the right variant per phase.
+
+Local verification:
+
+- `python -m pytest -q` → 51 passed.
+- `python scripts/validate_fixes.py` → 32/32 assertions pass.
+- `python scripts/browser_smoke.py --base http://127.0.0.1:8001` →
+  `ok:true`, no console / network / layout issues.
+
+## Live Playwright pin (commit `54c9dec`)
+
+Closes the live-container browser-launch bug from the
+"CRITICAL: live container browser-launch bug" section above.
+
+`requirements.txt` now pins `playwright==1.48.0` exactly, matching the
+chromium ABI shipped in
+`mcr.microsoft.com/playwright/python:v1.48.0-jammy`. Comment in the file
+notes the pin must move in lockstep with the Dockerfile base-image tag.
+
+This is the change the user has been waiting for so the customer-UI
+improvements actually become visible in production. Without it, every
+deploy would build green, the workflow's `/health.commit` poll would
+match, and every customer DL submission would still crash on
+`BrowserType.launch()` within ~17s — surfacing as the misleading
+"Portal session interrupted" customer-safe message.
+
+Local validation: the pin only matters at `pip install` time. Local dev
+keeps its existing 1.60 SDK + 1.60 chromium because no pip install is
+triggered. Container rebuild on next push will pull 1.48 SDK to match
+the 1.48 chromium binary.
+
+## Session summary (all commits since `b5e7fab`)
+
+Local-only commits being pushed to `origin/main` in this push:
+
+1. `b5cd715` — Surface CAPTCHA manual fallback to customer UI + state
+   confirmation on review screen + initial live-card polish. Wired
+   `captcha_solver._solve_manual` through `human_loop.ask` when a job +
+   human_loop are available (the production path); kept stdin/file
+   fallback for `run_agent.py` terminal mode. New `#screen-captcha`
+   renders the CAPTCHA image with `data:image/png;base64,…` from
+   `customer_request.image_b64`. State row added to step-3 review with a
+   36-state dropdown override.
+2. `21765e6` — Customer-UI hardening (parallel SSE+polling, idempotent
+   show*, no-cache headers, phase + LIVE polish). See preceding section.
+3. `54c9dec` — Pin `playwright==1.48.0` in `requirements.txt`. See
+   preceding section.
+
+Already in origin from earlier this session: `397cd0d` (the four
+customer-UI bugs A/B/C/D fix) and `b5e7fab` (other agent's customer-copy
+keyword rule).
+
+## What to verify after the deploy lands
+
+1. `GET https://thxz3gzmhf.ap-south-1.awsapprunner.com/health` returns
+   `commit == 54c9dec…` and `status == ok` (or whatever HEAD is at the
+   time, if this doc is read after more commits).
+2. **Real end-to-end DL submission against the live URL** — this is the
+   one we kept skipping and that hid the Playwright bug for a deploy
+   cycle. Use the customer UI on the live URL. Fill the form. Click
+   Start. The agent should open a browser server-side and proceed to
+   OTP. If `/jobs/{id}.error_message` ever contains
+   `BrowserType.launch: Executable doesn't exist`, the pin did not
+   land — investigate Docker build cache before pushing more.
+3. Customer reaches the OTP screen within ~4s of the agent flipping
+   the job to `STUCK_HUMAN_NEEDED`. Phase card shows the saturated
+   blue gradient on the active phase, LIVE chip pulses red.
+
+## Still deferred (next slices)
+
+- Remove diagnostic `console.log('[applyJob]', …)` in `frontend/index.html`
+  once Bug E is confirmed gone after the live deploy. If it returns,
+  capture one `[applyJob]` log from the customer's dev tools to nail the
+  cause without further guessing.
+- Agentic OCR — wrong-card / non-document / image-quality detection on
+  the customer's DL upload step. Brainstorm completed earlier in this
+  session; user picked "hybrid classifier + canned messages with LLM
+  details line", 3 retake budget, runtime-configurable upload size and
+  retry count via env vars. Implementation pending.
+- Move SQLite + uploads off container disk (RDS Postgres + S3) so
+  redeploys don't wipe job history.
+- `tests/test_customer_interactions.py` doesn't yet assert the new
+  `_otp_message` patterns or `step_label` overrides — `validate_fixes.py`
+  covers it but a proper pytest unit would be cleaner.
+- `api/status_messages.py:_service_rejection_message(lower)` still has
+  an unused `lower` param (pre-existing IDE hint).
+
+## Retry-state answer-box fix + portal-block diagnosis (uncommitted)
+
+User saw this customer UI state:
+
+- Headline: "Government portal is slow right now"
+- Message: "The government Sarathi portal is temporarily unavailable..."
+- But the same screen still rendered the generic `Your answer` input.
+
+Root cause:
+
+- Backend/customer-view correctly mapped the Sarathi `403 Forbidden` page to
+  `phase:"retrying"`, `action_required:false`, `action_type:""`.
+- Frontend `applyJob()` still had a broad condition:
+  `... || r.status === 'STUCK_HUMAN_NEEDED'`, so any stuck job, including a
+  passive retry state, opened `#screen-human` and displayed `Your answer`.
+
+Fix:
+
+- `frontend/index.html`
+  - Added explicit retry branch before human-input branch:
+    `v.phase === 'retrying' || r.status === 'FAILED_RETRYING'` keeps the
+    customer on live progress (`screen-4`) and never asks for an answer.
+  - Human screen now renders only when
+    `v.action_required && v.action_type && action_type not in otp/captcha`.
+  - Added phase classes to `#live-head` and CSS variants for waiting,
+    retrying, done, failed so the live progress card background actually
+    changes with state.
+- `api/status_messages.py`
+  - Includes `403` / `forbidden` in portal-down patterns.
+  - Portal-down now beats generic `STUCK_HUMAN_NEEDED`; customer sees a
+    retrying message and no action prompt.
+- `agent/brain.py`
+  - Added `PortalTransientError` and a portal-block detector for
+    `403 Forbidden` / gateway outages. On detection, the agent stores
+    `FAILED_RETRYING`, clears cookies/checkpoints, and raises so the
+    orchestrator can restart with a fresh browser session instead of asking
+    the customer to interpret a government 403 page.
+- `scripts/live_ui_flow.py`
+  - New headed harness for customer UI -> agent -> OTP UI -> customer OTP
+    submit. It records `data/live_ui_result.json` and a failure screenshot
+    on timeout. Harness is useful but not yet fully validated end-to-end
+    because local process spawning was flaky in this session.
+- `scripts/validate_fixes.py`
+  - Added Bug G regression: retrying/portal-down payloads are passive and
+    frontend source no longer routes every `STUCK_HUMAN_NEEDED` to the
+    answer screen.
+- `tests/test_customer_interactions.py`
+  - Added regression for "403 Forbidden even when agent asked human" mapping
+    to retrying/no action/no customer request.
+
+Observed live-agent reason for the retry state:
+
+- Sarathi rejected Get DL Details with alert:
+  `Please provide valid Driving Licence data / Captcha`
+- After that rejection, the DL lookup form disappeared.
+- Recovery tried the DL services landing/direct `envaction.do` path.
+- Sarathi returned a `403 Forbidden` page at `envaction.do`.
+- The previous code asked the customer/operator about that raw 403; after this
+  patch it is treated as a portal retry state.
+
+Validation completed locally:
+
+- `python -m py_compile scripts\validate_fixes.py api\status_messages.py tests\test_customer_interactions.py agent\brain.py scripts\live_ui_flow.py` -> pass
+- `python -m pytest tests\test_customer_interactions.py tests\test_agent_resilience_helpers.py -q` -> `19 passed`
+- `python scripts\validate_fixes.py` -> `ALL FIXES VALIDATED`
+- `python scripts\browser_smoke.py --base http://127.0.0.1:8001 --out data\browser_smoke_retry_fix` -> `ok:true`
+  - no console issues
+  - no failed network requests
+  - no layout issues
+  - verified mocked customer OTP POST and human-response POST paths
+
+Still not fully proven:
+
+- Real live customer UI -> Sarathi -> customer OTP -> Sarathi OTP validation
+  after this exact patch. Previous runs proved the backend can reach OTP, and
+  smoke tests prove the UI bridge posts OTP/human answers correctly, but the
+  latest live UI run hit Sarathi 403 before OTP.

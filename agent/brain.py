@@ -51,6 +51,10 @@ settings = get_settings()
 SARATHI_HOME = f"{settings.sarathi_base_url}/sarathiHomePublic.do"
 
 
+class PortalTransientError(RuntimeError):
+    """Raised when Sarathi returns a retryable portal-level block."""
+
+
 class AgentAction:
     """Structured action returned by the LLM each step."""
 
@@ -155,6 +159,33 @@ class AgentBrain:
                 inputs=len(dom_elements.get("inputs", [])),
                 links=len(dom_elements.get("links", [])),
             )
+
+            portal_block_reason = self._portal_transient_block_reason(page_text, url)
+            if portal_block_reason:
+                retry_no = job.increment_retry("portal_transient_block")
+                msg = (
+                    f"Government portal returned a transient block: {portal_block_reason}. "
+                    f"Restarting portal flow from a fresh browser session (attempt {retry_no})."
+                )
+                log.warning(
+                    "brain.portal_transient_block",
+                    step=current_step if "current_step" in locals() else "",
+                    retry=retry_no,
+                    url=url,
+                    reason=portal_block_reason,
+                )
+                job.mark_step_done("portal_transient_block", StepLog(
+                    step_name="portal_transient_block",
+                    status="retrying",
+                    observation=portal_block_reason,
+                    action_taken="restart_fresh_portal_session",
+                    error=msg,
+                ))
+                job.steps_completed = []
+                job.session_cookies = []
+                job.last_url = ""
+                await self._sm.transition(job, JobStatus.FAILED_RETRYING, msg)
+                raise PortalTransientError(msg)
 
             # ── Build pending steps ────────────────────────────────────────────
             pending = steps_after(job.steps_completed)
@@ -3918,6 +3949,17 @@ class AgentBrain:
             "required",
         ]
         return any(term in lower for term in failure_terms)
+
+    @staticmethod
+    def _portal_transient_block_reason(page_text: str, url: str) -> str:
+        lower = f"{url}\n{page_text}".lower()
+        if "403" in lower and "forbidden" in lower:
+            return "Sarathi returned 403 Forbidden"
+        if "service unavailable" in lower or "bad gateway" in lower or "gateway timeout" in lower:
+            return "Sarathi gateway/service unavailable"
+        if "site can't be reached" in lower or "site cannot be reached" in lower:
+            return "Sarathi page could not be reached"
+        return ""
 
     @staticmethod
     def _is_bad_navigation(action: AgentAction, current_step: str) -> str:

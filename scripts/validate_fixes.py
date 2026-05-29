@@ -7,6 +7,7 @@ Validates:
   Bug C — first-OTP doesn't trip the "expired/fresh OTP" branch when the
           question text contains the word "Resend".
   Bug D — phase advances past PHASE_CONNECTING once portal popup is closed.
+  Bug G — retrying/portal-down payloads do not render the generic answer box.
 
 Run after restarting uvicorn on 127.0.0.1:8001.
 
@@ -103,6 +104,40 @@ def test_bug_c_first_otp_no_false_expiry() -> bool:
     ok &= assert_eq(
         "subline does NOT claim expiry",
         expired_phrase in v["subline"], False,
+    )
+    return ok
+
+
+def test_bug_g_retrying_is_not_customer_question() -> bool:
+    print("\n[Bug G] retrying/portal-down is passive, not a customer question")
+    ok = True
+
+    job = _fake_job(
+        ["open_homepage", "close_homepage_popup", "select_state"],
+        JobStatus.STUCK_HUMAN_NEEDED,
+        pending={
+            "question": "The page is showing a 403 Forbidden error.",
+            "context": "403 Forbidden",
+            "action_type": "confirmation",
+        },
+        error_message="The page is showing a 403 Forbidden error.",
+    )
+    v = customer_job_view(job)
+    ok &= assert_eq("phase", v["phase"], "retrying")
+    ok &= assert_eq("action_required", v["action_required"], False)
+    ok &= assert_eq("action_type", v["action_type"], "")
+    ok &= assert_eq("customer_request", v["customer_request"], {})
+
+    frontend = Path("frontend/index.html").read_text(encoding="utf-8")
+    ok &= assert_eq(
+        "frontend no longer routes all STUCK_HUMAN_NEEDED to answer screen",
+        "|| r.status === 'STUCK_HUMAN_NEEDED'" in frontend,
+        False,
+    )
+    ok &= assert_eq(
+        "frontend has explicit retrying branch",
+        "v.phase === 'retrying'" in frontend,
+        True,
     )
     return ok
 
@@ -360,6 +395,7 @@ async def main():
         test_bug_c_explicit_expiry_still_works(),
         test_bug_f_captcha_action_type_and_payload(),
         test_human_loop_captcha_step_name_routes_correctly(),
+        test_bug_g_retrying_is_not_customer_question(),
         await test_bug_a_ui_pin_stays_on_step_3(),
         await test_state_confirmation_ui_changes_payload(),
     ]
