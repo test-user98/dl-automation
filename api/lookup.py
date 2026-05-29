@@ -46,15 +46,26 @@ def _redact_phone(phone: str) -> str:
 async def lookup(
     phone: str = Query("", min_length=0, max_length=15),
     customer_id: str = Query("", min_length=0, max_length=40),
+    application_number: str = Query("", min_length=0, max_length=60),
 ):
-    if not phone and not customer_id:
-        raise HTTPException(status_code=400, detail="Provide phone or customer_id")
-    key = (phone or customer_id).strip()
+    if not phone and not customer_id and not application_number:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide phone, customer_id, or application_number",
+        )
+    key = (phone or customer_id or application_number).strip()
     _rate_check(key)
 
     store = get_store()
     cust = None
-    if customer_id:
+    # Lookup by application number first — most specific
+    if application_number:
+        matches = await store.list_applications(search=application_number, limit=5)
+        # Filter to exact application_number matches only (search is LIKE-based)
+        exact = [m for m in matches if m.get("application_number") == application_number]
+        if exact:
+            cust = await store.get_customer(exact[0]["customer_id"])
+    if not cust and customer_id:
         cust = await store.get_customer(customer_id)
     if not cust and phone:
         cust = await store.get_customer_by_phone(phone)

@@ -173,15 +173,29 @@ jobs:
                 AutoDeploymentsEnabled: true,
                 AuthenticationConfiguration: { AccessRoleArn: $role }
               }')
+            # update-service must succeed AND propagate the new env vars.
+            # The previous version silenced errors with `>/dev/null` and
+            # `|| true` — that hid a real failure once. Run loudly now.
             aws apprunner update-service \
               --region "$AWS_REGION" \
               --service-arn "$SERVICE_ARN" \
-              --source-configuration "$SOURCE_CFG" >/dev/null
-            # update-service starts a deployment automatically only if config changed;
-            # force a fresh pull of :latest to guarantee a deploy.
+              --source-configuration "$SOURCE_CFG"
+            # update-service returns immediately while the service rolls.
+            # Wait for it to leave OPERATION_IN_PROGRESS before we trigger
+            # a deployment, otherwise start-deployment races and may use
+            # stale env vars.
+            for i in $(seq 1 30); do
+              st=$(aws apprunner describe-service \
+                --region "$AWS_REGION" --service-arn "$SERVICE_ARN" \
+                --query 'Service.Status' --output text)
+              echo "  describe-service status=$st (try $i)"
+              [ "$st" = "RUNNING" ] && break
+              sleep 10
+            done
+            # Force a fresh pull of :latest to guarantee the new image is
+            # served (auto-deploy only fires on digest change, not sha tag).
             aws apprunner start-deployment \
-              --region "$AWS_REGION" \
-              --service-arn "$SERVICE_ARN" >/dev/null || true
+              --region "$AWS_REGION" --service-arn "$SERVICE_ARN"
           fi
 
           # Resolve the live URL for the summary

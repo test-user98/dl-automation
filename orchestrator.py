@@ -113,6 +113,23 @@ class Orchestrator:
         elif job.status not in (JobStatus.FAILED, JobStatus.CANCELLED):
             await self._sm.transition(job, JobStatus.FAILED, "Job ended without application number")
 
+        # Mirror the terminal job state into the matching Application row so
+        # the operator dashboard sees the truth without polling Jobs separately.
+        try:
+            from agent.customer_store import get_store
+            cs = get_store()
+            apps = await cs.list_applications(limit=200)
+            for a in apps:
+                if a.get("current_job_id") == job_id:
+                    await cs.update_application(
+                        a["app_id"],
+                        status=job.status.value,
+                        application_number=job.application_number or a.get("application_number") or "",
+                    )
+                    break
+        except Exception as e:
+            log.warning("orchestrator.app_sync_failed", job_id=job_id, error=str(e))
+
         log.info("orchestrator.done", job_id=job_id, final_status=job.status.value)
 
 

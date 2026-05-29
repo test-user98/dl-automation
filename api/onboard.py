@@ -59,6 +59,20 @@ async def validate_dl(req: DLValidateRequest):
 
 # ── Step 2: OCR fallback — upload DL photo to extract number ───────────────────
 
+_MAX_UPLOAD_BYTES = 8 * 1024 * 1024              # 8 MB
+_ACCEPTED_UPLOAD_TYPES = {
+    "image/jpeg", "image/jpg", "image/png", "image/heic", "image/webp",
+    "application/pdf",
+}
+
+
+def _safe_filename(name: str) -> str:
+    """Strip path separators and dangerous characters; preserve the extension."""
+    import re as _re
+    name = (name or "upload").rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    return _re.sub(r"[^A-Za-z0-9._-]+", "_", name)[-120:] or "upload"
+
+
 @router.post("/extract-dl-image")
 async def extract_dl_image(file: UploadFile = File(...)):
     """
@@ -66,11 +80,29 @@ async def extract_dl_image(file: UploadFile = File(...)):
     We OCR it, extract dl_number and other fields.
     Returns pre-filled form data for the confirmation screen.
     """
+    # Reject obviously-wrong content types early
+    if file.content_type and file.content_type.lower() not in _ACCEPTED_UPLOAD_TYPES:
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported file type: {file.content_type}. "
+                   "Please upload a JPG, PNG, HEIC, WEBP, or PDF.",
+        )
+
+    data = await file.read()
+    if len(data) > _MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large ({len(data) / (1024*1024):.1f} MB). "
+                   f"Maximum is {_MAX_UPLOAD_BYTES / (1024*1024):.0f} MB.",
+        )
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty file.")
+
     upload_dir = Path("./uploads")
     upload_dir.mkdir(exist_ok=True)
-    file_path = str(upload_dir / f"dl_{file.filename}")
+    file_path = str(upload_dir / f"dl_{_safe_filename(file.filename)}")
     with open(file_path, "wb") as f:
-        f.write(await file.read())
+        f.write(data)
 
     extracted = {}
     for attempt in range(1, settings.ocr_max_attempts + 1):

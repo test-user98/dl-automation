@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 
 from config.settings import get_settings
 from agent.customer_store import CustomerStore, get_store
+from agent.state_manager import JobStatus
 from api.deps import state_manager
 
 log = structlog.get_logger(__name__)
@@ -34,6 +35,14 @@ def require_admin(x_admin_secret: str = Header(None)):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
+def require_admin_qs(secret: str = "", x_admin_secret: str = Header(None)):
+    """Accept either a header (preferred) OR a ?secret=... query param.
+    Query-string auth exists so <img src> tags can preview admin documents —
+    browsers don't let img tags send custom headers."""
+    if (x_admin_secret or "") != _admin_secret() and (secret or "") != _admin_secret():
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
 def _store() -> CustomerStore:
     return get_store()
 
@@ -43,6 +52,15 @@ def _store() -> CustomerStore:
 class NoteBody(BaseModel):
     text: str = Field(..., min_length=1, max_length=2000)
     operator_id: str = Field("operator", max_length=120)
+
+
+_VALID_STATUSES = {s.value for s in JobStatus}
+
+
+class StatusBody(BaseModel):
+    status: str = Field(..., min_length=1, max_length=60)
+    operator_id: str = Field("operator", max_length=120)
+    note: str = Field("", max_length=2000)
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -93,12 +111,13 @@ async def list_applications(
     status: str = Query(""),
     service: str = Query(""),
     customer_id: str = Query(""),
+    search: str = Query(""),
     x_admin_secret: str = Header(None),
 ):
     require_admin(x_admin_secret)
     rows = await _store().list_applications(
         customer_id=customer_id, status=status, service=service,
-        limit=limit, offset=offset,
+        search=search, limit=limit, offset=offset,
     )
     return {"count": len(rows), "items": rows}
 
@@ -162,6 +181,27 @@ async def add_note(app_id: str, body: NoteBody, x_admin_secret: str = Header(Non
     return {"note": note}
 
 
+@router.post("/applications/{app_id}/status")
+async def update_status(app_id: str, body: StatusBody, x_admin_secret: str = Header(None)):
+    """Operator-side manual status push, e.g. mark a stuck job as CANCELLED."""
+    require_admin(x_admin_secret)
+    if body.status not in _VALID_STATUSES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid status. Must be one of: {sorted(_VALID_STATUSES)}",
+        )
+    store = _store()
+    app = await store.get_application(app_id)
+    if not app:
+        raise HTTPException(status_code=404, detail="Application not found")
+    updated = await store.update_application(app_id, status=body.status)
+    note_text = f"Status set to {body.status} by operator"
+    if body.note:
+        note_text = f"{note_text}: {body.note}"
+    await store.add_note(app_id, note_text, operator_id=body.operator_id)
+    return {"application": {"app_id": updated.app_id, "status": updated.status}}
+
+
 @router.get("/documents/{doc_id}")
 async def get_document_meta(doc_id: str, x_admin_secret: str = Header(None)):
     require_admin(x_admin_secret)
@@ -172,8 +212,13 @@ async def get_document_meta(doc_id: str, x_admin_secret: str = Header(None)):
 
 
 @router.get("/documents/{doc_id}/preview")
-async def preview_document(doc_id: str, x_admin_secret: str = Header(None)):
-    require_admin(x_admin_secret)
+async def preview_document(
+    doc_id: str,
+    secret: str = Query(""),
+    x_admin_secret: str = Header(None),
+):
+    """Accepts auth via header OR ?secret=… so <img src> tags can preview."""
+    require_admin_qs(secret=secret, x_admin_secret=x_admin_secret)
     doc = await _store().get_document(doc_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")

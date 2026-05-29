@@ -16,8 +16,9 @@ from typing import Optional
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Header
-from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.responses import StreamingResponse, FileResponse, Response
 from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from config.settings import get_settings
@@ -32,6 +33,21 @@ settings = get_settings()
 configure_logging(level="INFO", json_output=False)
 
 app = FastAPI(title="Sarathi Agent API", version="1.0.0")
+
+# CORS — same-origin works out of the box. If a deployment needs to allow a
+# specific external frontend domain, set CORS_ALLOW_ORIGINS in env (comma list).
+import os as _os
+_cors_origins = [
+    o.strip() for o in (_os.environ.get("CORS_ALLOW_ORIGINS") or "").split(",") if o.strip()
+]
+if _cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_credentials=True,
+        allow_methods=["GET", "POST"],
+        allow_headers=["Content-Type", "X-Secret", "X-Admin-Secret"],
+    )
 
 
 @app.on_event("startup")
@@ -72,6 +88,19 @@ async def serve_admin_ui():
     """RTO operator dashboard. The HTML itself is public — every data fetch
     inside it requires the X-Admin-Secret header, so showing the shell is fine."""
     return FileResponse(str(_frontend_dir / "admin.html"))
+
+
+# Tiny transparent PNG so browsers stop logging 404 on every page load.
+_FAVICON_BYTES = (
+    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x10\x00\x00\x00\x10"
+    b"\x08\x06\x00\x00\x00\x1f\xf3\xffa\x00\x00\x00\x19IDATx\x9cc\xfc\xff"
+    b"\xff?\x03)\x80\x89\x81DA\x00\x16\x18\x00\x00\xc0\x00\x01[F\xae0Q"
+    b"\x00\x00\x00\x00IEND\xaeB`\x82"
+)
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    return Response(content=_FAVICON_BYTES, media_type="image/png")
 
 
 # ── Auth ───────────────────────────────────────────────────────────────────────

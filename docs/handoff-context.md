@@ -222,7 +222,95 @@ is never empty in demo.
 - Move state from container disk to RDS Postgres + S3.
 - Operator: bulk export, status timeline view, assigning jobs to specific
   operators. None blocking demo.
-- Frontend customer "track my application" page that hits `/lookup`.
+
+## UI + API polish round (SHIPPED)
+
+22 audited issues fixed in one batch. 32/32 pytest pass (7 new tests
+added for the new endpoints).
+
+Customer UI (`frontend/index.html`):
+- OTP boxes now handle paste (`onpaste` event distributes 6 digits),
+  backspace navigates to previous box, arrow keys + Enter wired,
+  `autocomplete="one-time-code"` for Android SMS autofill.
+- Mobile regex tightened to `^[6-9]\d{9}$` (Indian mobile).
+- DOB sanity check: rejects impossible dates, future dates, < 1924.
+- File upload guard client-side: 8 MB max, accepts JPG/PNG/HEIC/WEBP/PDF.
+- "Try again with the same details" button on FAILED state preserves
+  the entered form data instead of `location.reload()`.
+- Landing screen "Track existing application" → `/lookup?phone=…`.
+- Mobile field copy updated to mark it required and explain it must be
+  the DL-registered number.
+- Topbar tagline "Powered by OpenAI · Codex".
+
+Operator UI (`frontend/admin.html`):
+- Status filter widened to all 15 JobStatus values.
+- `prettyService` recognises DL/RTO/OTP/PIN/OCR/KYC/NOC acronyms
+  ("DL Renewal" not "Dl Renewal").
+- Search field passes through to API (`?search=` param).
+- Doc preview uses `?secret=…` query param (img tags can't send
+  headers); broken images render an inline "Preview unavailable" panel.
+- Empty-note submission shows a toast instead of failing silently.
+- Sign-out button in topbar, Enter submits token gate, ESC closes the
+  drawer.
+- Apps table wrapped in `.table-scroll` for mobile.
+- Status pills added for OTP_RECEIVED, OCR_PROCESSING, OCR_DONE,
+  PARTNER_HANDOFF.
+
+API:
+- `/onboard/extract-dl-image` rejects >8 MB (413) and non-image MIME
+  (415); filename sanitised.
+- `/admin/applications/{app_id}/status` — operator manual status push.
+  Validates against the JobStatus enum, auto-records an operator note.
+- `/admin/applications` accepts `?search=` (LIKE on app_id, app_number,
+  customer phone, customer name).
+- `/lookup` now accepts `?application_number=…` in addition to phone +
+  customer_id.
+- `/favicon.ico` served (silences the 404).
+- CORS via `CORS_ALLOW_ORIGINS` env (comma-separated origins; off
+  by default → same-origin only).
+- Orchestrator mirrors terminal Job status (COMPLETED / FAILED /
+  CANCELLED) back into the matching Application row, so the operator
+  dashboard never goes stale.
+
+Workflow (`.github/workflows/deploy.yml`):
+- `update-service` no longer swallows errors (`>/dev/null` + `|| true`
+  removed). The previous version masked a real failure during the
+  c102e5e → 1b38006 deploy where env vars (GIT_COMMIT_SHA,
+  ADMIN_SECRET) silently stayed stale until I forced an update via
+  boto3.
+- Workflow now waits for `Service.Status=RUNNING` before calling
+  `start-deployment`, eliminating the race between config update and
+  fresh image pull.
+
+## Inputs in the UI (for the user)
+
+If you want to refine any of these labels/hints/copy, list them.
+
+Customer flow:
+| Field | Where | Type | Required | Current label / hint |
+|---|---|---|---|---|
+| DL photo | Step 1 | file (≤8 MB) | optional | "Upload a photo of your DL — we'll auto-read…" |
+| DL number | Step 2 | text | required | "Driving licence number" / "Printed on the front…" |
+| Date of birth | Step 2 | DD-MM-YYYY | required | "Date of birth" |
+| Mobile number | Step 2 | 10-digit `[6-9]\d{9}` | required | "Mobile number * / Need the number registered with your DL…" |
+| Full name | Step 2 | text | optional | "Full name (optional) / Leave blank — we'll read it from the portal." |
+| PIN code | Step 3 | 6-digit | required | "Present address PIN code" |
+| OTP | OTP screen | 6 digits | required when prompted | "Enter the OTP" |
+| Free-text answer | Human-needed | text | required when prompted | "Your answer" |
+| Phone (track) | Landing → Track | 10-digit | required if used | "10-digit mobile" |
+
+Operator flow:
+| Field | Where | Type | Required | Current label / hint |
+|---|---|---|---|---|
+| Admin secret | Token gate | password | required | "Admin secret" |
+| Operator note | App drawer | text | required | "Add an operator note…" |
+| Status change | (not yet in UI; API only) | enum | required | n/a |
+
+## Still deferred
+
+- Move state from container disk to RDS Postgres + S3.
+- Status-change widget in operator drawer (endpoint exists, UI not yet).
+- Bulk export, status timeline view, per-operator job assignment.
 
 ## User Preferences
 

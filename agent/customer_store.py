@@ -338,6 +338,7 @@ class CustomerStore:
         customer_id: str = "",
         status: str = "",
         service: str = "",
+        search: str = "",
         limit: int = 50,
         offset: int = 0,
     ) -> list[dict]:
@@ -349,6 +350,13 @@ class CustomerStore:
             where.append("a.status = ?"); params.append(status)
         if service:
             where.append("a.service_type = ?"); params.append(service)
+        if search:
+            like = f"%{search.strip()}%"
+            where.append(
+                "(a.app_id LIKE ? OR a.application_number LIKE ? "
+                " OR c.phone LIKE ? OR c.name LIKE ?)"
+            )
+            params.extend([like, like, like, like])
         clause = (" WHERE " + " AND ".join(where)) if where else ""
 
         q = (

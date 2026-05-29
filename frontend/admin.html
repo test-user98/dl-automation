@@ -92,15 +92,24 @@
       display: inline-block; padding: 3px 10px; border-radius: 999px;
       font-size: 12px; font-weight: 600;
     }
-    .st-CREATED, .st-AGENT_QUEUED            { background: #eef2f8; color: var(--ink-2); }
-    .st-AGENT_RUNNING, .st-OCR_PROCESSING    { background: #e6f0ff; color: var(--primary); }
-    .st-WAITING_OTP, .st-STUCK_HUMAN_NEEDED  { background: var(--warn-bg); color: var(--warn); }
-    .st-PAYMENT_PENDING                      { background: var(--warn-bg); color: var(--warn); }
-    .st-SUBMITTED, .st-COMPLETED             { background: var(--success-bg); color: var(--success); }
-    .st-FAILED, .st-CANCELLED                { color: var(--err); background: var(--err-bg); }
-    .st-FAILED_RETRYING                      { background: var(--warn-bg); color: var(--warn); }
+    .st-CREATED, .st-AGENT_QUEUED, .st-OCR_DONE            { background: #eef2f8; color: var(--ink-2); }
+    .st-AGENT_RUNNING, .st-OCR_PROCESSING, .st-OTP_RECEIVED { background: #e6f0ff; color: var(--primary); }
+    .st-WAITING_OTP, .st-STUCK_HUMAN_NEEDED                 { background: var(--warn-bg); color: var(--warn); }
+    .st-PAYMENT_PENDING, .st-PARTNER_HANDOFF                { background: var(--warn-bg); color: var(--warn); }
+    .st-SUBMITTED, .st-COMPLETED                            { background: var(--success-bg); color: var(--success); }
+    .st-FAILED, .st-CANCELLED                               { color: var(--err); background: var(--err-bg); }
+    .st-FAILED_RETRYING                                     { background: var(--warn-bg); color: var(--warn); }
 
     .empty { padding: 50px 24px; text-align: center; color: var(--muted); }
+    .table-scroll { width: 100%; overflow-x: auto; }
+    .toast {
+      position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
+      background: var(--ink); color: #fff; padding: 10px 16px; border-radius: 10px;
+      font-size: 14px; z-index: 100; opacity: 0; transition: opacity 0.2s;
+      pointer-events: none;
+    }
+    .toast.on { opacity: 1; }
+    .toast.err { background: var(--err); }
 
     /* detail drawer */
     .drawer-backdrop {
@@ -156,7 +165,10 @@
       <span class="brand">RTO Operator</span>
       <span class="brand-sub">Sarathi automation dashboard</span>
     </div>
-    <div class="brand-sub" id="conn-status">—</div>
+    <div style="display: flex; gap: 12px; align-items: center">
+      <span class="brand-sub" id="conn-status">—</span>
+      <button id="signout-btn" class="hidden" onclick="signOut()" style="min-height:32px; padding: 0 12px; font-size: 13px">Sign out</button>
+    </div>
   </div>
 
   <main class="shell">
@@ -200,11 +212,19 @@
           <select id="filt-status" onchange="loadApps()">
             <option value="">All statuses</option>
             <option>CREATED</option>
+            <option>OCR_PROCESSING</option>
+            <option>OCR_DONE</option>
+            <option>AGENT_QUEUED</option>
             <option>AGENT_RUNNING</option>
             <option>WAITING_OTP</option>
+            <option>OTP_RECEIVED</option>
             <option>STUCK_HUMAN_NEEDED</option>
+            <option>PAYMENT_PENDING</option>
+            <option>FAILED_RETRYING</option>
             <option>SUBMITTED</option>
+            <option>PARTNER_HANDOFF</option>
             <option>COMPLETED</option>
+            <option>CANCELLED</option>
             <option>FAILED</option>
           </select>
           <select id="filt-service" onchange="loadApps()">
@@ -234,6 +254,9 @@
 
     </section>
   </main>
+
+  <!-- toast -->
+  <div class="toast" id="toast"></div>
 
   <!-- detail drawer -->
   <div class="drawer-backdrop" id="backdrop" onclick="closeDrawer()"></div>
@@ -272,6 +295,7 @@ async function signIn() {
     sessionStorage.setItem('admin_secret', v);
     document.getElementById('gate').classList.add('hidden');
     document.getElementById('dash').classList.remove('hidden');
+    document.getElementById('signout-btn').classList.remove('hidden');
     setConn(true);
     renderSummary(s.counts);
     loadApps();
@@ -286,8 +310,22 @@ function signOut() {
   SECRET = '';
   document.getElementById('dash').classList.add('hidden');
   document.getElementById('gate').classList.remove('hidden');
+  document.getElementById('signout-btn').classList.add('hidden');
   setConn(false);
 }
+
+// Enter-to-submit on token gate
+document.addEventListener('DOMContentLoaded', () => {
+  const sec = document.getElementById('admin-secret');
+  if (sec) sec.addEventListener('keydown', e => { if (e.key === 'Enter') signIn(); });
+});
+
+// ESC closes the drawer
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && document.getElementById('drawer').classList.contains('on')) {
+    closeDrawer();
+  }
+});
 
 function renderSummary(c) {
   if (!c) return;
@@ -318,28 +356,21 @@ function debouncedAppFilter() { clearTimeout(appFilterTimer); appFilterTimer = s
 async function loadApps() {
   const status  = document.getElementById('filt-status').value;
   const service = document.getElementById('filt-service').value;
-  const search  = document.getElementById('filt-app-search').value.trim().toLowerCase();
+  const search  = document.getElementById('filt-app-search').value.trim();
   let qs = `?limit=100`;
   if (status)  qs += `&status=${encodeURIComponent(status)}`;
   if (service) qs += `&service=${encodeURIComponent(service)}`;
+  if (search)  qs += `&search=${encodeURIComponent(search)}`;
   let data;
   try { data = await adminFetch('/admin/applications' + qs); }
   catch (e) { return; }
-  let rows = data.items || [];
-  if (search) rows = rows.filter(r =>
-    (r.customer_phone || '').includes(search) ||
-    (r.application_number || '').toLowerCase().includes(search) ||
-    (r.customer_name || '').toLowerCase().includes(search) ||
-    (r.app_id || '').toLowerCase().includes(search)
-  );
-  renderAppsTable(rows);
-  try { renderSummary((await adminFetch('/admin/summary')).counts); } catch (_) {}
+  renderAppsTable(data.items || []);
 }
 
 function renderAppsTable(rows) {
   const wrap = document.getElementById('apps-table-wrap');
   if (!rows.length) { wrap.innerHTML = `<div class="empty">No applications match your filters.</div>`; return; }
-  let html = `<table><thead><tr>
+  let html = `<div class="table-scroll"><table><thead><tr>
     <th>Customer</th><th>Service</th><th>Status</th><th>App number</th><th>Fee</th><th>Last updated</th>
   </tr></thead><tbody>`;
   for (const r of rows) {
@@ -355,7 +386,7 @@ function renderAppsTable(rows) {
       <td>${esc(relTime(r.updated_at))}</td>
     </tr>`;
   }
-  html += '</tbody></table>';
+  html += '</tbody></table></div>';
   wrap.innerHTML = html;
 }
 
@@ -375,7 +406,7 @@ async function loadCustomers() {
 function renderCustomersTable(rows) {
   const wrap = document.getElementById('customers-table-wrap');
   if (!rows.length) { wrap.innerHTML = `<div class="empty">No customers yet.</div>`; return; }
-  let html = `<table><thead><tr>
+  let html = `<div class="table-scroll"><table><thead><tr>
     <th>Customer</th><th>Customer ID</th><th>Phone</th><th>Applications</th><th>Last activity</th>
   </tr></thead><tbody>`;
   for (const r of rows) {
@@ -387,7 +418,7 @@ function renderCustomersTable(rows) {
       <td>${esc(relTime(r.last_activity))}</td>
     </tr>`;
   }
-  html += '</tbody></table>';
+  html += '</tbody></table></div>';
   wrap.innerHTML = html;
 }
 
@@ -447,9 +478,12 @@ async function openApp(appId) {
 }
 
 function renderDoc(d) {
+  // Append admin secret as query so the <img> tag can authenticate without custom headers
+  const previewUrl = `${API}/admin/documents/${d.doc_id}/preview?secret=${encodeURIComponent(SECRET)}`;
+  const fallback = `'<div style=\\'display:flex;align-items:center;justify-content:center;height:100%;color:var(--muted);font-size:12px;text-align:center;padding:6px\\'>Preview unavailable</div>'`;
   return `
     <div class="doc">
-      <div class="imgwrap"><img src="${API}/admin/documents/${d.doc_id}/preview" alt="${esc(d.doc_type)}" onerror="this.style.display='none'" /></div>
+      <div class="imgwrap"><img src="${previewUrl}" alt="${esc(d.doc_type)}" onerror="this.outerHTML=${fallback}" /></div>
       <div style="font-weight: 600">${esc(prettyDocType(d.doc_type))}</div>
       <div class="conf">Confidence ${Math.round((d.confidence || 0) * 100)}%</div>
       <div style="color: var(--muted); margin-top: 4px">${(d.size_bytes || 0).toLocaleString()} bytes</div>
@@ -459,13 +493,21 @@ function renderDoc(d) {
 
 async function addNote(appId) {
   const t = document.getElementById('new-note').value.trim();
-  if (!t) return;
+  if (!t) { toast('Please type a note before adding.', 'err'); return; }
   const res = await fetch(`${API}/admin/applications/${appId}/notes`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Admin-Secret': SECRET },
     body: JSON.stringify({ text: t }),
   });
-  if (res.ok) openApp(appId);
+  if (res.ok) { toast('Note added.'); openApp(appId); }
+  else        { toast(`Could not add note (HTTP ${res.status}).`, 'err'); }
+}
+
+function toast(msg, kind) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'toast on' + (kind === 'err' ? ' err' : '');
+  setTimeout(() => el.classList.remove('on'), 2500);
 }
 
 async function openCustomer(cid) {
@@ -514,9 +556,14 @@ function closeDrawer() {
 function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, ch => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[ch]));
 }
+const ACRONYMS = new Set(['DL', 'RTO', 'OTP', 'PIN', 'OCR', 'KYC', 'NOC']);
 function prettyService(s) {
   if (!s) return '—';
-  return s.replace(/_/g, ' ').replace(/\bDL\b/g, 'DL').toLowerCase().replace(/\b\w/g, c => c.toUpperCase());
+  return s.split('_').map(w => {
+    const up = w.toUpperCase();
+    if (ACRONYMS.has(up)) return up;
+    return up[0] + w.slice(1).toLowerCase();
+  }).join(' ');
 }
 function prettyDocType(s) {
   return ({ driving_license: 'Driving License', aadhaar: 'Aadhaar', address_proof: 'Address proof' }[s]) || (s || '').replace(/_/g, ' ');

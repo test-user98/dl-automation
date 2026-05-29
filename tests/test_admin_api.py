@@ -175,3 +175,93 @@ def test_lookup_rate_limit(client):
         r = client.get("/lookup?phone=9876512345")
         assert r.status_code in (200,)
     assert client.get("/lookup?phone=9876512345").status_code == 429
+
+
+# ─── New endpoints (UI/API polish round) ──────────────────────────────────────
+
+def test_application_search_filter(client):
+    """The /admin/applications search param should match phone/name/app/number."""
+    r = client.get("/admin/applications?search=Aarav", headers=_hdr(client))
+    assert r.status_code == 200
+    rows = r.json()["items"]
+    assert any("Aarav" in (a.get("customer_name") or "") for a in rows)
+
+    r2 = client.get("/admin/applications?search=9876512345", headers=_hdr(client))
+    assert any(a.get("customer_phone") == "9876512345" for a in r2.json()["items"])
+
+
+def test_status_update_endpoint(client):
+    rows = client.get("/admin/applications", headers=_hdr(client)).json()["items"]
+    app_id = rows[0]["app_id"]
+    # Bad status rejected
+    r = client.post(
+        f"/admin/applications/{app_id}/status",
+        headers={**_hdr(client), "Content-Type": "application/json"},
+        json={"status": "MOON"},
+    )
+    assert r.status_code == 400
+    # Valid status accepted, note auto-added
+    r = client.post(
+        f"/admin/applications/{app_id}/status",
+        headers={**_hdr(client), "Content-Type": "application/json"},
+        json={"status": "CANCELLED", "note": "operator cancelled per customer call"},
+    )
+    assert r.status_code == 200
+    assert r.json()["application"]["status"] == "CANCELLED"
+    # Note is visible in detail
+    d = client.get(f"/admin/applications/{app_id}", headers=_hdr(client))
+    assert any("operator cancelled" in n["text"] for n in d.json()["notes"])
+
+
+def test_doc_preview_query_secret(client):
+    """The img-tag preview path accepts ?secret= without the header."""
+    rows = client.get("/admin/applications", headers=_hdr(client)).json()["items"]
+    for r in rows:
+        d = client.get(f"/admin/applications/{r['app_id']}", headers=_hdr(client))
+        docs = d.json()["documents"]
+        if not docs:
+            continue
+        doc_id = docs[0]["doc_id"]
+        # No header at all -> 401
+        bad = client.get(f"/admin/documents/{doc_id}/preview")
+        assert bad.status_code == 401
+        # With query string secret -> 200 or 410
+        ok = client.get(f"/admin/documents/{doc_id}/preview?secret=admin-secret")
+        assert ok.status_code in (200, 410)
+        return
+    pytest.skip("no seeded documents")
+
+
+def test_upload_rejects_oversize(client):
+    """/onboard/extract-dl-image should reject files over 8 MB."""
+    huge = b"x" * (9 * 1024 * 1024)  # 9 MB
+    r = client.post(
+        "/onboard/extract-dl-image",
+        files={"file": ("big.jpg", huge, "image/jpeg")},
+    )
+    assert r.status_code == 413
+
+
+def test_upload_rejects_bad_mime(client):
+    r = client.post(
+        "/onboard/extract-dl-image",
+        files={"file": ("x.exe", b"binary", "application/octet-stream")},
+    )
+    assert r.status_code == 415
+
+
+def test_lookup_by_application_number(client):
+    """Lookup by application number finds the customer record."""
+    # Seeded app numbers include 'RJ-DL-2026-04219'
+    r = client.get("/lookup?application_number=RJ-DL-2026-04219")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["found"] is True
+    assert any(a["application_number"] == "RJ-DL-2026-04219"
+               for a in body["applications"])
+
+
+def test_favicon_served(client):
+    r = client.get("/favicon.ico")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("image/")

@@ -192,7 +192,7 @@
       <span class="brand">RTO Services</span>
       <span class="brand-sub">Driving licence renewal · India</span>
     </div>
-    <div class="brand-sub">Powered by AI agent</div>
+    <div class="brand-sub">Powered by OpenAI &middot; Codex</div>
   </div>
 
   <main class="shell">
@@ -220,6 +220,16 @@
 
       <div class="actions">
         <button class="primary" onclick="goStep(2)" id="step1-next">Continue without photo</button>
+        <button class="ghost"   onclick="openTrack()">Track existing application</button>
+      </div>
+
+      <div id="track-panel" class="banner hidden" style="margin-top:14px">
+        <label style="display:block; font-size:12px; font-weight:600; color:var(--ink-2); margin-bottom:6px">Look up by phone number</label>
+        <div style="display:flex; gap:8px">
+          <input id="track-phone" placeholder="10-digit mobile" maxlength="10" inputmode="numeric" style="flex:1; min-height:38px; border:1px solid var(--line-2); border-radius:8px; padding:6px 10px; font:inherit" />
+          <button class="primary" onclick="lookupTrack()">Look up</button>
+        </div>
+        <div id="track-result" style="margin-top:10px"></div>
       </div>
     </section>
 
@@ -240,9 +250,9 @@
           <input id="dob" placeholder="DD-MM-YYYY" maxlength="10" inputmode="numeric" oninput="formatDOB(this)" />
         </div>
         <div class="field">
-          <label>Mobile number</label>
+          <label>Mobile number <span style="color: var(--err)">*</span></label>
           <input id="mobile" placeholder="10-digit mobile" maxlength="10" inputmode="numeric" />
-          <div class="hint">We'll send you a status update here.</div>
+          <div class="hint">Need the number registered with your DL — the government portal sends the OTP to this number.</div>
         </div>
       </div>
 
@@ -313,12 +323,12 @@
       <p class="sub" id="otp-sub">The government portal just sent an OTP to your registered mobile. Enter it here so we can submit your application.</p>
 
       <div class="otp-row" id="otp-row">
-        <input maxlength="1" inputmode="numeric" oninput="moveOTP(this, 1)" />
-        <input maxlength="1" inputmode="numeric" oninput="moveOTP(this, 2)" />
-        <input maxlength="1" inputmode="numeric" oninput="moveOTP(this, 3)" />
-        <input maxlength="1" inputmode="numeric" oninput="moveOTP(this, 4)" />
-        <input maxlength="1" inputmode="numeric" oninput="moveOTP(this, 5)" />
-        <input maxlength="1" inputmode="numeric" oninput="moveOTP(this, 6)" />
+        <input maxlength="6" inputmode="numeric" autocomplete="one-time-code" />
+        <input maxlength="1" inputmode="numeric" autocomplete="one-time-code" />
+        <input maxlength="1" inputmode="numeric" autocomplete="one-time-code" />
+        <input maxlength="1" inputmode="numeric" autocomplete="one-time-code" />
+        <input maxlength="1" inputmode="numeric" autocomplete="one-time-code" />
+        <input maxlength="1" inputmode="numeric" autocomplete="one-time-code" />
       </div>
 
       <div style="text-align:center; margin-top: 6px">
@@ -384,12 +394,29 @@ function goStep(n) {
 }
 
 // ─── Step 1: OCR upload ─────────────────────────────────────────────────────
+const MAX_UPLOAD_BYTES = 8 * 1024 * 1024;            // 8 MB — comfortably enough for a phone photo
+const ACCEPTED_UPLOAD = ['image/jpeg', 'image/jpg', 'image/png', 'image/heic', 'image/webp', 'application/pdf'];
+
 async function onDLImage(input) {
   const file = input.files[0];
   if (!file) return;
   const banner = document.getElementById('ocr-banner');
   banner.className = 'banner';
   banner.classList.remove('hidden');
+
+  if (file.size > MAX_UPLOAD_BYTES) {
+    banner.className = 'banner err';
+    banner.textContent = `That file is too large (${(file.size / (1024*1024)).toFixed(1)} MB). Please upload a photo under 8 MB.`;
+    input.value = '';
+    return;
+  }
+  if (file.type && !ACCEPTED_UPLOAD.includes(file.type.toLowerCase())) {
+    banner.className = 'banner err';
+    banner.textContent = `Unsupported file type (${file.type}). Please upload a JPG, PNG, HEIC, WEBP, or PDF.`;
+    input.value = '';
+    return;
+  }
+
   banner.textContent = 'Reading your DL — this takes a few seconds…';
 
   const form = new FormData();
@@ -465,6 +492,20 @@ function formatDOB(el) {
   el.value = v;
 }
 
+function isValidDOB(s) {
+  const m = /^(\d{2})-(\d{2})-(\d{4})$/.exec(s);
+  if (!m) return false;
+  const [_, dd, mm, yyyy] = m;
+  const d = Number(dd), mo = Number(mm), y = Number(yyyy);
+  if (mo < 1 || mo > 12 || d < 1 || d > 31) return false;
+  const dt = new Date(y, mo - 1, d);
+  if (dt.getFullYear() !== y || dt.getMonth() !== mo - 1 || dt.getDate() !== d) return false;
+  const now = new Date();
+  if (dt > now) return false;
+  if (y < 1924) return false;            // older than 100 years is almost certainly a typo
+  return true;
+}
+
 // ─── Step 3: review + start ────────────────────────────────────────────────
 function renderReview() {
   const rows = {
@@ -485,9 +526,9 @@ async function startJob() {
   const dob    = document.getElementById('dob').value.trim();
   const mobile = document.getElementById('mobile').value.trim();
   const pin    = document.getElementById('pin_code').value.trim();
-  if (!okDl)                          return inlineAlert('Please double-check the DL number.');
-  if (!/^\d{2}-\d{2}-\d{4}$/.test(dob))   return inlineAlert('DOB should be DD-MM-YYYY.');
-  if (!/^\d{10}$/.test(mobile))           return inlineAlert('Mobile should be 10 digits.');
+  if (!okDl)                              return inlineAlert('Please double-check the DL number.');
+  if (!isValidDOB(dob))                   return inlineAlert('DOB should be DD-MM-YYYY and a real date between 1924 and today.');
+  if (!/^[6-9]\d{9}$/.test(mobile))       return inlineAlert('Mobile should be a 10-digit Indian number starting with 6, 7, 8, or 9.');
   if (!/^\d{6}$/.test(pin))               return inlineAlert('PIN should be 6 digits.');
 
   const btn = document.getElementById('start-btn');
@@ -561,11 +602,13 @@ function applyJob(r) {
     show('screen-done');
   } else if (r.status === 'FAILED') {
     clearInterval(pollTimer);
-    // Failed but customer can retry
     const b = document.getElementById('live-banner');
     b.className = 'banner err'; b.classList.remove('hidden');
     b.innerHTML = `${escapeHtml(v.subline || 'Something went wrong.')}
-      <div style="margin-top: 10px"><button class="ghost" onclick="location.reload()">Try again</button></div>`;
+      <div style="margin-top: 10px">
+        <button class="primary" onclick="retryWithSameData()">Try again with the same details</button>
+        <button class="ghost"   onclick="location.reload()">Start over</button>
+      </div>`;
   }
 }
 
@@ -606,14 +649,55 @@ function showOTP(v) {
   document.getElementById('otp-sub').textContent = v.subline
     || 'Enter the OTP the government portal sent to your phone.';
   show('screen-otp');
+  wireOTPInputs();
   const first = document.querySelector('#otp-row input');
-  if (first) first.focus();
+  if (first) { first.value = ''; first.focus(); }
 }
 
-function moveOTP(el, idx) {
-  el.value = el.value.replace(/\D/g, '').slice(-1);
-  const inputs = document.querySelectorAll('#otp-row input');
-  if (el.value && idx < 6) inputs[idx].focus();
+function wireOTPInputs() {
+  const inputs = Array.from(document.querySelectorAll('#otp-row input'));
+  if (inputs.length === 0 || inputs[0]._otpWired) return;
+  inputs.forEach((el, i) => {
+    el._otpWired = true;
+    el.addEventListener('input', (e) => {
+      const raw = (el.value || '').replace(/\D/g, '');
+      if (raw.length > 1) {                       // paste or autofill
+        distributeOTP(raw);
+        return;
+      }
+      el.value = raw.slice(-1);
+      if (el.value && i < inputs.length - 1) inputs[i + 1].focus();
+    });
+    el.addEventListener('keydown', (e) => {
+      if (e.key === 'Backspace' && !el.value && i > 0) {
+        inputs[i - 1].focus();
+        inputs[i - 1].value = '';
+        e.preventDefault();
+      } else if (e.key === 'ArrowLeft' && i > 0) {
+        inputs[i - 1].focus(); e.preventDefault();
+      } else if (e.key === 'ArrowRight' && i < inputs.length - 1) {
+        inputs[i + 1].focus(); e.preventDefault();
+      } else if (e.key === 'Enter') {
+        submitOTP();
+      }
+    });
+    el.addEventListener('paste', (e) => {
+      const txt = (e.clipboardData || window.clipboardData).getData('text') || '';
+      const digits = txt.replace(/\D/g, '');
+      if (digits.length >= 2) {
+        e.preventDefault();
+        distributeOTP(digits);
+      }
+    });
+  });
+}
+
+function distributeOTP(digits) {
+  const inputs = Array.from(document.querySelectorAll('#otp-row input'));
+  digits = digits.slice(0, 6);
+  inputs.forEach((el, i) => { el.value = digits[i] || ''; });
+  const next = Math.min(digits.length, 5);
+  inputs[next].focus();
 }
 
 async function submitOTP() {
@@ -636,6 +720,14 @@ function resendOTP() {
   // No API for resend yet — restart the polling so the agent re-evaluates.
   show('screen-4');
   startPolling();
+}
+
+async function retryWithSameData() {
+  // Restart agent with the same payload — keep all entered details, just submit again.
+  currentJobId = null;
+  clearInterval(pollTimer);
+  document.getElementById('live-banner').classList.add('hidden');
+  await startJob();
 }
 
 async function submitHumanResponse() {
@@ -674,6 +766,43 @@ function formatDL(dl) {
 
 function escapeHtml(v) {
   return String(v).replace(/[&<>"']/g, ch => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[ch]));
+}
+
+// ─── Track existing application ─────────────────────────────────────────────
+function openTrack() {
+  document.getElementById('track-panel').classList.toggle('hidden');
+  const el = document.getElementById('track-phone');
+  if (el) el.focus();
+}
+
+async function lookupTrack() {
+  const phone = document.getElementById('track-phone').value.trim();
+  const out   = document.getElementById('track-result');
+  if (!/^[6-9]\d{9}$/.test(phone)) {
+    out.innerHTML = `<div style="color:var(--err); font-size:13px">Enter a valid 10-digit mobile number.</div>`;
+    return;
+  }
+  out.innerHTML = `<div style="color:var(--muted); font-size:13px">Looking up…</div>`;
+  let r;
+  try {
+    r = await fetch(`${API}/lookup?phone=${encodeURIComponent(phone)}`).then(x => x.json());
+  } catch (e) {
+    out.innerHTML = `<div style="color:var(--err); font-size:13px">Could not reach the server.</div>`;
+    return;
+  }
+  if (!r.found || !r.applications?.length) {
+    out.innerHTML = `<div style="color:var(--muted); font-size:13px">No applications found for ${escapeHtml(phone)}. Start a new one below.</div>`;
+    return;
+  }
+  out.innerHTML = r.applications.map(a => `
+    <div class="banner" style="margin-bottom:8px">
+      <div style="font-weight:600">${escapeHtml(a.customer_view?.headline || a.status)}</div>
+      <div style="color:var(--muted); font-size:13px; margin-top:2px">
+        ${escapeHtml(a.service_type.replace(/_/g, ' '))} • ${escapeHtml(a.customer_view?.subline || '')}
+      </div>
+      ${a.application_number ? `<div style="font-size:13px; margin-top:6px"><b>App #</b>: ${escapeHtml(a.application_number)}</div>` : ''}
+    </div>
+  `).join('');
 }
 </script>
 </body>
