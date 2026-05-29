@@ -1,6 +1,12 @@
 # Core
 anthropic>=0.40.0
-playwright>=1.48.0
+# Pinned exactly: the Docker base image
+# `mcr.microsoft.com/playwright/python:v1.48.0-jammy` ships chromium for 1.48.
+# Any newer SDK (e.g. 1.60.0) expects chromium at a different path and
+# every BrowserType.launch() crashes immediately inside the container, with
+# the customer seeing a misleading "Portal session interrupted" message.
+# Keep this in lockstep with the Dockerfile base-image tag.
+playwright==1.48.0
 fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
 python-multipart>=0.0.18
