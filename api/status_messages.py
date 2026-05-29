@@ -32,11 +32,16 @@ PHASE_FAILED     = "failed"
 
 # Map each known agent step to (phase, short customer label).
 # Anything missing falls back to ("filling", "Working on your application").
+#
+# Connecting = pre-portal: we're still loading the Sarathi homepage.
+# Once any popup is closed or the state dropdown is touched, the agent is
+# verifiably on the portal, so we advance to "filling". This matters because
+# the customer reads a stale "Connecting…" headline as the agent being stuck.
 STEP_TO_PHASE: dict[str, tuple[str, str]] = {
     "open_homepage":            (PHASE_CONNECTING, "Connecting to the government portal"),
-    "close_homepage_popup":     (PHASE_CONNECTING, "Connecting to the government portal"),
-    "select_state":             (PHASE_CONNECTING, "Selecting your state"),
-    "close_state_popup":        (PHASE_CONNECTING, "Selecting your state"),
+    "close_homepage_popup":     (PHASE_FILLING,    "On the portal — preparing your request"),
+    "select_state":             (PHASE_FILLING,    "Selecting your state"),
+    "close_state_popup":        (PHASE_FILLING,    "Opening the DL renewal section"),
     "navigate_to_dl_services":  (PHASE_FILLING,    "Opening the DL renewal page"),
     "fetch_dl_details":         (PHASE_FILLING,    "Looking up your DL on the portal"),
     "confirm_dl_details":       (PHASE_FILLING,    "Confirming your details with the portal"),
@@ -61,6 +66,67 @@ _PORTAL_DOWN_PATTERNS = (
     "gateway timeout", "site can't be reached", "site cannot be reached",
     "err_connection", "name not resolved", "net::err",
 )
+
+# Phrases that mean Sarathi actually marked the OTP as expired/needing resend
+# (not just our own UI offering a "Resend OTP" option). Must be specific enough
+# that the option label "Resend OTP" alone does NOT trip the expired branch.
+_OTP_EXPIRED_PATTERNS = (
+    "otp expired",
+    "otp has expired",
+    "fresh otp",
+    "expired otp",
+    "request a fresh",
+    "request fresh otp",
+    "resend otp option",  # the agent explicitly chose the resend path
+)
+_OTP_INVALID_PATTERNS = (
+    "invalid otp", "wrong otp", "incorrect otp", "otp invalid",
+    "otp incorrect", "otp does not match",
+)
+
+
+def _otp_message(lower: str, mobile_suffix: str) -> tuple[str, str]:
+    """Pick the right OTP customer message based on portal signals.
+
+    Order matters: invalid is more specific than expired (an expired OTP can
+    also be rejected as invalid by some portals).
+    """
+    if any(p in lower for p in _OTP_INVALID_PATTERNS):
+        return (
+            "Check the OTP",
+            "The government portal did not accept the previous OTP. "
+            f"Please enter the latest OTP sent to {mobile_suffix}.",
+        )
+    if any(p in lower for p in _OTP_EXPIRED_PATTERNS):
+        return (
+            "Enter the fresh OTP",
+            f"The previous OTP expired. We requested a fresh OTP on {mobile_suffix}. "
+            "Enter the new code here so we can continue.",
+        )
+    return (
+        "Enter the OTP",
+        f"The government portal just sent an OTP to {mobile_suffix}. "
+        "Enter it here so we can submit your application.",
+    )
+
+
+def _otp_in_question(pending_request: dict, lower: str) -> bool:
+    """True iff the pending human-loop request is genuinely about an OTP.
+
+    Looks at the pending request's own text first (step_name / question /
+    context) before falling back to the broader job context, because the
+    job log can contain OTP-related noise from earlier steps.
+    """
+    parts = []
+    if isinstance(pending_request, dict):
+        parts.extend([
+            str(pending_request.get("step_name", "")),
+            str(pending_request.get("question", "")),
+            str(pending_request.get("context", "")),
+        ])
+    if any("otp" in p.lower() for p in parts):
+        return True
+    return "otp" in lower
 
 
 def _mask_mobile(mobile: str) -> str:
@@ -127,24 +193,8 @@ def customer_job_view(job: Job) -> dict:
         phase = PHASE_WAITING
         action_required = True
         action_type = "otp"
-        if "expired" in lower or "fresh otp" in lower or "resend" in lower:
-            title = "Enter the fresh OTP"
-            message = (
-                f"The previous OTP expired. We requested a fresh OTP on {mobile_suffix}. "
-                "Enter the new code here so we can continue."
-            )
-        elif "invalid otp" in lower or "wrong otp" in lower or "incorrect otp" in lower:
-            title = "Check the OTP"
-            message = (
-                "The government portal did not accept the previous OTP. "
-                f"Please enter the latest OTP sent to {mobile_suffix}."
-            )
-        else:
-            title = "Enter the OTP"
-            message = (
-                f"The government portal just sent an OTP to {mobile_suffix}. "
-                "Enter it here so we can submit your application."
-            )
+        title, message = _otp_message(lower, mobile_suffix)
+        step_label = "Waiting for the OTP"
         severity = "action"
 
     elif job.status == JobStatus.STUCK_HUMAN_NEEDED:
@@ -152,27 +202,11 @@ def customer_job_view(job: Job) -> dict:
         action_required = not pending_answered
         action_type = (
             pending_request.get("action_type")
-            or ("otp" if "otp" in lower else "human_response")
+            or ("otp" if _otp_in_question(pending_request, lower) else "human_response")
         )
         if action_type == "otp":
-            if "expired" in lower or "fresh otp" in lower or "resend" in lower:
-                title = "Enter the fresh OTP"
-                message = (
-                    f"The previous OTP expired. We requested a fresh OTP on {mobile_suffix}. "
-                    "Enter the new code here so we can continue."
-                )
-            elif "invalid otp" in lower or "wrong otp" in lower or "incorrect otp" in lower:
-                title = "Check the OTP"
-                message = (
-                    "The government portal did not accept the previous OTP. "
-                    f"Please enter the latest OTP sent to {mobile_suffix}."
-                )
-            else:
-                title = "Enter the OTP"
-                message = (
-                    f"The government portal just sent an OTP to {mobile_suffix}. "
-                    "Enter it here so we can submit your application."
-                )
+            title, message = _otp_message(lower, mobile_suffix)
+            step_label = "Waiting for the OTP"
         elif pending_request:
             title = _title_for_customer_request(pending_request)
             message = (
@@ -180,9 +214,11 @@ def customer_job_view(job: Job) -> dict:
                 or pending_request.get("context")
                 or "Please confirm one detail so we can continue."
             )
+            step_label = title
         else:
             title = "We need one detail"
             message = _human_message(lower) or "Please confirm one detail so we can continue."
+            step_label = title
         severity = "action"
 
     elif job.status in {JobStatus.SUBMITTED, JobStatus.COMPLETED}:

@@ -651,3 +651,167 @@ Final deploy result:
 - Only remaining warning: GitHub's Node.js 20 deprecation warning for upstream
   actions (`actions/checkout`, AWS credential action, Docker actions). This is
   not blocking today, but should be upgraded later.
+
+## CRITICAL: live container browser-launch bug (NOT YET FIXED)
+
+Discovered 2026-05-29 while the user was running a real DL submission against
+the live App Runner deploy. The customer hit "Portal session interrupted" within
+~17 seconds of clicking Start.
+
+**Real failure** (from `GET /jobs/{job_id}.error_message` on the live API):
+
+```
+BrowserType.launch: Executable doesn't exist at
+/ms-playwright/chromium_headless_shell-1223/chrome-headless-shell-linux64/chrome-headless-shell
+
+Looks like Playwright was just updated to 1.60.0.
+Please update docker image as well.
+-  current: mcr.microsoft.com/playwright/python:v1.48.0-jammy
+- required: mcr.microsoft.com/playwright/python:v1.60.0-jammy
+```
+
+**Root cause:** `requirements.txt` pins `playwright>=1.48.0` with no upper
+bound. The Docker base image is `mcr.microsoft.com/playwright/python:v1.48.0-jammy`.
+Inside the container `pip install` resolves to playwright **1.60.0**, which
+expects chromium at a new path that doesn't exist in the 1.48 base image.
+The agent's `BrowserType.launch()` fails immediately; it retries 3 times; the
+job dies. The "browser" keyword in the error text routes the customer-facing
+message to `"Portal session interrupted"` (`api/status_messages.py:338-343`),
+which is misleading — the portal was never contacted.
+
+**Verification gap that allowed this:**
+
+- The workflow's "Wait for App Runner to serve this commit" step polls
+  `/health.commit` until it matches the pushed SHA. `/health` only proves the
+  FastAPI process started — it does NOT spin up Playwright. So a workflow can
+  go green while every actual agent run dies on browser launch.
+- No automated post-deploy smoke runs `/onboard/confirm-and-start` against the
+  live container and waits for the resulting job to reach at least
+  `AGENT_RUNNING` for ~30 s. That is the minimum check that proves the agent
+  can actually launch a browser in the container.
+
+**Fix options (NOT YET APPLIED — user wants local proof first):**
+
+- **A. Pin** `playwright==1.48.0` in `requirements.txt` so the SDK matches the
+  current Docker base image. Cheapest; no Docker rebuild logic changes.
+- **B. Bump** the Dockerfile base to
+  `mcr.microsoft.com/playwright/python:v1.60.0-jammy` so the chromium binary
+  matches whatever pip resolved. Stays current but risks selector/behavior
+  drift in newer Playwright versions.
+
+Plan: implement A, run the full local flow (uvicorn + visible browser) to
+prove the agent reaches at least the portal, only then push.
+
+**Verification policy update (apply to both agents):**
+
+- `/health.commit == SHA` is necessary but NOT sufficient for "deploy is good."
+- A real live submission via `/onboard/confirm-and-start` (or the equivalent
+  customer UI flow) MUST be run before any deploy is called verified.
+- Until that smoke is automated in the workflow, the agent that ships a deploy
+  also runs the live customer smoke and records the result here, including the
+  job's last observed `customer_view.phase` and any `error_message`.
+
+## Current local-testing session (in progress)
+
+To debug the live failure without burning more deploy cycles, a local uvicorn
+is running on **port 8001** (port 8000 is held by the other agent's session).
+`BROWSER_HEADLESS=false` so the agent's Chrome is visible. Live log tail:
+`data/local_run_<timestamp>.log` and the corresponding task output file.
+The local Playwright install is SDK 1.60 + chromium 1.60 (matched), so the
+container-only mismatch does not reproduce locally — confirming the agent code
+itself is sound and the bug is purely the packaging.
+
+## Customer-UI bug round (this slice)
+
+The user ran the live flow and reported four distinct customer-UI bugs that
+were independent of the Playwright deploy bug. Root cause for each and the
+fix landed in this commit:
+
+- **Bug A — PIN-empty bounce.** On screen-3, leaving PIN empty and clicking
+  "Start my application" silently took the customer back to screen-2 with no
+  visible error. Cause: `inlineAlert` wrote the error to `#ocr-banner` (which
+  lives on screen-1) and called `goStep(2)` for every validation failure.
+  Fix in `frontend/index.html`: added per-field error nodes
+  (`#dl_raw-error`, `#dob-error`, `#mobile-error`, `#pin_code-error`) and a
+  screen-local banner (`#step2-banner`, `#step3-banner`). New helpers
+  `setFieldError / clearFieldError / setScreenBanner / focusFirstError`.
+  `startJob` now collects all invalid fields, decides whether to stay on
+  step 3 (PIN-only failure) or return to step 2 (DL/DOB/mobile failure),
+  shows errors inline, and never bounces silently. CSS added for
+  `.field-error` and `input.input-error`.
+
+- **Bug B — "Latest update: Filling your application" stuck during OTP wait.**
+  When the agent reached the OTP page and called `human_loop.ask`, the job
+  flipped to `STUCK_HUMAN_NEEDED` but `last_step_label` continued to read
+  from `steps_completed[-1]` (= `accept_alert_popup` → "Filling your
+  application"). Fix in `api/status_messages.py`: when status is
+  `WAITING_OTP` or `STUCK_HUMAN_NEEDED` with `action_type == "otp"`, the
+  function now overrides `step_label = "Waiting for the OTP"`. Other
+  human-needed action types use the request title as label.
+
+- **Bug C — "Enter the FRESH OTP / previous OTP expired" on the FIRST OTP.**
+  The OTP question text contains "or choose **'Resend** OTP'…" as a built-in
+  resend option. The old check `if "expired" in lower or "fresh otp" in
+  lower or "resend" in lower` matched on the literal word "resend" and routed
+  every OTP through the expired-OTP message. Fix: extracted `_otp_message()`
+  helper with explicit pattern sets `_OTP_EXPIRED_PATTERNS` (`otp expired`,
+  `otp has expired`, `fresh otp`, `expired otp`, `request a fresh`, …) and
+  `_OTP_INVALID_PATTERNS`, and a `_otp_in_question()` helper that checks the
+  pending request's own text before falling back to broader job context.
+  Also confirmed via regression test that genuine "OTP expired" still trips
+  the fresh-OTP branch.
+
+- **Bug D — "Connecting…" stuck even after the portal is open.**
+  Previously `close_homepage_popup`, `select_state`, `close_state_popup` all
+  mapped to `PHASE_CONNECTING` with title "Connecting to the portal", so the
+  customer's headline read "Connecting" while the agent was already deep
+  inside Sarathi. Fix in `STEP_TO_PHASE`: those three steps now map to
+  `PHASE_FILLING` with new labels "On the portal — preparing your request",
+  "Selecting your state", "Opening the DL renewal section". `open_homepage`
+  alone keeps `PHASE_CONNECTING`.
+
+- **Bug E — OTP screen not appearing in customer UI even though backend was
+  correctly emitting `action_required:true, action_type:"otp"`.** Backend
+  payload verified against live job by querying `/jobs/{job_id}` directly
+  while the agent was waiting; payload was correct. Frontend code path
+  (`applyJob` → `showOTP` → `show('screen-otp')`) also looks correct on
+  read. Could not reproduce in the mocked browser smoke. Added diagnostic
+  `console.log('[applyJob]', {...})` so the next user run produces clean
+  dev-tools evidence (status / action_type / action_required / phase /
+  headline / last_step_label) when applyJob fires, and a follow-up log
+  `console.log('[applyJob] -> showOTP() called')` confirms the OTP branch
+  was entered. Logs will be removed once Bug E is reproduced and fixed.
+
+**What was NOT touched in this slice:**
+
+- The agent code (`agent/brain.py`, `agent/human_loop.py`, …). The live
+  agent log proved the agent reached OTP cleanly when run locally; the bugs
+  were all in the customer-UI / status-mapping layer.
+- The Playwright `requirements.txt` pin. Still required to fix the live
+  container, but only landing after this UI round is verified.
+
+**Local verification for this slice:**
+
+- `python -m pytest -q` → 51 passed (no regressions).
+- `python scripts/validate_fixes.py` → 18/18 assertions pass:
+  - phase advances past `connecting` after popup-closed (Bug D);
+  - first OTP with "Resend OTP" option keeps headline "Enter the OTP" (Bug C);
+  - `last_step_label = "Waiting for the OTP"` during OTP wait (Bug B);
+  - genuine `OTP expired` / `Invalid OTP` still trip their correct branches;
+  - leaving PIN empty on step 3 keeps the customer on step 3 with the inline
+    error visible, `#pin_code` gets `.input-error` class, the error clears
+    on typing (Bug A).
+- `python scripts/browser_smoke.py --base http://127.0.0.1:8001` →
+  `ok: true`, no console issues, no failed requests, no bad responses, no
+  layout issues. OTP + human-needed mock flows still post correctly.
+
+**Loose ends I noticed but did NOT change:**
+
+- `api/status_messages.py:_service_rejection_message(lower)` has an unused
+  `lower` parameter (IDE hint). Pre-existing; not from this slice.
+- `tests/test_customer_interactions.py` only asserted the customer-safe
+  failure-mode messages, not the new step_label override during OTP. Worth
+  adding a unit test there in a future slice — for now the new
+  `scripts/validate_fixes.py` covers it.
+- `frontend/index.html` still has the diagnostic `console.log` calls in
+  `applyJob`. Remove once Bug E is reproduced and root-caused.

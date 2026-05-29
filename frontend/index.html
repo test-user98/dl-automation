@@ -84,6 +84,14 @@
     .hint  { margin-top: 6px; color: var(--muted); font-size: 12px; }
     .hint.ok    { color: var(--success); }
     .hint.err   { color: var(--err); }
+    .field-error {
+      margin-top: 6px; color: var(--err); font-size: 12px; font-weight: 500;
+      padding-left: 6px; border-left: 2px solid var(--err);
+    }
+    input.input-error, select.input-error, textarea.input-error {
+      border-color: var(--err) !important;
+      box-shadow: 0 0 0 3px rgba(214, 64, 64, 0.12) !important;
+    }
     .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
     @media (max-width: 520px) { .row2 { grid-template-columns: 1fr; } }
 
@@ -337,21 +345,26 @@
       <h2>Confirm your details</h2>
       <p class="sub">We need these to start your application on the government portal.</p>
 
+      <div class="banner err hidden" id="step2-banner" role="alert"></div>
+
       <div class="field">
         <label>Driving licence number</label>
-        <input id="dl_raw" placeholder="e.g. RJ0720170010191" oninput="onDLInput()" autocomplete="off" />
+        <input id="dl_raw" placeholder="e.g. RJ0720170010191" oninput="clearFieldError('dl_raw'); onDLInput()" autocomplete="off" />
         <div id="dl-message" class="hint">Printed on the front of your DL.</div>
+        <div class="field-error hidden" id="dl_raw-error" role="alert"></div>
       </div>
 
       <div class="row2">
         <div class="field">
           <label>Date of birth</label>
-          <input id="dob" placeholder="DD-MM-YYYY" maxlength="10" inputmode="numeric" oninput="formatDOB(this)" />
+          <input id="dob" placeholder="DD-MM-YYYY" maxlength="10" inputmode="numeric" oninput="clearFieldError('dob'); formatDOB(this)" />
+          <div class="field-error hidden" id="dob-error" role="alert"></div>
         </div>
         <div class="field">
           <label>Mobile number <span style="color: var(--err)">*</span></label>
-          <input id="mobile" placeholder="10-digit mobile" maxlength="10" inputmode="numeric" />
+          <input id="mobile" placeholder="10-digit mobile" maxlength="10" inputmode="numeric" oninput="clearFieldError('mobile')" />
           <div class="hint">Need the number registered with your DL — the government portal sends the OTP to this number.</div>
+          <div class="field-error hidden" id="mobile-error" role="alert"></div>
         </div>
       </div>
 
@@ -374,11 +387,14 @@
 
       <div class="field">
         <label>Present address PIN code</label>
-        <input id="pin_code" placeholder="6-digit PIN" maxlength="6" inputmode="numeric" oninput="renderReview()" />
+        <input id="pin_code" placeholder="6-digit PIN" maxlength="6" inputmode="numeric" oninput="clearFieldError('pin_code'); renderReview()" />
+        <div class="field-error hidden" id="pin_code-error" role="alert"></div>
       </div>
 
       <h2 style="margin-top: 24px">Review before we start</h2>
       <div class="review" id="review-rows"></div>
+
+      <div class="banner err hidden" id="step3-banner" role="alert"></div>
 
       <p class="footnote">
         By continuing, you authorise us to fill the government Sarathi portal on your behalf using these details.
@@ -665,15 +681,42 @@ function renderReview() {
 }
 
 async function startJob() {
-  // Validate inputs
+  // Validate inputs without leaving step 3 — errors stay inline on the field.
+  clearAllFieldErrors();
+  clearScreenBanner('step3-banner');
   const okDl   = await validateDL();
   const dob    = document.getElementById('dob').value.trim();
   const mobile = document.getElementById('mobile').value.trim();
   const pin    = document.getElementById('pin_code').value.trim();
-  if (!okDl)                              return inlineAlert('Please double-check the DL number.');
-  if (!isValidDOB(dob))                   return inlineAlert('DOB should be DD-MM-YYYY and a real date between 1924 and today.');
-  if (!/^[6-9]\d{9}$/.test(mobile))       return inlineAlert('Mobile should be a 10-digit Indian number starting with 6, 7, 8, or 9.');
-  if (!/^\d{6}$/.test(pin))               return inlineAlert('PIN should be 6 digits.');
+
+  let firstInvalidStep = 0;
+  if (!okDl) {
+    setFieldError('dl_raw', 'Please double-check the DL number.');
+    if (!firstInvalidStep) firstInvalidStep = 2;
+  }
+  if (!isValidDOB(dob)) {
+    setFieldError('dob', 'Enter a real date as DD-MM-YYYY (between 1924 and today).');
+    if (!firstInvalidStep) firstInvalidStep = 2;
+  }
+  if (!/^[6-9]\d{9}$/.test(mobile)) {
+    setFieldError('mobile', 'Indian mobile, 10 digits, starting with 6, 7, 8, or 9.');
+    if (!firstInvalidStep) firstInvalidStep = 2;
+  }
+  if (!/^\d{6}$/.test(pin)) {
+    setFieldError('pin_code', 'PIN code must be 6 digits.');
+    if (!firstInvalidStep) firstInvalidStep = 3;
+  }
+  if (firstInvalidStep) {
+    if (firstInvalidStep === 2) {
+      setScreenBanner('step2-banner', 'Please fix the highlighted fields, then continue.');
+      goStep(2);
+      focusFirstError();
+    } else {
+      setScreenBanner('step3-banner', 'PIN code must be 6 digits.');
+      focusFirstError();
+    }
+    return;
+  }
 
   const btn = document.getElementById('start-btn');
   btn.disabled = true; btn.textContent = 'Starting…';
@@ -693,7 +736,8 @@ async function startJob() {
   const r = await apiJson('/onboard/confirm-and-start', payload);
   if (!r || !r.job_id) {
     btn.disabled = false; btn.textContent = 'Start my application';
-    return inlineAlert(r?.detail || "We couldn't start the application — please check your details.");
+    setScreenBanner('step3-banner', r?.detail || "We couldn't start the application — please check your details.");
+    return;
   }
   currentJobId = r.job_id;
   goStep(4);
@@ -702,12 +746,45 @@ async function startJob() {
   startPolling();
 }
 
+function setFieldError(fieldId, msg) {
+  const el = document.getElementById(`${fieldId}-error`);
+  if (!el) return;
+  el.textContent = msg;
+  el.classList.remove('hidden');
+  const input = document.getElementById(fieldId);
+  if (input) input.classList.add('input-error');
+}
+function clearFieldError(fieldId) {
+  const el = document.getElementById(`${fieldId}-error`);
+  if (el) { el.textContent = ''; el.classList.add('hidden'); }
+  const input = document.getElementById(fieldId);
+  if (input) input.classList.remove('input-error');
+}
+function clearAllFieldErrors() {
+  ['dl_raw', 'dob', 'mobile', 'pin_code'].forEach(clearFieldError);
+}
+function setScreenBanner(bannerId, msg) {
+  const b = document.getElementById(bannerId);
+  if (!b) return;
+  b.textContent = msg;
+  b.classList.remove('hidden');
+}
+function clearScreenBanner(bannerId) {
+  const b = document.getElementById(bannerId);
+  if (b) { b.textContent = ''; b.classList.add('hidden'); }
+}
+function focusFirstError() {
+  const first = document.querySelector('.input-error');
+  if (first && typeof first.focus === 'function') first.focus();
+}
+
 function inlineAlert(msg) {
+  // Legacy entry point — used by OCR error path on screen-1.
   const banner = document.getElementById('ocr-banner');
   banner.className = 'banner err';
   banner.classList.remove('hidden');
   banner.textContent = msg;
-  goStep(2);
+  goStep(1);
 }
 
 // ─── Step 4: live polling ──────────────────────────────────────────────────
@@ -755,6 +832,17 @@ async function poll() {
 
 function applyJob(r) {
   const v = r.customer_view || {};
+  // Diagnostic: keep until OTP-screen-not-showing is confirmed fixed.
+  try {
+    console.log('[applyJob]', {
+      status: r.status,
+      action_type: v.action_type,
+      action_required: v.action_required,
+      phase: v.phase,
+      headline: v.headline,
+      last_step_label: v.last_step_label,
+    });
+  } catch (_) {}
   setLive(v, r);
 
   if (v.action_type === 'otp' || r.status === 'WAITING_OTP') {
@@ -766,6 +854,7 @@ function applyJob(r) {
       severity: 'action',
     });
     showOTP(v);
+    console.log('[applyJob] -> showOTP() called');
   } else if ((v.action_required && v.action_type !== 'otp') || r.status === 'STUCK_HUMAN_NEEDED') {
     stopLiveUpdates();
     addActivity({
