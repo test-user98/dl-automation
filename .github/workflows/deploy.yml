@@ -97,6 +97,7 @@ jobs:
           OPENAI_API_KEY:        ${{ secrets.OPENAI_API_KEY }}
           ANTHROPIC_API_KEY:     ${{ secrets.ANTHROPIC_API_KEY }}    # optional
           API_SECRET_KEY:        ${{ secrets.API_SECRET_KEY }}
+          ADMIN_SECRET:          ${{ secrets.ADMIN_SECRET }}          # optional, falls back to API_SECRET_KEY
         run: |
           set -e
           SERVICE_NAME="$APP_RUNNER_SERVICE"
@@ -110,11 +111,13 @@ jobs:
             --arg openai "$OPENAI_API_KEY" \
             --arg anthropic "$ANTHROPIC_API_KEY" \
             --arg secret "$API_SECRET_KEY" \
+            --arg admin "$ADMIN_SECRET" \
             --arg sha "${{ github.sha }}" \
             '{
               OPENAI_API_KEY:     $openai,
               ANTHROPIC_API_KEY:  $anthropic,
               API_SECRET_KEY:     $secret,
+              ADMIN_SECRET:       ($admin | if . == "" then $secret else . end),
               GIT_COMMIT_SHA:     $sha,
               BROWSER_HEADLESS:   "true",
               HUMAN_LOOP_BACKEND: "polling",

@@ -13,9 +13,19 @@ remote updates.
 Two LLMs are working on this repo in parallel (one focused on the customer
 layer + Sarathi flow, one focused on infra/deploy). To stay coherent:
 
-- **Ground rule:** if you make a change and you validated it works, commit
-  it AND update this handoff doc in the same change. This doc is the source
-  of truth between the two agents.
+- **Ground rule #1 (test before push):** every change MUST be tested locally
+  before pushing to `origin/main`. That means:
+  1. Run the existing test suite (`python -m pytest`) — no regressions.
+  2. If you touched code reachable from `/api`, boot uvicorn locally and
+     curl the affected endpoints. New endpoints get new test cases.
+  3. Think through edge cases (empty/missing input, unauthorised, unknown
+     IDs, malformed payload, rate limits, oversized data) and verify each.
+  4. Only then `git push origin main` — the workflow auto-deploys to
+     App Runner. A bad push wastes a 6–8 minute build cycle, and worse,
+     poisons `/health.commit` for anyone watching live.
+- **Ground rule #2 (commit + handoff together):** if you make a change and
+  you validated it works, commit it AND update this handoff doc in the
+  same change. This doc is the source of truth between the two agents.
 - Whoever commits last updates this doc to point at the latest meaningful
   checkpoint and adds a one-line summary of what changed.
 - Both follow the same "no push without approval" rule.
@@ -152,18 +162,67 @@ Portal-down detection: status_messages scans recent step logs for `5xx`,
 "service unavailable", "bad gateway", DNS failures — and surfaces a calm
 "government portal is slow, we will retry" message instead of an error.
 
-## Deferred / next batch (do not start without alignment)
+## Operator + Customer-lookup layer (SHIPPED)
 
-- **Customer entity + lookup**: today `customer_id` is the mobile number with
-  no separate Customer row. Need a `Customer` table keyed by phone + a unique
-  customer ID, so customers can come back later and look up status by phone
-  (or by ID) across multiple services.
-- **RTO operator portal**: an admin view at `/admin` (auth-gated) listing all
-  applications across customers, with status + ability to nudge a stuck job.
-  Powers the "RTO agent logs in and sees everyone's applications" use case.
+This batch landed alongside the live deploy. NOT mocked — actual aiosqlite
+tables, async CRUD, 25 pytest tests passing, smoke-verified locally.
 
-Both are explicitly lower priority than getting OCR + Sarathi end-to-end
-working reliably and seeing the live URL respond.
+**Schema** — `data/customers.db` (separate from `data/jobs.db`):
+
+- `customers(customer_id PK CUST-XXXXXXXX, phone UNIQUE, name, email,
+  kyc_status, created_at, updated_at)` — phone normalised on insert
+- `applications(app_id PK APP-XXXXXXXXXX, customer_id FK, service_type,
+  status, application_number, current_job_id, state_code, fee_inr,
+  metadata JSON, created_at, updated_at)`
+- `documents(doc_id PK DOC-XXXXXXXXXX, customer_id FK, app_id FK NULL,
+  doc_type, file_path, mime_type, size_bytes, ocr_data JSON, confidence,
+  uploaded_at)`
+- `notes(note_id, app_id FK, operator_id, text, created_at)`
+
+**Hook**: `/onboard/confirm-and-start` now upserts the Customer + creates
+an Application linked to the Job, and persists the OCR'd DL image as a
+Document with `ocr_data` + `confidence`. `/onboard/extract-dl-image` now
+returns `dl_image_path` so the frontend can pass it through.
+
+**Endpoints** (auth via `X-Admin-Secret` header → env `ADMIN_SECRET`,
+falls back to `API_SECRET_KEY` if unset):
+
+- `GET /admin/summary` → counts + by-status breakdown
+- `GET /admin/customers?limit&offset&search` — search matches phone, name, CUST-id
+- `GET /admin/customers/{phone_or_cust_id}` — customer + apps + docs
+- `GET /admin/applications?status&service&customer_id&limit&offset`
+- `GET /admin/applications/{app_id}` — app + customer + docs + notes + live job view
+- `POST /admin/applications/{app_id}/notes` body `{text, operator_id?}`
+- `GET /admin/documents/{doc_id}` — metadata
+- `GET /admin/documents/{doc_id}/preview` — serves the file (mime-typed)
+
+**Customer self-service** (no admin auth, rate-limited 10/min/phone):
+
+- `GET /lookup?phone=…` OR `?customer_id=…` — returns redacted view
+  (`phone_mask`, no DL/DOB, no internal IDs unless looked up by ID)
+- Unknown phone returns `{found: false}` to avoid leaking registration.
+
+**Operator dashboard UI** at `/admin` — single self-contained HTML/JS.
+Token gate stores secret in sessionStorage only. Tabs: Applications /
+Customers. Side drawer for detail with doc previews, metadata, live job
+view, and operator notes thread.
+
+**Seed**: on startup, if `customers` table is empty, inserts 5 mock
+customers across 5 states with mixed statuses (SUBMITTED, WAITING_OTP,
+AGENT_RUNNING, STUCK_HUMAN_NEEDED, COMPLETED, FAILED) so the dashboard
+is never empty in demo.
+
+**Tests**: `tests/test_customer_store.py` (10) + `tests/test_admin_api.py`
+(15) — covers auth, phone normalisation, dedupe, filters, edge cases,
+404s, note validation, rate limit, lookup redaction. Run with
+`python -m pytest`.
+
+## Still deferred
+
+- Move state from container disk to RDS Postgres + S3.
+- Operator: bulk export, status timeline view, assigning jobs to specific
+  operators. None blocking demo.
+- Frontend customer "track my application" page that hits `/lookup`.
 
 ## User Preferences
 

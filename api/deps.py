@@ -8,12 +8,13 @@ the customer UI look successful while the running agent never receives input.
 from agent.human_loop import HumanLoop
 from agent.learning_store import LearningStore
 from agent.state_manager import StateManager
+from agent.customer_store import get_store as _get_customer_store
 from orchestrator import Orchestrator
 from tools.ocr_service import OCRService
 
-state_manager = StateManager()
+state_manager  = StateManager()
 learning_store = LearningStore()
-human_loop = HumanLoop(state_manager)
-ocr_service = OCRService()
-orchestrator = Orchestrator(state_manager, learning_store, human_loop)
-
+human_loop     = HumanLoop(state_manager)
+ocr_service    = OCRService()
+orchestrator   = Orchestrator(state_manager, learning_store, human_loop)
+customer_store = _get_customer_store()

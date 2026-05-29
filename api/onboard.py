@@ -19,8 +19,9 @@ from pydantic import BaseModel
 from typing import Optional
 from pathlib import Path
 
-from config.settings import get_settings
-from api.deps import state_manager, ocr_service, orchestrator
+from config.settings import get_settings, get_settings as _gs
+from config.portal_rules import get_fee
+from api.deps import state_manager, ocr_service, orchestrator, customer_store
 from tools.dl_normalizer import DLNormalizer, DL_FORMAT_HINT, DL_LOCATION_HINT
 
 router = APIRouter(prefix="/onboard", tags=["onboarding"])
@@ -30,6 +31,7 @@ _normalizer    = DLNormalizer()
 _ocr           = ocr_service
 _state_manager = state_manager
 _orchestrator  = orchestrator
+_store         = customer_store
 
 import asyncio
 
@@ -102,6 +104,9 @@ async def extract_dl_image(file: UploadFile = File(...)):
         "confidence":     round(confidence, 2),
         "missing_fields": missing_fields,
         "needs_manual_review": needs_manual_review,
+        # Path passed through to /onboard/confirm-and-start so we can persist
+        # a Document record once we know the customer_id.
+        "dl_image_path":  file_path,
         "message":        "Details extracted from your DL image" if extracted else "Could not read DL — please enter details manually",
     }
 
@@ -125,6 +130,9 @@ class ConfirmAndStartRequest(BaseModel):
     # Document paths (set by server after upload)
     photo_path:     str = ""
     signature_path: str = ""
+    dl_image_path:  str = ""             # returned by /onboard/extract-dl-image
+    ocr_data:       dict = {}            # what the OCR step extracted
+    ocr_confidence: float = 0.0
 
     service: str = "DL_RENEWAL"
 
@@ -169,11 +177,54 @@ async def confirm_and_start(req: ConfirmAndStartRequest):
     )
     await _state_manager.save(job)
 
+    # Persist durable customer + application records so the operator
+    # dashboard sees this customer and the agent can write status updates.
+    cust = await _store.upsert_customer(
+        phone=req.mobile_number, name=req.name or "", email=req.email or "",
+    )
+    fee_inr = get_fee(req.service.lower().replace("_", " "), customer_data["state_code"])
+    application = await _store.create_application(
+        customer_id    = cust.customer_id,
+        service_type   = req.service,
+        state_code     = customer_data["state_code"],
+        fee_inr        = fee_inr,
+        current_job_id = job.job_id,
+        metadata       = {
+            "dl_number":  customer_data["dl_number"],
+            "dob":        customer_data["dob"],
+            "pin_code":   customer_data.get("pin_code", ""),
+            "rto_code":   customer_data.get("rto_code", ""),
+            "state_name": customer_data.get("state_name", ""),
+        },
+    )
+
+    # Persist the OCR'd DL image as a Document if we have one.
+    if req.dl_image_path:
+        try:
+            await _store.add_document(
+                customer_id=cust.customer_id,
+                app_id=application.app_id,
+                doc_type="driving_license",
+                file_path=req.dl_image_path,
+                mime_type="image/jpeg",
+                ocr_data=req.ocr_data or {},
+                confidence=req.ocr_confidence or 0.0,
+            )
+        except Exception as e:  # don't fail the application start if doc record fails
+            import structlog
+            structlog.get_logger(__name__).warning(
+                "onboard.add_document_failed",
+                error=str(e), app_id=application.app_id,
+            )
+
     # Start agent in background
     asyncio.create_task(_orchestrator.run_job(job.job_id))
 
     return {
         "job_id":          job.job_id,
+        "app_id":          application.app_id,
+        "customer_id":     cust.customer_id,
+        "fee_inr":         fee_inr,
         "status":          job.status.value,
         "dl_display":      _normalizer.format_for_display(dl_result["normalized"]),
         "customer_summary": {

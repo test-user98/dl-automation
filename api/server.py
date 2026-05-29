@@ -23,7 +23,8 @@ from pydantic import BaseModel
 from config.settings import get_settings
 from config.logging_setup import configure_logging
 from agent.state_manager import JobStatus
-from api.deps import state_manager, learning_store, human_loop, ocr_service, orchestrator
+from agent.customer_seed import seed_if_empty
+from api.deps import state_manager, learning_store, human_loop, ocr_service, orchestrator, customer_store
 from api.status_messages import customer_job_view
 
 settings = get_settings()
@@ -32,6 +33,15 @@ configure_logging(level="INFO", json_output=False)
 
 app = FastAPI(title="Sarathi Agent API", version="1.0.0")
 
+
+@app.on_event("startup")
+async def _bootstrap_customer_store() -> None:
+    """Initialise tables and seed demo data so the operator dashboard is non-empty."""
+    await customer_store.init()
+    report = await seed_if_empty(customer_store)
+    import structlog
+    structlog.get_logger(__name__).info("customer_store.bootstrap", report=report)
+
 # Singletons — shared across requests
 _state_manager  = state_manager
 _learning_store = learning_store
@@ -39,9 +49,13 @@ _human_loop     = human_loop
 _ocr            = ocr_service
 _orchestrator   = orchestrator
 
-# ── Onboarding router ─────────────────────────────────────────────────────────
+# ── Onboarding + Admin + Lookup routers ───────────────────────────────────────
 from api.onboard import router as onboard_router
+from api.admin   import router as admin_router
+from api.lookup  import router as lookup_router
 app.include_router(onboard_router)
+app.include_router(admin_router)
+app.include_router(lookup_router)
 
 # ── Serve customer-facing web UI ──────────────────────────────────────────────
 _frontend_dir = Path(__file__).parent.parent / "frontend"
@@ -51,6 +65,13 @@ if _frontend_dir.exists():
 @app.get("/", include_in_schema=False)
 async def serve_ui():
     return FileResponse(str(_frontend_dir / "index.html"))
+
+
+@app.get("/admin", include_in_schema=False)
+async def serve_admin_ui():
+    """RTO operator dashboard. The HTML itself is public — every data fetch
+    inside it requires the X-Admin-Secret header, so showing the shell is fine."""
+    return FileResponse(str(_frontend_dir / "admin.html"))
 
 
 # ── Auth ───────────────────────────────────────────────────────────────────────

@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RTO Operator — Dashboard</title>
+  <style>
+    *,*::before,*::after { box-sizing: border-box; }
+    :root {
+      --bg:        #f5f7fb;
+      --card:      #ffffff;
+      --ink:       #111729;
+      --ink-2:     #3b4762;
+      --muted:     #6b7688;
+      --line:      #e3e8f0;
+      --line-2:    #cfd6e3;
+      --primary:   #0e62d8;
+      --primary-d: #0b4ca8;
+      --success:   #126a2f;
+      --success-bg:#eaf7ef;
+      --warn:      #7a5300;
+      --warn-bg:   #fff5d6;
+      --err:       #a31418;
+      --err-bg:    #fdecec;
+      --shadow:    0 1px 2px rgba(15, 24, 48, 0.06), 0 8px 24px -12px rgba(15, 24, 48, 0.10);
+    }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, ui-sans-serif, system-ui, sans-serif;
+      color: var(--ink);
+      background: var(--bg);
+      -webkit-font-smoothing: antialiased;
+    }
+    .topbar {
+      height: 56px; display: flex; align-items: center; justify-content: space-between;
+      padding: 0 22px; background: #fff; border-bottom: 1px solid var(--line);
+    }
+    .brand { font-weight: 700; font-size: 16px; }
+    .brand-sub { color: var(--muted); font-size: 12px; margin-left: 8px; }
+    .shell { max-width: 1280px; margin: 0 auto; padding: 22px 18px 64px; }
+
+    /* token gate */
+    .gate { max-width: 460px; margin: 80px auto; }
+    .gate input { width: 100%; padding: 12px; border: 1px solid var(--line-2); border-radius: 10px; font: inherit; }
+    .gate button { margin-top: 12px; width: 100%; }
+
+    .toolbar {
+      display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+      margin-bottom: 16px;
+    }
+    .toolbar input, .toolbar select {
+      min-height: 38px; border: 1px solid var(--line-2); border-radius: 8px;
+      padding: 6px 10px; font: inherit; background: #fff;
+    }
+    .toolbar input { min-width: 240px; }
+
+    /* summary cards */
+    .summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 18px; }
+    @media (max-width: 720px) { .summary { grid-template-columns: 1fr 1fr; } }
+    .sumcard {
+      background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+      padding: 14px 16px; box-shadow: var(--shadow);
+    }
+    .sumcard .lbl { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
+    .sumcard .val { font-size: 26px; font-weight: 700; margin-top: 4px; letter-spacing: -0.01em; }
+    .sumcard .by-status { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+    .sumcard .by-status span {
+      font-size: 11px; padding: 2px 8px; border-radius: 999px;
+      background: #eef2f8; color: var(--ink-2);
+    }
+
+    /* tabs */
+    .tabs { display: flex; gap: 4px; margin-bottom: 12px; border-bottom: 1px solid var(--line); }
+    .tab {
+      padding: 10px 14px; cursor: pointer; font-weight: 600; color: var(--muted);
+      border-bottom: 2px solid transparent; font-size: 14px;
+    }
+    .tab.on { color: var(--primary); border-bottom-color: var(--primary); }
+
+    /* main layout */
+    .panel {
+      background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+      box-shadow: var(--shadow); overflow: hidden;
+    }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { padding: 10px 14px; text-align: left; vertical-align: middle; }
+    th { font-size: 12px; text-transform: uppercase; color: var(--muted); letter-spacing: 0.04em; border-bottom: 1px solid var(--line); background: #fafbfd; font-weight: 600; }
+    tr.row { border-bottom: 1px solid var(--line); cursor: pointer; }
+    tr.row:hover { background: #f7faff; }
+
+    .pill {
+      display: inline-block; padding: 3px 10px; border-radius: 999px;
+      font-size: 12px; font-weight: 600;
+    }
+    .st-CREATED, .st-AGENT_QUEUED            { background: #eef2f8; color: var(--ink-2); }
+    .st-AGENT_RUNNING, .st-OCR_PROCESSING    { background: #e6f0ff; color: var(--primary); }
+    .st-WAITING_OTP, .st-STUCK_HUMAN_NEEDED  { background: var(--warn-bg); color: var(--warn); }
+    .st-PAYMENT_PENDING                      { background: var(--warn-bg); color: var(--warn); }
+    .st-SUBMITTED, .st-COMPLETED             { background: var(--success-bg); color: var(--success); }
+    .st-FAILED, .st-CANCELLED                { color: var(--err); background: var(--err-bg); }
+    .st-FAILED_RETRYING                      { background: var(--warn-bg); color: var(--warn); }
+
+    .empty { padding: 50px 24px; text-align: center; color: var(--muted); }
+
+    /* detail drawer */
+    .drawer-backdrop {
+      position: fixed; inset: 0; background: rgba(15, 24, 48, 0.40);
+      z-index: 50; display: none;
+    }
+    .drawer-backdrop.on { display: block; }
+    .drawer {
+      position: fixed; top: 0; right: 0; width: min(720px, 100%); height: 100vh;
+      background: #fff; box-shadow: -8px 0 24px rgba(15, 24, 48, 0.18);
+      transform: translateX(100%); transition: transform 0.18s ease;
+      z-index: 51; overflow: auto;
+    }
+    .drawer.on { transform: translateX(0); }
+    .drawer header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 14px 18px; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: #fff;
+    }
+    .drawer .body { padding: 18px; }
+    .drawer h2 { margin: 0 0 4px; font-size: 18px; }
+    .drawer .label { font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+    .kv { display: grid; grid-template-columns: 140px 1fr; gap: 6px 12px; font-size: 14px; }
+    .kv b { font-weight: 500; color: var(--muted); }
+    .section { margin-top: 22px; }
+    .doc-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 10px; margin-top: 10px; }
+    .doc { border: 1px solid var(--line); border-radius: 10px; padding: 10px; font-size: 12px; }
+    .doc .imgwrap { width: 100%; aspect-ratio: 4/3; background: #f3f5fa; border-radius: 6px; overflow: hidden; margin-bottom: 8px; }
+    .doc img { width: 100%; height: 100%; object-fit: cover; }
+    .doc .conf { color: var(--muted); }
+
+    .notes { margin-top: 12px; display: flex; flex-direction: column; gap: 8px; }
+    .note { border: 1px solid var(--line); border-radius: 10px; padding: 10px; font-size: 14px; background: #fafbfd; }
+    .note .meta { color: var(--muted); font-size: 12px; margin-top: 4px; }
+    .note-add { margin-top: 10px; display: flex; gap: 8px; }
+    .note-add textarea { flex: 1; min-height: 38px; border: 1px solid var(--line-2); border-radius: 8px; padding: 8px; font: inherit; }
+
+    button {
+      border: 0; border-radius: 8px; min-height: 38px; padding: 0 14px;
+      font-weight: 600; font-size: 14px; cursor: pointer;
+      background: #eef2f8; color: var(--ink);
+    }
+    button.primary { background: var(--primary); color: #fff; }
+    button.primary:hover { background: var(--primary-d); }
+    button.icon { background: transparent; padding: 4px 10px; font-size: 20px; }
+    button:disabled { opacity: 0.55; cursor: not-allowed; }
+    .hidden { display: none !important; }
+    a { color: var(--primary); }
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <div>
+      <span class="brand">RTO Operator</span>
+      <span class="brand-sub">Sarathi automation dashboard</span>
+    </div>
+    <div class="brand-sub" id="conn-status">—</div>
+  </div>
+
+  <main class="shell">
+
+    <!-- token gate -->
+    <section id="gate" class="gate panel">
+      <div style="padding: 28px">
+        <h2 style="margin: 0 0 4px">Operator sign-in</h2>
+        <p style="margin: 0 0 16px; color: var(--muted); font-size: 14px">
+          Enter the admin secret to view all customer applications.
+          The token is stored only in this tab's session storage.
+        </p>
+        <input id="admin-secret" type="password" placeholder="Admin secret" autocomplete="current-password" />
+        <button class="primary" onclick="signIn()">Open dashboard</button>
+        <div id="gate-error" style="color: var(--err); font-size: 13px; margin-top: 10px"></div>
+      </div>
+    </section>
+
+    <!-- dashboard -->
+    <section id="dash" class="hidden">
+
+      <div class="summary">
+        <div class="sumcard"><div class="lbl">Customers</div>      <div class="val" id="cnt-customers">—</div></div>
+        <div class="sumcard"><div class="lbl">Applications</div>   <div class="val" id="cnt-apps">—</div></div>
+        <div class="sumcard"><div class="lbl">Documents</div>      <div class="val" id="cnt-docs">—</div></div>
+        <div class="sumcard"><div class="lbl">By status</div>
+          <div class="val" style="font-size:14px; margin-top: 0">—</div>
+          <div class="by-status" id="status-mix"></div>
+        </div>
+      </div>
+
+      <div class="tabs">
+        <div class="tab on" id="tab-apps" onclick="switchTab('apps')">Applications</div>
+        <div class="tab"    id="tab-customers" onclick="switchTab('customers')">Customers</div>
+      </div>
+
+      <!-- Applications -->
+      <section id="view-apps">
+        <div class="toolbar">
+          <input id="filt-app-search" placeholder="Search by customer phone or app number…" oninput="debouncedAppFilter()" />
+          <select id="filt-status" onchange="loadApps()">
+            <option value="">All statuses</option>
+            <option>CREATED</option>
+            <option>AGENT_RUNNING</option>
+            <option>WAITING_OTP</option>
+            <option>STUCK_HUMAN_NEEDED</option>
+            <option>SUBMITTED</option>
+            <option>COMPLETED</option>
+            <option>FAILED</option>
+          </select>
+          <select id="filt-service" onchange="loadApps()">
+            <option value="">All services</option>
+            <option>DL_RENEWAL</option>
+            <option>DUPLICATE_DL</option>
+            <option>CHANGE_OF_ADDRESS</option>
+            <option>ADDITION_OF_CLASS</option>
+          </select>
+          <button onclick="loadApps()">Refresh</button>
+        </div>
+        <div class="panel" id="apps-table-wrap">
+          <div class="empty">Loading…</div>
+        </div>
+      </section>
+
+      <!-- Customers -->
+      <section id="view-customers" class="hidden">
+        <div class="toolbar">
+          <input id="filt-cust-search" placeholder="Search by phone, name, or CUST-id…" oninput="debouncedCustFilter()" />
+          <button onclick="loadCustomers()">Refresh</button>
+        </div>
+        <div class="panel" id="customers-table-wrap">
+          <div class="empty">Loading…</div>
+        </div>
+      </section>
+
+    </section>
+  </main>
+
+  <!-- detail drawer -->
+  <div class="drawer-backdrop" id="backdrop" onclick="closeDrawer()"></div>
+  <aside class="drawer" id="drawer">
+    <header>
+      <div>
+        <div class="label">Application</div>
+        <h2 id="drawer-title">—</h2>
+      </div>
+      <button class="icon" onclick="closeDrawer()" title="Close">×</button>
+    </header>
+    <div class="body" id="drawer-body"></div>
+  </aside>
+
+<script>
+const API = window.location.origin;
+let SECRET = sessionStorage.getItem('admin_secret') || '';
+
+function setConn(ok) {
+  document.getElementById('conn-status').textContent = ok ? 'connected' : 'disconnected';
+}
+
+async function adminFetch(path) {
+  const res = await fetch(`${API}${path}`, { headers: { 'X-Admin-Secret': SECRET } });
+  if (res.status === 401) { signOut(); throw new Error('unauth'); }
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+async function signIn() {
+  const v = document.getElementById('admin-secret').value.trim();
+  if (!v) return;
+  SECRET = v;
+  try {
+    const s = await adminFetch('/admin/summary');
+    sessionStorage.setItem('admin_secret', v);
+    document.getElementById('gate').classList.add('hidden');
+    document.getElementById('dash').classList.remove('hidden');
+    setConn(true);
+    renderSummary(s.counts);
+    loadApps();
+  } catch (e) {
+    document.getElementById('gate-error').textContent = 'Wrong secret or backend unreachable.';
+    setConn(false);
+  }
+}
+
+function signOut() {
+  sessionStorage.removeItem('admin_secret');
+  SECRET = '';
+  document.getElementById('dash').classList.add('hidden');
+  document.getElementById('gate').classList.remove('hidden');
+  setConn(false);
+}
+
+function renderSummary(c) {
+  if (!c) return;
+  document.getElementById('cnt-customers').textContent = c.customers ?? 0;
+  document.getElementById('cnt-apps').textContent      = c.applications ?? 0;
+  document.getElementById('cnt-docs').textContent      = c.documents ?? 0;
+  const mix = document.getElementById('status-mix');
+  mix.innerHTML = '';
+  Object.entries(c.by_status || {}).forEach(([k, v]) => {
+    const span = document.createElement('span');
+    span.textContent = `${k}: ${v}`;
+    mix.appendChild(span);
+  });
+}
+
+function switchTab(name) {
+  ['apps','customers'].forEach(t => {
+    document.getElementById(`tab-${t}`).classList.toggle('on', t === name);
+    document.getElementById(`view-${t}`).classList.toggle('hidden', t !== name);
+  });
+  if (name === 'customers') loadCustomers(); else loadApps();
+}
+
+// ─── Apps ─────────────────────────────────────────────────────────────────────
+let appFilterTimer;
+function debouncedAppFilter() { clearTimeout(appFilterTimer); appFilterTimer = setTimeout(loadApps, 250); }
+
+async function loadApps() {
+  const status  = document.getElementById('filt-status').value;
+  const service = document.getElementById('filt-service').value;
+  const search  = document.getElementById('filt-app-search').value.trim().toLowerCase();
+  let qs = `?limit=100`;
+  if (status)  qs += `&status=${encodeURIComponent(status)}`;
+  if (service) qs += `&service=${encodeURIComponent(service)}`;
+  let data;
+  try { data = await adminFetch('/admin/applications' + qs); }
+  catch (e) { return; }
+  let rows = data.items || [];
+  if (search) rows = rows.filter(r =>
+    (r.customer_phone || '').includes(search) ||
+    (r.application_number || '').toLowerCase().includes(search) ||
+    (r.customer_name || '').toLowerCase().includes(search) ||
+    (r.app_id || '').toLowerCase().includes(search)
+  );
+  renderAppsTable(rows);
+  try { renderSummary((await adminFetch('/admin/summary')).counts); } catch (_) {}
+}
+
+function renderAppsTable(rows) {
+  const wrap = document.getElementById('apps-table-wrap');
+  if (!rows.length) { wrap.innerHTML = `<div class="empty">No applications match your filters.</div>`; return; }
+  let html = `<table><thead><tr>
+    <th>Customer</th><th>Service</th><th>Status</th><th>App number</th><th>Fee</th><th>Last updated</th>
+  </tr></thead><tbody>`;
+  for (const r of rows) {
+    html += `<tr class="row" onclick="openApp('${r.app_id}')">
+      <td>
+        <div style="font-weight: 600">${esc(r.customer_name || r.customer_phone || r.customer_id)}</div>
+        <div style="color: var(--muted); font-size: 12px">${esc(r.customer_phone || '')}</div>
+      </td>
+      <td>${esc(prettyService(r.service_type))}<div style="color: var(--muted); font-size: 12px">${esc(r.state_code || '')}</div></td>
+      <td><span class="pill st-${esc(r.status)}">${esc(r.status.replace(/_/g, ' '))}</span></td>
+      <td>${esc(r.application_number || '—')}</td>
+      <td>${r.fee_inr ? '₹' + r.fee_inr : '—'}</td>
+      <td>${esc(relTime(r.updated_at))}</td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  wrap.innerHTML = html;
+}
+
+// ─── Customers ───────────────────────────────────────────────────────────────
+let custFilterTimer;
+function debouncedCustFilter() { clearTimeout(custFilterTimer); custFilterTimer = setTimeout(loadCustomers, 250); }
+
+async function loadCustomers() {
+  const search = document.getElementById('filt-cust-search').value.trim();
+  const qs = `?limit=100${search ? `&search=${encodeURIComponent(search)}` : ''}`;
+  let data;
+  try { data = await adminFetch('/admin/customers' + qs); }
+  catch (e) { return; }
+  renderCustomersTable(data.items || []);
+}
+
+function renderCustomersTable(rows) {
+  const wrap = document.getElementById('customers-table-wrap');
+  if (!rows.length) { wrap.innerHTML = `<div class="empty">No customers yet.</div>`; return; }
+  let html = `<table><thead><tr>
+    <th>Customer</th><th>Customer ID</th><th>Phone</th><th>Applications</th><th>Last activity</th>
+  </tr></thead><tbody>`;
+  for (const r of rows) {
+    html += `<tr class="row" onclick="openCustomer('${r.customer_id}')">
+      <td>${esc(r.name || '—')}<div style="color: var(--muted); font-size: 12px">${esc(r.email || '')}</div></td>
+      <td><code>${esc(r.customer_id)}</code></td>
+      <td>${esc(r.phone)}</td>
+      <td>${r.app_count ?? 0}</td>
+      <td>${esc(relTime(r.last_activity))}</td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  wrap.innerHTML = html;
+}
+
+// ─── Drawer: application detail ──────────────────────────────────────────────
+async function openApp(appId) {
+  let d;
+  try { d = await adminFetch(`/admin/applications/${appId}`); } catch { return; }
+  const a = d.application, c = d.customer, docs = d.documents || [], notes = d.notes || [];
+  document.getElementById('drawer-title').textContent = `${prettyService(a.service_type)} • ${a.app_id}`;
+  const body = document.getElementById('drawer-body');
+  body.innerHTML = `
+    <div class="kv">
+      <b>Customer</b><span>${esc(c?.name || '—')} (${esc(c?.customer_id || '—')})</span>
+      <b>Phone</b><span>${esc(c?.phone || '—')}</span>
+      <b>Service</b><span>${esc(prettyService(a.service_type))}</span>
+      <b>State</b><span>${esc(a.state_code || '—')}</span>
+      <b>Status</b><span><span class="pill st-${esc(a.status)}">${esc(a.status.replace(/_/g,' '))}</span></span>
+      <b>App number</b><span>${esc(a.application_number || '—')}</span>
+      <b>Fee</b><span>${a.fee_inr ? '₹' + a.fee_inr : '—'}</span>
+      <b>Job ID</b><span><code>${esc(a.current_job_id || '—')}</code></span>
+      <b>Created</b><span>${esc(a.created_at)}</span>
+      <b>Updated</b><span>${esc(a.updated_at)}</span>
+    </div>
+
+    <div class="section">
+      <div class="label">Metadata</div>
+      <pre style="margin-top: 6px; background: #f7f9fc; padding: 10px; border-radius: 8px; font-size: 12px; overflow: auto">${esc(JSON.stringify(a.metadata || {}, null, 2))}</pre>
+    </div>
+
+    <div class="section">
+      <div class="label">Documents (${docs.length})</div>
+      <div class="doc-grid">
+        ${docs.map(renderDoc).join('') || '<div class="empty" style="padding: 12px">No documents.</div>'}
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="label">Live job view</div>
+      ${d.job
+        ? `<pre style="margin-top: 6px; background: #f7f9fc; padding: 10px; border-radius: 8px; font-size: 12px; overflow: auto">${esc(JSON.stringify(d.job.customer_view, null, 2))}</pre>`
+        : '<div class="empty" style="padding: 12px">No live job attached.</div>'}
+    </div>
+
+    <div class="section">
+      <div class="label">Operator notes</div>
+      <div class="notes">
+        ${notes.map(n => `<div class="note">${esc(n.text)}<div class="meta">${esc(n.operator_id)} • ${esc(relTime(n.created_at))}</div></div>`).join('')
+          || '<div class="empty" style="padding: 12px">No notes yet.</div>'}
+      </div>
+      <div class="note-add">
+        <textarea id="new-note" placeholder="Add an operator note…"></textarea>
+        <button class="primary" onclick="addNote('${a.app_id}')">Add note</button>
+      </div>
+    </div>
+  `;
+  showDrawer();
+}
+
+function renderDoc(d) {
+  return `
+    <div class="doc">
+      <div class="imgwrap"><img src="${API}/admin/documents/${d.doc_id}/preview" alt="${esc(d.doc_type)}" onerror="this.style.display='none'" /></div>
+      <div style="font-weight: 600">${esc(prettyDocType(d.doc_type))}</div>
+      <div class="conf">Confidence ${Math.round((d.confidence || 0) * 100)}%</div>
+      <div style="color: var(--muted); margin-top: 4px">${(d.size_bytes || 0).toLocaleString()} bytes</div>
+    </div>
+  `;
+}
+
+async function addNote(appId) {
+  const t = document.getElementById('new-note').value.trim();
+  if (!t) return;
+  const res = await fetch(`${API}/admin/applications/${appId}/notes`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Admin-Secret': SECRET },
+    body: JSON.stringify({ text: t }),
+  });
+  if (res.ok) openApp(appId);
+}
+
+async function openCustomer(cid) {
+  let d;
+  try { d = await adminFetch(`/admin/customers/${cid}`); } catch { return; }
+  document.getElementById('drawer-title').textContent = `${d.customer.name || 'Customer'} • ${d.customer.customer_id}`;
+  const body = document.getElementById('drawer-body');
+  body.innerHTML = `
+    <div class="kv">
+      <b>Name</b><span>${esc(d.customer.name || '—')}</span>
+      <b>Phone</b><span>${esc(d.customer.phone)}</span>
+      <b>Email</b><span>${esc(d.customer.email || '—')}</span>
+      <b>KYC</b><span>${esc(d.customer.kyc_status)}</span>
+      <b>Created</b><span>${esc(d.customer.created_at)}</span>
+    </div>
+    <div class="section">
+      <div class="label">Applications (${d.applications.length})</div>
+      <table style="margin-top: 6px"><thead><tr><th>Service</th><th>Status</th><th>App number</th><th>Updated</th></tr></thead><tbody>
+        ${d.applications.map(a => `
+          <tr class="row" onclick="openApp('${a.app_id}')">
+            <td>${esc(prettyService(a.service_type))}</td>
+            <td><span class="pill st-${esc(a.status)}">${esc(a.status.replace(/_/g,' '))}</span></td>
+            <td>${esc(a.application_number || '—')}</td>
+            <td>${esc(relTime(a.updated_at))}</td>
+          </tr>`).join('')}
+      </tbody></table>
+    </div>
+    <div class="section">
+      <div class="label">Documents (${d.documents.length})</div>
+      <div class="doc-grid">${d.documents.map(renderDoc).join('') || '<div class="empty" style="padding: 12px">No documents.</div>'}</div>
+    </div>
+  `;
+  showDrawer();
+}
+
+function showDrawer() {
+  document.getElementById('backdrop').classList.add('on');
+  document.getElementById('drawer').classList.add('on');
+}
+function closeDrawer() {
+  document.getElementById('backdrop').classList.remove('on');
+  document.getElementById('drawer').classList.remove('on');
+}
+
+// ─── helpers ─────────────────────────────────────────────────────────────────
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, ch => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[ch]));
+}
+function prettyService(s) {
+  if (!s) return '—';
+  return s.replace(/_/g, ' ').replace(/\bDL\b/g, 'DL').toLowerCase().replace(/\b\w/g, c => c.toUpperCase());
+}
+function prettyDocType(s) {
+  return ({ driving_license: 'Driving License', aadhaar: 'Aadhaar', address_proof: 'Address proof' }[s]) || (s || '').replace(/_/g, ' ');
+}
+function relTime(iso) {
+  if (!iso) return '—';
+  const t = new Date(iso).getTime();
+  if (isNaN(t)) return iso;
+  const diff = Date.now() - t;
+  const s = Math.floor(diff / 1000);
+  if (s < 60)  return `${s}s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
+}
+
+// Auto sign-in if token is in session storage
+if (SECRET) signIn();
+</script>
+</body>
+</html>

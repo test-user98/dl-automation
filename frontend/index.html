@@ -366,6 +366,8 @@ let dlNormalised = '';
 let lastSubline = '';
 let dlImageUploaded = false;
 let extractedSnapshot = {};
+let dlImagePath = '';
+let ocrConfidence = 0;
 
 // ─── Step nav ───────────────────────────────────────────────────────────────
 function goStep(n) {
@@ -407,6 +409,8 @@ async function onDLImage(input) {
 
   extractedSnapshot = r.extracted || {};
   dlImageUploaded   = true;
+  dlImagePath       = r.dl_image_path || '';
+  ocrConfidence     = r.confidence    || 0;
 
   // Pre-fill what we read
   if (extractedSnapshot.dl_number) document.getElementById('dl_raw').value = extractedSnapshot.dl_number;
@@ -496,6 +500,9 @@ async function startJob() {
     address: extractedSnapshot.address || '',
     state_code: (dlNormalised || '').slice(0, 2),
     service: 'DL_RENEWAL',
+    dl_image_path:  dlImagePath,
+    ocr_data:       extractedSnapshot,
+    ocr_confidence: ocrConfidence,
   };
 
   const r = await apiJson('/onboard/confirm-and-start', payload);
