@@ -241,8 +241,33 @@ async def preview_document(
     doc = await _store().get_document(doc_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
+
+    # Prefer the local file if it exists (free, no S3 round-trip). On a fresh
+    # container after redeploy the disk is wiped but the S3 URL on the doc's
+    # ocr_data still points at the durable copy.
     path = Path(doc.file_path)
-    if not path.exists() or not path.is_file():
-        raise HTTPException(status_code=410, detail="File no longer available")
-    mt = doc.mime_type or mimetypes.guess_type(str(path))[0] or "application/octet-stream"
-    return FileResponse(str(path), media_type=mt, filename=path.name)
+    if path.exists() and path.is_file():
+        mt = doc.mime_type or mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+        return FileResponse(str(path), media_type=mt, filename=path.name)
+
+    # Fall back to the S3 URL stored on the doc record. Presigned URLs in our
+    # S3 setup are short-lived (configurable), so we re-sign per request when
+    # the storage layer is available.
+    ocr_data = getattr(doc, "ocr_data", None) or {}
+    s3_key = ocr_data.get("s3_key") if isinstance(ocr_data, dict) else None
+    s3_url = ocr_data.get("s3_url") if isinstance(ocr_data, dict) else None
+    if s3_key or s3_url:
+        try:
+            from fastapi.responses import RedirectResponse
+            from tools.storage import get_storage
+            storage = get_storage()
+            client = storage._s3()  # internal use — re-sign for redirect
+            if client is not None and s3_key:
+                fresh = storage._url_for_key(client, s3_key)
+                return RedirectResponse(url=fresh, status_code=307)
+            if s3_url:
+                return RedirectResponse(url=s3_url, status_code=307)
+        except Exception:  # noqa: BLE001
+            pass
+
+    raise HTTPException(status_code=410, detail="File no longer available")

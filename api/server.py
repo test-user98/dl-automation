@@ -164,6 +164,10 @@ async def get_job(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
+    screenshots = job.customer_data.get("screenshots") or []
+    if not isinstance(screenshots, list):
+        screenshots = []
+
     return {
         "job_id":             job.job_id,
         "status":             job.status.value,
@@ -175,7 +179,24 @@ async def get_job(job_id: str):
         "step_logs":          job.step_logs[-5:],  # last 5 logs
         "updated_at":         job.updated_at,
         "customer_view":      customer_job_view(job),
+        # All durable image artifacts captured by the agent for this run
+        # (captcha attempts, step screenshots when wired). Empty when S3
+        # is not configured. Capped at the last 100 entries by the storage
+        # helper to bound payload size.
+        "screenshots":        screenshots[-50:],
     }
+
+
+@app.get("/jobs/{job_id}/screenshots", dependencies=[Depends(verify_secret)])
+async def list_job_screenshots(job_id: str):
+    """Full list of durable image artifacts for a job — useful for admin/debug."""
+    job = await _state_manager.load(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    screenshots = job.customer_data.get("screenshots") or []
+    if not isinstance(screenshots, list):
+        screenshots = []
+    return {"job_id": job_id, "count": len(screenshots), "screenshots": screenshots}
 
 
 @app.post("/jobs/{job_id}/otp", dependencies=[Depends(verify_secret)])

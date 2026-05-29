@@ -100,9 +100,19 @@ async def extract_dl_image(file: UploadFile = File(...)):
 
     upload_dir = Path("./uploads")
     upload_dir.mkdir(exist_ok=True)
-    file_path = str(upload_dir / f"dl_{_safe_filename(file.filename)}")
-    with open(file_path, "wb") as f:
-        f.write(data)
+    safe_name = _safe_filename(file.filename)
+    file_path = str(upload_dir / f"dl_{safe_name}")
+
+    # Write to disk + push to S3 in one step. Disk write is always durable
+    # for the in-process OCR call below; S3 URL goes onto the response and is
+    # later persisted with the Document record by /onboard/confirm-and-start.
+    from tools.storage import get_storage
+    storage_result = await get_storage().put_bytes(
+        local_path=file_path,
+        data=data,
+        kind="dl_upload",
+        content_type=file.content_type or "image/jpeg",
+    )
 
     extracted = {}
     for attempt in range(1, settings.ocr_max_attempts + 1):
@@ -139,6 +149,9 @@ async def extract_dl_image(file: UploadFile = File(...)):
         # Path passed through to /onboard/confirm-and-start so we can persist
         # a Document record once we know the customer_id.
         "dl_image_path":  file_path,
+        "dl_image_s3_url": storage_result.s3_url or "",
+        "dl_image_s3_key": storage_result.s3_key or "",
+        "storage_backend": storage_result.backend,
         "message":        "Details extracted from your DL image" if extracted else "Could not read DL — please enter details manually",
     }
 
@@ -163,6 +176,8 @@ class ConfirmAndStartRequest(BaseModel):
     photo_path:     str = ""
     signature_path: str = ""
     dl_image_path:  str = ""             # returned by /onboard/extract-dl-image
+    dl_image_s3_url: str = ""            # also returned by /onboard/extract-dl-image
+    dl_image_s3_key: str = ""
     ocr_data:       dict = {}            # what the OCR step extracted
     ocr_confidence: float = 0.0
 
@@ -238,16 +253,23 @@ async def confirm_and_start(req: ConfirmAndStartRequest):
         },
     )
 
-    # Persist the OCR'd DL image as a Document if we have one.
+    # Persist the OCR'd DL image as a Document if we have one. ocr_data gets
+    # a non-destructive `s3_url`/`s3_key` pair so the operator UI can deep-link
+    # to the durable copy even after the container disk is wiped on redeploy.
     if req.dl_image_path:
         try:
+            doc_ocr_data = dict(req.ocr_data or {})
+            if req.dl_image_s3_url:
+                doc_ocr_data["s3_url"] = req.dl_image_s3_url
+            if req.dl_image_s3_key:
+                doc_ocr_data["s3_key"] = req.dl_image_s3_key
             await _store.add_document(
                 customer_id=cust.customer_id,
                 app_id=application.app_id,
                 doc_type="driving_license",
                 file_path=req.dl_image_path,
                 mime_type="image/jpeg",
-                ocr_data=req.ocr_data or {},
+                ocr_data=doc_ocr_data,
                 confidence=req.ocr_confidence or 0.0,
             )
         except Exception as e:  # don't fail the application start if doc record fails

@@ -481,7 +481,9 @@ class CaptchaSolver:
         Last-resort human-in-the-loop CAPTCHA handling.
 
         The image is saved to data/latest_captcha.png in all cases (debug
-        artifact, also the fallback if the customer-UI ask fails).
+        artifact, also the fallback if the customer-UI ask fails). When S3
+        is configured the bytes also go up to S3 and the URL is stamped on
+        the job so the admin dashboard / job inspector can pull it later.
 
         Order of preference:
           1. `human_loop.ask` with the CAPTCHA image embedded — customer types
@@ -494,7 +496,23 @@ class CaptchaSolver:
         data_dir.mkdir(parents=True, exist_ok=True)
         image_path = (data_dir / "latest_captcha.png").resolve()
         answer_path = (data_dir / "manual_captcha.txt").resolve()
-        image_path.write_bytes(image_bytes)
+
+        # Upload via the storage layer (writes the file + optionally pushes to S3).
+        from tools.storage import get_storage, stamp_screenshot_on_job
+        try:
+            storage_result = await get_storage().put_bytes(
+                local_path=str(image_path),
+                data=image_bytes,
+                kind="captcha",
+                job_id=getattr(job, "job_id", "") if job is not None else "",
+                content_type="image/png",
+            )
+            if job is not None:
+                stamp_screenshot_on_job(job, storage_result, label="captcha_manual")
+        except Exception as e:  # noqa: BLE001
+            log.warning("captcha.storage_put_failed", error=str(e))
+            # Fall back to direct disk write so we don't lose the artifact.
+            image_path.write_bytes(image_bytes)
         try:
             answer_path.unlink()
         except FileNotFoundError:

@@ -29,6 +29,10 @@ opencv-python-headless>=4.10.0
 asyncio-throttle>=1.0.2
 anyio>=4.7.0
 
+# AWS — only needed when AWS_S3_BUCKET is set; bytes are still written to
+# disk locally either way.
+boto3>=1.34.0
+
 # Notifications (optional - for push to customer app)
 firebase-admin>=6.6.0
 

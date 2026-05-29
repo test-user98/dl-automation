@@ -132,6 +132,22 @@ class Settings(BaseSettings):
     demo_auto_ack: bool = Field(False, env="DEMO_AUTO_ACK")
     demo_auto_ack_delay_seconds: float = Field(6.0, env="DEMO_AUTO_ACK_DELAY_SECONDS")
 
+    # ── S3 STORAGE ───────────────────────────────────────────────────────────
+    # Set AWS_S3_BUCKET to enable durable storage for screenshots, captcha
+    # images, and customer DL uploads. When empty, the agent keeps writing to
+    # local disk (current MVP behavior). Local writes always happen so the
+    # agent's debug artifacts work even when S3 is unreachable; the S3 upload
+    # is additive and stores a sharable URL on the job record.
+    aws_s3_bucket: str = Field("", env="AWS_S3_BUCKET")
+    aws_s3_region: str = Field("ap-south-1", env="AWS_S3_REGION")
+    # When true, uploads are made with `ACL=public-read` and the public URL is
+    # returned. When false (default, recommended), uploads stay private and a
+    # presigned URL (`s3_url_expiry_seconds` long) is returned.
+    s3_public_read: bool = Field(False, env="S3_PUBLIC_READ")
+    s3_url_expiry_seconds: int = Field(3600, env="S3_URL_EXPIRY_SECONDS")
+    s3_key_prefix: str = Field("sarathi", env="S3_KEY_PREFIX")
+    s3_owner_tag: str = Field("sipanijai@gmail.com", env="S3_OWNER_TAG")
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
 

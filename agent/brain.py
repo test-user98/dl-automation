@@ -1947,7 +1947,13 @@ class AgentBrain:
         solution: str,
         metadata: dict | None = None,
     ) -> None:
-        """Persist CAPTCHA evidence so failed runs can be debugged precisely."""
+        """Persist CAPTCHA evidence so failed runs can be debugged precisely.
+
+        Writes are synchronous (caller does not await). The disk write happens
+        immediately so local debug paths keep working; the S3 upload is fired
+        as a background task so we don't block the agent step on a network
+        round-trip.
+        """
         try:
             safe_flow = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in flow)
             safe_stage = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in stage)
@@ -1955,8 +1961,9 @@ class AgentBrain:
             out_dir = Path("data") / "captcha_attempts" / job_id
             out_dir.mkdir(parents=True, exist_ok=True)
             base = out_dir / f"{ts}_{safe_flow}_attempt{attempt}_{safe_stage}"
-            if image_bytes:
-                base.with_suffix(".png").write_bytes(image_bytes)
+            png_path = base.with_suffix(".png") if image_bytes else None
+            if png_path is not None:
+                png_path.write_bytes(image_bytes)
             base.with_suffix(".json").write_text(
                 json.dumps(
                     {
@@ -1972,6 +1979,35 @@ class AgentBrain:
                 encoding="utf-8",
             )
             log.info("brain.captcha_attempt_saved", path=str(base))
+
+            if png_path is not None and self._current_job is not None:
+                from tools.storage import get_storage, stamp_screenshot_on_job
+
+                async def _upload_and_stamp() -> None:
+                    try:
+                        result = await get_storage().put_bytes(
+                            local_path=str(png_path),
+                            data=image_bytes,
+                            kind="captcha_attempt",
+                            job_id=job_id,
+                            content_type="image/png",
+                        )
+                        # Only stamp on the job if S3 actually accepted the upload
+                        # — otherwise the disk write already happened and tracking
+                        # the local-only URL would clutter the screenshots list.
+                        if result.s3_url and self._current_job is not None:
+                            stamp_screenshot_on_job(
+                                self._current_job, result,
+                                label=f"captcha:{flow}:attempt{attempt}:{stage}",
+                            )
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("brain.captcha_attempt_s3_failed", error=str(e))
+
+                try:
+                    asyncio.create_task(_upload_and_stamp())
+                except RuntimeError:
+                    # No running loop (rare in our async code path); skip.
+                    pass
         except Exception as e:
             log.warning("brain.captcha_attempt_save_failed", error=str(e))
 
