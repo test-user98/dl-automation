@@ -43,6 +43,7 @@ from browser.controller import BrowserController
 from tools.captcha_solver import CaptchaSolver
 from tools.otp_relay import OTPRelay
 from tools.image_processor import ImageProcessor
+from tools.dl_normalizer import STATE_CODES
 from flows.dl_renewal import DL_RENEWAL_STEPS, steps_after
 
 log = structlog.get_logger(__name__)
@@ -197,6 +198,15 @@ class AgentBrain:
 
             current_step = next_step.name if next_step else "unknown"
             fails        = step_failures.get(current_step, 0)
+
+            # Hard guard: select filing state deterministically from requested
+            # state code, never from DL-derived hints or LLM guesswork.
+            if current_step == "select_state":
+                if await self._force_select_state(job):
+                    step_failures.pop(current_step, None)
+                    failure_context = ""
+                    await self._sm.save(job)
+                    continue
 
             otp_result = await self._maybe_handle_otp_page(
                 job=job,
@@ -4362,6 +4372,31 @@ KNOWN OBSTACLES: {json.dumps(next_step.known_obstacles if next_step else [])}
 
     # ── Execute action with fallback chain ────────────────────────────────────
 
+    async def _force_select_state(self, job: Job) -> bool:
+        code = (job.state_code or job.customer_data.get("state_code") or "RJ").strip().upper()
+        state_name = STATE_CODES.get(code, code)
+        ok = await self._browser.select_option("#stfNameId", label=state_name)
+        if not ok:
+            ok = await self._browser.select_option("#stfNameId", value=state_name)
+        if not ok:
+            ok = await self._browser.click_text(state_name)
+        if not ok:
+            ok = await self._browser.click_link_containing(state_name)
+        if not ok:
+            log.warning("brain.force_select_state_failed", state_code=code, state_name=state_name)
+            return False
+
+        job.customer_data["state_code"] = code
+        job.customer_data["state_name"] = state_name
+        job.mark_step_done("select_state", StepLog(
+            step_name="select_state",
+            status="success",
+            observation=f"Forced filing state: {state_name} ({code})",
+            action_taken="deterministic_state_selection",
+        ))
+        log.info("brain.force_select_state_success", state_code=code, state_name=state_name)
+        return True
+
     async def _execute(self, action: AgentAction, job: Job) -> tuple[bool, str]:
         """
         Returns (success, detail_string).
@@ -4433,7 +4468,18 @@ KNOWN OBSTACLES: {json.dumps(next_step.known_obstacles if next_step else [])}
                     details.append("missing_selector -> False")
                     continue
                 is_date = any(k in selector.lower() for k in ["dob", "date", "birth"])
-                ok = await self._browser.fill(selector, str(value), blur_after=is_date)
+                sel_lower = selector.lower()
+                is_known_select = (
+                    "dispdldet" in sel_lower
+                    or "applcatgdlsereq" in sel_lower
+                    or "rtocodedltr" in sel_lower
+                )
+                if is_known_select:
+                    ok = await self._browser.select_option(selector, label=str(value))
+                    if not ok:
+                        ok = await self._browser.select_option(selector, value=str(value))
+                else:
+                    ok = await self._browser.fill(selector, str(value), blur_after=is_date)
                 details.append(f"{selector} -> {ok}")
                 if ok:
                     ok_count += 1
