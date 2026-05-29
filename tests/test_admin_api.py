@@ -336,6 +336,59 @@ def test_upload_accepts_agentic_dl_payload(client, monkeypatch):
     assert body["extracted"]["name"] == "Aarav Sharma"
 
 
+def test_upload_accepts_dl_when_only_optional_fields_are_missing(client, monkeypatch):
+    import api.onboard
+
+    async def fake_classify(path):
+        assert Path(path).exists()
+        return {
+            "accepted": False,
+            "is_driving_license": True,
+            "document_type": "driving_license",
+            "image_quality": "clear",
+            "confidence": 0.88,
+            "rejection_reason": "missing_required",
+            "rejection_title": "Some details were not readable",
+            "rejection_message": "We need the DL number and date of birth.",
+            "extracted": {
+                "dl_number": "RJ07 2017 0010191",
+                "dob": "01-01-1990",
+                "name": "Aarav Sharma",
+            },
+            "missing_fields": [
+                "address",
+                "pin_code",
+                "vehicle_classes",
+                "gender",
+                "badge_number",
+            ],
+            "needs_manual_review": True,
+        }
+
+    monkeypatch.setattr(api.onboard._ocr, "classify_and_extract_driving_license", fake_classify)
+    r = client.post(
+        "/onboard/extract-dl-image",
+        data={"attempt": "1"},
+        files={"file": ("real-dl.jpg", b"fake image bytes", "image/jpeg")},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ocr_success"] is True
+    assert body["needs_manual_review"] is False
+    assert body["rejection_reason"] == ""
+    assert body["missing_fields"] == []
+    assert body["optional_missing_fields"] == [
+        "address",
+        "pin_code",
+        "vehicle_classes",
+        "gender",
+        "badge_number",
+    ]
+    assert body["retakes_remaining"] == 0
+    assert body["dl_normalised"]["valid"] is True
+    assert body["extracted"]["dl_number"] == "RJ07 2017 0010191"
+
+
 def test_lookup_by_application_number(client):
     """Lookup by application number finds the customer record."""
     # Seeded app numbers include 'RJ-DL-2026-04219'

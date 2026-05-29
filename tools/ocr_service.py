@@ -135,6 +135,7 @@ class OCRService:
             "badge_number": ""
           },
           "missing_fields": [],
+          "optional_missing_fields": [],
           "notes": ""
         }
 
@@ -144,7 +145,10 @@ class OCRService:
         - If it looks like a screen capture rather than the document/photo/PDF itself, use screenshot.
         - If the back side is shown and DL number or DOB is absent, use wrong_side.
         - If the image is too blurry, cropped, dark, tiny, or glared to read required fields, use unreadable.
-        - A DL upload is acceptable only when both dl_number and dob are readable.
+        - A DL upload is acceptable when both dl_number and dob are readable.
+        - missing_fields may contain ONLY dl_number or dob. Do not include optional
+          fields like address, pin_code, vehicle_classes, gender, or badge_number.
+        - Put unread optional fields in optional_missing_fields.
         - If a DL is visible but dl_number or dob is missing, use missing_required.
         - Use low_confidence when fields are guessed instead of clearly read.
         - Leave rejection_reason empty only when the DL is acceptable.
@@ -261,7 +265,14 @@ class OCRService:
         if confidence == 0.0 and any(v for v in extracted.values() if v):
             confidence = 0.75
 
-        missing_fields = self._as_list(data.get("missing_fields"))
+        raw_missing_fields = self._as_list(data.get("missing_fields"))
+        missing_fields = self._required_missing_labels(raw_missing_fields)
+        optional_missing_fields = [
+            item for item in raw_missing_fields if not self._required_missing_label(item)
+        ]
+        optional_missing_fields.extend(self._as_list(data.get("optional_missing_fields")))
+        optional_missing_fields = list(dict.fromkeys(optional_missing_fields))
+
         for key, label in DL_REQUIRED_FIELDS.items():
             if not extracted.get(key) and label not in missing_fields:
                 missing_fields.append(label)
@@ -277,6 +288,8 @@ class OCRService:
                 reason = "screenshot"
             elif not reason:
                 reason = "unreadable" if doc_type in {"", "unknown", "not_a_document"} else "not_dl"
+        elif reason == "missing_required" and not missing_fields:
+            reason = ""
         elif not reason and missing_fields:
             reason = "missing_required"
         elif not reason and confidence < 0.5:
@@ -294,6 +307,7 @@ class OCRService:
             "rejection_message": message,
             "extracted": extracted,
             "missing_fields": missing_fields if is_dl else [],
+            "optional_missing_fields": optional_missing_fields if is_dl else [],
             "needs_manual_review": bool(reason),
             "notes": str(data.get("notes") or "")[:500],
         }
@@ -350,6 +364,30 @@ class OCRService:
         return max(0.0, min(0.99, confidence))
 
     @staticmethod
+    def _required_missing_labels(values: list[str]) -> list[str]:
+        labels = []
+        for value in values:
+            label = OCRService._required_missing_label(value)
+            if not label:
+                continue
+            if label not in labels:
+                labels.append(label)
+        return labels
+
+    @staticmethod
+    def _required_missing_label(value: str) -> str:
+        text = str(value or "").strip().lower().replace("_", " ")
+        if not text:
+            return ""
+        if ("dl" in text or "licence" in text or "license" in text) and "number" in text:
+            return "DL number"
+        if text in {"dob", "date of birth", "birth date"} or (
+            "date" in text and "birth" in text
+        ):
+            return "date of birth"
+        return ""
+
+    @staticmethod
     def _as_bool(value: Any) -> bool:
         if isinstance(value, bool):
             return value
@@ -371,6 +409,7 @@ class OCRService:
             "rejection_message": message,
             "extracted": OCRService._ensure_dl_fields({}),
             "missing_fields": [],
+            "optional_missing_fields": [],
             "needs_manual_review": True,
             "notes": "",
         }

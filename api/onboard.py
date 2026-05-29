@@ -137,6 +137,30 @@ def _unique_labels(values: list) -> list[str]:
     return labels
 
 
+def _required_upload_missing_labels(values: list) -> list[str]:
+    labels = []
+    for value in values or []:
+        label = _required_upload_missing_label(value)
+        if not label:
+            continue
+        if label not in labels:
+            labels.append(label)
+    return labels
+
+
+def _required_upload_missing_label(value: str) -> str:
+    text = str(value or "").strip().lower().replace("_", " ")
+    if not text:
+        return ""
+    if ("dl" in text or "licence" in text or "license" in text) and "number" in text:
+        return "DL number"
+    if text in {"dob", "date of birth", "birth date"} or (
+        "date" in text and "birth" in text
+    ):
+        return "date of birth"
+    return ""
+
+
 @router.post("/extract-dl-image")
 async def extract_dl_image(file: UploadFile = File(...), attempt: int = Form(1)):
     """
@@ -184,8 +208,16 @@ async def extract_dl_image(file: UploadFile = File(...), attempt: int = Form(1))
     # Normalise the DL number if OCR found one
     dl_raw = extracted.get("dl_number", "")
     normalised = _normalizer.normalize(dl_raw) if dl_raw else {"valid": False}
-    missing_fields = _unique_labels(assessment.get("missing_fields") or [])
-    if assessment.get("is_driving_license"):
+    raw_missing_fields = _unique_labels(assessment.get("missing_fields") or [])
+    missing_fields = _required_upload_missing_labels(raw_missing_fields)
+    optional_missing_fields = _unique_labels(
+        [
+            item for item in raw_missing_fields if not _required_upload_missing_label(item)
+        ]
+        + (assessment.get("optional_missing_fields") or [])
+    )
+    is_driving_license = bool(assessment.get("is_driving_license"))
+    if is_driving_license:
         missing_fields = _unique_labels(
             missing_fields
             + [
@@ -207,6 +239,8 @@ async def extract_dl_image(file: UploadFile = File(...), attempt: int = Form(1))
     rejection_reason = (assessment.get("rejection_reason") or "").strip()
     if assessment.get("accepted") and not normalised.get("valid"):
         rejection_reason = "invalid_dl_number"
+    elif rejection_reason == "missing_required" and not missing_fields and normalised.get("valid"):
+        rejection_reason = ""
     elif not rejection_reason and (missing_fields or not normalised.get("valid")):
         rejection_reason = "missing_required"
     elif not rejection_reason and not extracted:
@@ -218,7 +252,7 @@ async def extract_dl_image(file: UploadFile = File(...), attempt: int = Form(1))
         rejection_title, rejection_message = _upload_rejection_copy(rejection_reason)
 
     needs_manual_review = bool(rejection_reason) or bool(missing_fields) or not normalised.get("valid")
-    ocr_success = bool(assessment.get("accepted")) and not needs_manual_review
+    ocr_success = is_driving_license and not needs_manual_review
 
     retake_attempt = max(1, int(attempt or 1))
     retake_budget = max(0, int(getattr(settings, "ocr_retake_budget", 2)))
@@ -233,8 +267,9 @@ async def extract_dl_image(file: UploadFile = File(...), attempt: int = Form(1))
         "display":        _normalizer.format_for_display(normalised.get("normalized", "")) if normalised.get("valid") else "",
         "confidence":     round(confidence, 2),
         "missing_fields": missing_fields,
+        "optional_missing_fields": optional_missing_fields,
         "needs_manual_review": needs_manual_review,
-        "is_driving_license": bool(assessment.get("is_driving_license")),
+        "is_driving_license": is_driving_license,
         "document_type": assessment.get("document_type", "unknown"),
         "image_quality": assessment.get("image_quality", "unknown"),
         "rejection_reason": rejection_reason,
