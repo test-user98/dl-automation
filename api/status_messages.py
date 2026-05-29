@@ -2,30 +2,75 @@
 
 The agent and Sarathi portal produce technical errors. This module converts
 them into short product messages that a customer can understand.
+
+Design rule: at any moment the customer is in one of these phases:
+  - connecting  → "Connecting to the government portal"
+  - filling     → "Filling your application"
+  - waiting     → "Waiting on you" (OTP / human-needed)
+  - submitting  → "Submitting your application"
+  - retrying    → portal/network hiccup, auto retry (e.g. portal is down)
+  - done        → submitted/completed
+  - failed      → terminal, but still retryable from customer's side
+
+The portal-down case (5xx / "service unavailable" / "bad gateway") is
+treated as a transient retry, not a hard failure, so the customer sees
+a calm "we will retry" message instead of an error screen.
 """
 
+import re
 from agent.state_manager import Job, JobStatus
 
 
-STEP_LABELS = {
-    "open_homepage": "Opening the government portal",
-    "close_homepage_popup": "Preparing the portal session",
-    "select_state": "Selecting your state",
-    "close_state_popup": "Handling portal notices",
-    "navigate_to_dl_services": "Opening the DL renewal service",
-    "fetch_dl_details": "Fetching your DL details",
-    "confirm_dl_details": "Confirming your DL information",
-    "select_renewal_service": "Selecting renewal service",
-    "auth_method_selection": "Setting up verification",
-    "fill_personal_details": "Filling your application",
-    "accept_alert_popup": "Handling portal confirmation",
-    "mobile_otp_verification": "Verifying your OTP",
-    "aadhaar_otp_verification": "Verifying Aadhaar OTP",
-    "upload_documents": "Uploading documents",
-    "upload_photo_signature": "Uploading photo and signature",
-    "fee_payment": "Preparing payment",
-    "download_acknowledgment": "Collecting acknowledgement",
+PHASE_CONNECTING = "connecting"
+PHASE_FILLING    = "filling"
+PHASE_WAITING    = "waiting"
+PHASE_SUBMITTING = "submitting"
+PHASE_RETRYING   = "retrying"
+PHASE_DONE       = "done"
+PHASE_FAILED     = "failed"
+
+
+# Map each known agent step to (phase, short customer label).
+# Anything missing falls back to ("filling", "Working on your application").
+STEP_TO_PHASE: dict[str, tuple[str, str]] = {
+    "open_homepage":            (PHASE_CONNECTING, "Connecting to the government portal"),
+    "close_homepage_popup":     (PHASE_CONNECTING, "Connecting to the government portal"),
+    "select_state":             (PHASE_CONNECTING, "Selecting your state"),
+    "close_state_popup":        (PHASE_CONNECTING, "Selecting your state"),
+    "navigate_to_dl_services":  (PHASE_FILLING,    "Opening the DL renewal page"),
+    "fetch_dl_details":         (PHASE_FILLING,    "Looking up your DL on the portal"),
+    "confirm_dl_details":       (PHASE_FILLING,    "Confirming your details with the portal"),
+    "select_renewal_service":   (PHASE_FILLING,    "Filling your application"),
+    "auth_method_selection":    (PHASE_FILLING,    "Setting up verification"),
+    "fill_personal_details":    (PHASE_FILLING,    "Filling your application"),
+    "accept_alert_popup":       (PHASE_FILLING,    "Filling your application"),
+    "mobile_otp_verification":  (PHASE_WAITING,    "Waiting for the OTP"),
+    "aadhaar_otp_verification": (PHASE_WAITING,    "Waiting for the OTP"),
+    "upload_documents":         (PHASE_SUBMITTING, "Uploading documents"),
+    "upload_photo_signature":   (PHASE_SUBMITTING, "Uploading photo and signature"),
+    "fee_payment":              (PHASE_SUBMITTING, "Preparing the government fee"),
+    "download_acknowledgment":  (PHASE_SUBMITTING, "Collecting your acknowledgement"),
 }
+
+# Legacy shape — kept so existing UI code that reads STEP_LABELS still works.
+STEP_LABELS = {k: v[1] for k, v in STEP_TO_PHASE.items()}
+
+
+_PORTAL_DOWN_PATTERNS = (
+    "503", "502", "504", "service unavailable", "bad gateway",
+    "gateway timeout", "site can't be reached", "site cannot be reached",
+    "err_connection", "name not resolved", "net::err",
+)
+
+
+def _mask_mobile(mobile: str) -> str:
+    """+91 XX*****63 — last 2 digits visible, rest masked."""
+    digits = re.sub(r"\D", "", mobile or "")
+    if len(digits) < 4:
+        return "your registered mobile"
+    last2 = digits[-2:]
+    first2 = digits[-10:-8] if len(digits) >= 10 else digits[:2]
+    return f"+91 {first2}******{last2}"
 
 
 def customer_job_view(job: Job) -> dict:
@@ -33,56 +78,118 @@ def customer_job_view(job: Job) -> dict:
     raw = _raw_context(job)
     lower = raw.lower()
     last_step = job.steps_completed[-1] if job.steps_completed else ""
-    step_label = STEP_LABELS.get(last_step, "Working on your application")
+    phase, step_label = STEP_TO_PHASE.get(
+        last_step, (PHASE_FILLING, "Working on your application")
+    )
+
+    mobile_suffix = _mask_mobile(job.customer_data.get("mobile_number", ""))
 
     action_required = False
     action_type = ""
-    title = "Application in progress"
+    title = {
+        PHASE_CONNECTING: "Connecting to the portal",
+        PHASE_FILLING:    "Filling your application",
+        PHASE_WAITING:    "Waiting on you",
+        PHASE_SUBMITTING: "Submitting your application",
+    }.get(phase, "Working on your application")
     message = step_label
     severity = "info"
     retryable = True
+    portal_down = _is_portal_down(lower)
 
-    if job.status == JobStatus.WAITING_OTP:
+    # Portal-down beats most other states — show the calm retry message.
+    if portal_down and job.status not in {
+        JobStatus.SUBMITTED, JobStatus.COMPLETED,
+        JobStatus.WAITING_OTP, JobStatus.STUCK_HUMAN_NEEDED,
+    }:
+        phase = PHASE_RETRYING
+        title = "Government portal is slow right now"
+        message = (
+            "The government Sarathi portal is temporarily unavailable. "
+            "Your details are saved — we'll retry automatically. "
+            "You don't need to do anything."
+        )
+        severity = "warning"
+
+    elif job.status == JobStatus.WAITING_OTP:
+        phase = PHASE_WAITING
         action_required = True
         action_type = "otp"
-        title = "OTP needed"
-        message = "Enter the OTP sent by the government portal so we can continue."
+        title = "Enter the OTP"
+        message = (
+            f"The government portal just sent an OTP to {mobile_suffix}. "
+            "Enter it here so we can submit your application."
+        )
         severity = "action"
+
     elif job.status == JobStatus.STUCK_HUMAN_NEEDED:
+        phase = PHASE_WAITING
         action_required = True
         action_type = "otp" if "otp" in lower else "human_response"
-        title = "Action needed"
-        message = _human_message(lower) or "We need one detail from you to continue safely."
+        if action_type == "otp":
+            title = "Enter the OTP"
+            message = (
+                f"The government portal just sent an OTP to {mobile_suffix}. "
+                "Enter it here so we can submit your application."
+            )
+        else:
+            title = "We need one detail"
+            message = _human_message(lower) or "Please confirm one detail so we can continue."
         severity = "action"
+
     elif job.status in {JobStatus.SUBMITTED, JobStatus.COMPLETED}:
+        phase = PHASE_DONE
         title = "Application submitted"
         message = "Your application was submitted on the government portal."
         severity = "success"
         retryable = False
+
     elif job.status == JobStatus.FAILED:
+        phase = PHASE_FAILED
         title, message, retryable = _failure_message(lower)
         severity = "error"
+
     elif job.status == JobStatus.PAYMENT_PENDING:
-        title = "Payment pending"
-        message = "The portal is checking payment status. Do not retry payment yet."
+        phase = PHASE_SUBMITTING
+        title = "Confirming payment"
+        message = "The portal is confirming your payment. Please don't retry — we'll update you in a moment."
         severity = "warning"
+
+    elif job.status == JobStatus.FAILED_RETRYING:
+        phase = PHASE_RETRYING
+        title = "Retrying"
+        message = "The portal didn't respond cleanly. We're retrying — your details are safe."
+        severity = "warning"
+
     elif "captcha" in lower:
-        title = "Portal verification retry"
-        message = "The government portal asked for a fresh verification code. We are retrying safely."
-        severity = "warning"
+        # CAPTCHA churn is internal — hide it behind the phase message.
+        title = "Working through the portal verification"
+        message = step_label
+        severity = "info"
+
     elif "403" in lower or "forbidden" in lower:
-        title = "Portal temporarily unavailable"
-        message = "The government portal refused this request for now. We will retry without changing your details."
+        phase = PHASE_RETRYING
+        title = "Government portal is slow right now"
+        message = (
+            "The portal refused this request for a moment. "
+            "We'll retry without changing your details."
+        )
         severity = "warning"
 
     return {
-        "title": title,
-        "message": message,
-        "severity": severity,
-        "action_required": action_required,
-        "action_type": action_type,
-        "retryable": retryable,
-        "last_step_label": step_label,
+        # New phase-based fields
+        "phase":           phase,
+        "headline":        title,
+        "subline":         message,
+        "mobile_suffix":   mobile_suffix if action_type == "otp" else "",
+        # Legacy fields — kept so the current frontend still works
+        "title":            title,
+        "message":          message,
+        "severity":         severity,
+        "action_required":  action_required,
+        "action_type":      action_type,
+        "retryable":        retryable,
+        "last_step_label":  step_label,
     }
 
 
@@ -99,6 +206,10 @@ def _raw_context(job: Job) -> str:
     return "\n".join(parts)
 
 
+def _is_portal_down(lower: str) -> bool:
+    return any(p in lower for p in _PORTAL_DOWN_PATTERNS)
+
+
 def _human_message(lower: str) -> str:
     if "otp" in lower:
         return "Enter the OTP sent to your registered mobile number."
@@ -112,6 +223,13 @@ def _human_message(lower: str) -> str:
 
 
 def _failure_message(lower: str) -> tuple[str, str, bool]:
+    if _is_portal_down(lower):
+        return (
+            "Government portal is unavailable",
+            "The Sarathi portal is down right now. Your details are saved — "
+            "please try again in a few minutes.",
+            True,
+        )
     if "403" in lower or "forbidden" in lower:
         return (
             "Portal temporarily unavailable",
@@ -137,7 +255,7 @@ def _failure_message(lower: str) -> tuple[str, str, bool]:
             True,
         )
     return (
-        "Could not complete application",
+        "Couldn't complete the application",
         "The government portal did not complete the request. Your details are saved and you can retry.",
         True,
     )

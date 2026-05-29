@@ -3,14 +3,33 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>RTO Services</title>
+  <title>RTO Services — Driving Licence Renewal</title>
   <style>
-    * { box-sizing: border-box; }
+    *,*::before,*::after { box-sizing: border-box; }
+    :root {
+      --bg:       #f5f7fb;
+      --card:     #ffffff;
+      --ink:      #111729;
+      --ink-2:    #3b4762;
+      --muted:    #6b7688;
+      --line:     #e3e8f0;
+      --line-2:   #cfd6e3;
+      --primary:  #0e62d8;
+      --primary-d:#0b4ca8;
+      --success:  #126a2f;
+      --success-bg:#eaf7ef;
+      --warn:     #7a5300;
+      --warn-bg:  #fff5d6;
+      --err:      #a31418;
+      --err-bg:   #fdecec;
+      --shadow:   0 1px 2px rgba(15, 24, 48, 0.06), 0 8px 24px -12px rgba(15, 24, 48, 0.10);
+    }
     body {
       margin: 0;
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      color: #172033;
-      background: #f6f8fb;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, ui-sans-serif, system-ui, sans-serif;
+      color: var(--ink);
+      background: var(--bg);
+      -webkit-font-smoothing: antialiased;
     }
     .topbar {
       height: 56px;
@@ -18,554 +37,637 @@
       align-items: center;
       justify-content: space-between;
       padding: 0 22px;
-      background: #ffffff;
-      border-bottom: 1px solid #dfe5ee;
+      background: #fff;
+      border-bottom: 1px solid var(--line);
     }
-    .brand { font-weight: 750; font-size: 16px; }
-    .subtle { color: #68758a; font-size: 13px; }
-    .shell { max-width: 920px; margin: 0 auto; padding: 22px 16px 42px; }
-    .layout { display: grid; grid-template-columns: 260px 1fr; gap: 18px; align-items: start; }
-    .panel, .side {
-      background: #ffffff;
-      border: 1px solid #dfe5ee;
-      border-radius: 8px;
-      box-shadow: 0 1px 3px rgba(18, 31, 54, 0.04);
+    .brand     { font-weight: 700; font-size: 16px; letter-spacing: -0.01em; }
+    .brand-sub { color: var(--muted); font-size: 12px; margin-left: 8px; }
+    .shell     { max-width: 720px; margin: 0 auto; padding: 24px 16px 64px; }
+
+    /* progress dots */
+    .progress { display: flex; gap: 8px; margin: 4px 0 22px; }
+    .pd       { flex: 1; height: 4px; border-radius: 999px; background: var(--line); }
+    .pd.on    { background: var(--primary); }
+    .pd.done  { background: var(--success); }
+
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 24px;
+      box-shadow: var(--shadow);
     }
-    .panel { padding: 22px; }
-    .side { padding: 16px; position: sticky; top: 14px; }
-    h1 { margin: 0 0 6px; font-size: 22px; letter-spacing: 0; }
-    h2 { margin: 0 0 6px; font-size: 18px; letter-spacing: 0; }
-    p { margin: 0; line-height: 1.45; }
-    .steps { display: grid; gap: 10px; margin-top: 16px; }
-    .step {
-      display: flex;
-      gap: 10px;
-      align-items: center;
-      color: #6b7688;
-      font-size: 13px;
-    }
-    .dot {
-      width: 22px;
-      height: 22px;
-      border-radius: 50%;
-      display: grid;
-      place-items: center;
-      background: #e8edf5;
-      color: #6b7688;
-      font-size: 12px;
-      font-weight: 700;
-      flex: 0 0 22px;
-    }
-    .step.active { color: #0b66d8; font-weight: 700; }
-    .step.active .dot { background: #0b66d8; color: #fff; }
-    .step.done { color: #16803c; }
-    .step.done .dot { background: #16803c; color: #fff; }
-    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    .card + .card { margin-top: 14px; }
+    h1 { margin: 0 0 4px; font-size: 22px; letter-spacing: -0.01em; }
+    h2 { margin: 0 0 4px; font-size: 18px; letter-spacing: -0.01em; }
+    .sub { color: var(--muted); font-size: 14px; margin: 0 0 18px; line-height: 1.45; }
+
     .field { margin-top: 14px; }
-    label { display: block; font-size: 12px; font-weight: 700; color: #354156; margin-bottom: 6px; }
+    label { display: block; font-size: 12px; font-weight: 600; color: var(--ink-2); margin-bottom: 6px; }
     input, select, textarea {
       width: 100%;
-      min-height: 42px;
-      border: 1px solid #cfd7e5;
-      border-radius: 7px;
-      padding: 10px 11px;
+      min-height: 44px;
+      border: 1px solid var(--line-2);
+      border-radius: 10px;
+      padding: 10px 12px;
       font: inherit;
-      outline: none;
       background: #fff;
+      color: var(--ink);
+      outline: none;
+      transition: border 0.15s, box-shadow 0.15s;
     }
-    input:focus, select:focus, textarea:focus { border-color: #0b66d8; box-shadow: 0 0 0 3px rgba(11, 102, 216, 0.1); }
-    textarea { min-height: 76px; resize: vertical; }
-    .hint { margin-top: 5px; color: #758196; font-size: 12px; }
-    .status {
-      border-radius: 7px;
-      padding: 11px 12px;
-      font-size: 13px;
-      margin-top: 14px;
-      border: 1px solid #dce3ee;
-      background: #f7f9fc;
-      color: #40506a;
+    input:focus, select:focus, textarea:focus {
+      border-color: var(--primary);
+      box-shadow: 0 0 0 3px rgba(14, 98, 216, 0.14);
     }
-    .status.success { border-color: #a9dfbc; background: #f1fbf4; color: #12622d; }
-    .status.warn { border-color: #f1cf79; background: #fff9e8; color: #6b4a00; }
-    .status.error { border-color: #f1aaa3; background: #fff4f2; color: #9e241b; }
-    .actions { display: flex; gap: 10px; margin-top: 18px; flex-wrap: wrap; }
+    .hint  { margin-top: 6px; color: var(--muted); font-size: 12px; }
+    .hint.ok    { color: var(--success); }
+    .hint.err   { color: var(--err); }
+    .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    @media (max-width: 520px) { .row2 { grid-template-columns: 1fr; } }
+
+    .actions { display: flex; gap: 10px; margin-top: 22px; flex-wrap: wrap; }
     button {
       border: 0;
-      border-radius: 7px;
-      min-height: 42px;
-      padding: 0 15px;
-      font-weight: 750;
+      border-radius: 10px;
+      min-height: 44px;
+      padding: 0 18px;
+      font-weight: 600;
+      font-size: 14px;
       cursor: pointer;
-      background: #edf2f8;
-      color: #20304a;
+      background: #eef2f8;
+      color: var(--ink);
+      transition: background 0.12s;
     }
-    button.primary { background: #0b66d8; color: #fff; }
-    button.success { background: #16803c; color: #fff; }
-    button.danger { background: #b42318; color: #fff; }
+    button:hover { background: #e1e8f3; }
+    button.primary { background: var(--primary); color: #fff; }
+    button.primary:hover { background: var(--primary-d); }
+    button.ghost   { background: transparent; color: var(--primary); padding: 0 10px; }
     button:disabled { opacity: 0.55; cursor: not-allowed; }
+
     .hidden { display: none !important; }
-    .review { display: grid; gap: 8px; margin-top: 16px; }
-    .row { display: flex; justify-content: space-between; gap: 18px; padding: 10px 0; border-bottom: 1px solid #eef2f7; }
-    .row b { font-size: 12px; text-transform: uppercase; color: #738096; letter-spacing: 0.02em; }
-    .row span { text-align: right; font-weight: 650; }
-    .progress { height: 8px; border-radius: 999px; background: #e8edf5; overflow: hidden; margin-top: 16px; }
-    .bar { height: 100%; width: 5%; background: #0b66d8; transition: width 0.35s ease; }
-    .log { margin-top: 16px; display: grid; gap: 8px; max-height: 260px; overflow: auto; }
-    .log-item { border: 1px solid #e4eaf3; border-radius: 7px; padding: 9px 10px; font-size: 13px; color: #41506a; }
-    .otp-box { display: flex; gap: 8px; margin: 16px 0; }
-    .otp-box input { text-align: center; font-size: 20px; font-weight: 800; padding: 8px; }
-    .file-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 14px; }
-    .mini-card { border: 1px solid #e1e8f2; border-radius: 8px; padding: 12px; }
-    @media (max-width: 760px) {
-      .layout { grid-template-columns: 1fr; }
-      .side { position: static; }
-      .grid, .file-row { grid-template-columns: 1fr; }
+
+    .banner {
+      border-radius: 10px;
+      padding: 12px 14px;
+      font-size: 14px;
+      margin-top: 14px;
+      border: 1px solid var(--line);
+      background: #f4f7fb;
+      color: var(--ink-2);
     }
+    .banner.success { border-color: #b8e1c5; background: var(--success-bg); color: var(--success); }
+    .banner.warn    { border-color: #ead49a; background: var(--warn-bg);    color: var(--warn); }
+    .banner.err     { border-color: #f1b0b0; background: var(--err-bg);     color: var(--err); }
+
+    /* file drop */
+    .drop {
+      border: 1.5px dashed var(--line-2);
+      border-radius: 12px;
+      padding: 22px;
+      text-align: center;
+      background: #fafbfd;
+      cursor: pointer;
+      transition: border 0.15s, background 0.15s;
+    }
+    .drop:hover { border-color: var(--primary); background: #f1f6fe; }
+    .drop input { display: none; }
+    .drop-title { font-weight: 600; }
+    .drop-sub   { color: var(--muted); font-size: 13px; margin-top: 4px; }
+
+    /* review rows */
+    .review { display: grid; gap: 0; margin-top: 8px; border-top: 1px solid var(--line); }
+    .review .row {
+      display: flex; justify-content: space-between; gap: 18px;
+      padding: 12px 0; border-bottom: 1px solid var(--line);
+      font-size: 14px;
+    }
+    .review .row b { font-weight: 500; color: var(--muted); }
+    .review .row span { font-weight: 600; text-align: right; word-break: break-word; }
+
+    /* live status */
+    .live-head {
+      display: flex; align-items: center; gap: 12px; margin-bottom: 12px;
+    }
+    .spin {
+      width: 18px; height: 18px;
+      border: 2px solid var(--line);
+      border-top-color: var(--primary);
+      border-radius: 50%;
+      animation: sp 0.9s linear infinite;
+    }
+    .spin.done { border-color: var(--success); border-top-color: var(--success); animation: none; }
+    .spin.warn { border-color: var(--warn);    border-top-color: var(--warn);    animation-duration: 1.6s; }
+    .spin.err  { border-color: var(--err);     border-top-color: var(--err);     animation: none; }
+    @keyframes sp { to { transform: rotate(360deg); } }
+    .live-title { font-size: 17px; font-weight: 700; }
+    .live-sub   { color: var(--muted); font-size: 14px; margin-top: 4px; }
+    .phase-track {
+      display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px;
+      margin-top: 16px;
+    }
+    .ph {
+      padding: 8px 8px; border-radius: 8px; font-size: 12px; font-weight: 600;
+      background: #f3f5fa; color: var(--muted); text-align: center;
+      border: 1px solid var(--line);
+    }
+    .ph.on   { background: #e6f0ff; color: var(--primary); border-color: #c4dafd; }
+    .ph.done { background: var(--success-bg); color: var(--success); border-color: #b8e1c5; }
+
+    /* OTP */
+    .otp-row { display: flex; gap: 8px; margin: 18px 0 4px; justify-content: center; }
+    .otp-row input {
+      width: 44px; min-height: 52px; text-align: center;
+      font-size: 22px; font-weight: 700; padding: 0;
+    }
+    .resend { color: var(--primary); cursor: pointer; font-size: 13px; }
+
+    .footnote { color: var(--muted); font-size: 12px; line-height: 1.5; margin-top: 14px; }
+    a { color: var(--primary); }
   </style>
 </head>
 <body>
   <div class="topbar">
-    <div class="brand">RTO Services</div>
-    <div class="subtle">Upload, verify, done</div>
+    <div>
+      <span class="brand">RTO Services</span>
+      <span class="brand-sub">Driving licence renewal · India</span>
+    </div>
+    <div class="brand-sub">Powered by AI agent</div>
   </div>
 
   <main class="shell">
-    <div class="layout">
-      <aside class="side">
-        <div class="subtle">Application flow</div>
-        <div class="steps">
-          <div class="step active" data-step="1"><span class="dot">1</span> Details</div>
-          <div class="step" data-step="2"><span class="dot">2</span> Review</div>
-          <div class="step" data-step="3"><span class="dot">3</span> Agent</div>
-          <div class="step" data-step="4"><span class="dot">4</span> Verify</div>
-          <div class="step" data-step="5"><span class="dot">5</span> Done</div>
-        </div>
-      </aside>
 
-      <section class="panel" id="screen-details">
-        <h1>Start DL renewal</h1>
-        <p class="subtle">Upload your DL or enter the details manually. You can review everything before the agent starts.</p>
-
-        <div class="file-row">
-          <div class="mini-card">
-            <label>Driving license image</label>
-            <input id="dl-file" type="file" accept="image/*,.pdf" onchange="uploadDLImage(this)" />
-            <div class="hint">OCR will try twice. If it is unsure, you can type manually.</div>
-          </div>
-          <div class="mini-card">
-            <label>Selfie or photo</label>
-            <input id="selfie-file" type="file" accept="image/*" capture="user" onchange="uploadSelfie(this)" />
-            <div class="hint">Used later for photo upload and face check workflow.</div>
-          </div>
-        </div>
-
-        <div id="ocr-status" class="status hidden"></div>
-
-        <div class="grid">
-          <div class="field">
-            <label>DL number</label>
-            <input id="dl_raw" placeholder="RJ0720170010191" oninput="onDLInput()" />
-            <div id="dl-message" class="hint">Printed on your driving license.</div>
-          </div>
-          <div class="field">
-            <label>Date of birth</label>
-            <input id="dob" placeholder="DD-MM-YYYY" maxlength="10" />
-          </div>
-          <div class="field">
-            <label>Mobile number</label>
-            <input id="mobile" placeholder="10-digit mobile" maxlength="10" inputmode="numeric" />
-          </div>
-          <div class="field">
-            <label>Present address PIN code</label>
-            <input id="pin_code" placeholder="334401" maxlength="6" inputmode="numeric" />
-          </div>
-          <div class="field">
-            <label>Name</label>
-            <input id="name" placeholder="As on DL" />
-          </div>
-          <div class="field">
-            <label>Email (optional)</label>
-            <input id="email" type="email" placeholder="sipanijai@gmail.com" />
-          </div>
-        </div>
-
-        <div class="field">
-          <label>Address (optional)</label>
-          <textarea id="address" placeholder="Auto-filled from OCR when available"></textarea>
-        </div>
-
-        <div class="actions">
-          <button class="primary" onclick="goToReview()">Review details</button>
-        </div>
-      </section>
-
-      <section class="panel hidden" id="screen-review">
-        <h2>Review before starting</h2>
-        <p class="subtle">These values will be used by the browser agent on the government portal.</p>
-        <div class="review" id="review-rows"></div>
-        <div class="actions">
-          <button onclick="showScreen(1)">Edit</button>
-          <button class="success" id="start-btn" onclick="startJob()">Confirm and start</button>
-        </div>
-      </section>
-
-      <section class="panel hidden" id="screen-agent">
-        <h2 id="status-title">Working on your application</h2>
-        <p id="status-message" class="subtle">Starting the browser agent.</p>
-        <div id="customer-status" class="status">Preparing your application.</div>
-        <div class="progress"><div class="bar" id="progress-bar"></div></div>
-        <div class="log" id="step-log"></div>
-      </section>
-
-      <section class="panel hidden" id="screen-otp">
-        <h2>Enter OTP</h2>
-        <p id="otp-desc" class="subtle">Enter the OTP sent by the government portal.</p>
-        <div class="otp-box">
-          <input maxlength="1" inputmode="numeric" id="o1" oninput="moveOTP(this,'o2')" />
-          <input maxlength="1" inputmode="numeric" id="o2" oninput="moveOTP(this,'o3')" />
-          <input maxlength="1" inputmode="numeric" id="o3" oninput="moveOTP(this,'o4')" />
-          <input maxlength="1" inputmode="numeric" id="o4" oninput="moveOTP(this,'o5')" />
-          <input maxlength="1" inputmode="numeric" id="o5" oninput="moveOTP(this,'o6')" />
-          <input maxlength="1" inputmode="numeric" id="o6" oninput="moveOTP(this,null)" />
-        </div>
-        <div class="actions">
-          <button class="primary" id="otp-btn" onclick="submitOTP()">Submit OTP</button>
-          <button onclick="showScreen(3); startPolling()">Back to status</button>
-        </div>
-      </section>
-
-      <section class="panel hidden" id="screen-human">
-        <h2>Action needed</h2>
-        <p id="human-question" class="subtle">The agent needs one detail to continue.</p>
-        <div class="field">
-          <label>Your answer</label>
-          <textarea id="human-answer"></textarea>
-        </div>
-        <div class="actions">
-          <button class="primary" onclick="submitHumanResponse()">Send answer</button>
-        </div>
-      </section>
-
-      <section class="panel hidden" id="screen-done">
-        <h2>Application submitted</h2>
-        <p class="subtle">Your acknowledgement/application number is below.</p>
-        <div class="status success" id="app-number">Submitted</div>
-        <div class="actions">
-          <button onclick="location.reload()">Start another application</button>
-        </div>
-      </section>
+    <!-- progress strip -->
+    <div class="progress" id="progress">
+      <div class="pd on"  data-step="1"></div>
+      <div class="pd"     data-step="2"></div>
+      <div class="pd"     data-step="3"></div>
+      <div class="pd"     data-step="4"></div>
     </div>
+
+    <!-- ── STEP 1 ── Upload DL or skip ────────────────────────────────── -->
+    <section id="screen-1" class="card">
+      <h1>Renew your driving licence</h1>
+      <p class="sub">We'll fill the government Sarathi portal on your behalf. It usually takes 3–5 minutes once we have your details.</p>
+
+      <label for="dl-file" class="drop" id="drop-label">
+        <input id="dl-file" type="file" accept="image/*,.pdf" onchange="onDLImage(this)" />
+        <div class="drop-title">Upload a photo of your DL</div>
+        <div class="drop-sub">We'll auto-read your DL number, DOB, and name. You can still edit them.</div>
+      </label>
+
+      <div class="banner hidden" id="ocr-banner"></div>
+
+      <div class="actions">
+        <button class="primary" onclick="goStep(2)" id="step1-next">Continue without photo</button>
+      </div>
+    </section>
+
+    <!-- ── STEP 2 ── Confirm core details ─────────────────────────────── -->
+    <section id="screen-2" class="card hidden">
+      <h2>Confirm your details</h2>
+      <p class="sub">We need these to start your application on the government portal.</p>
+
+      <div class="field">
+        <label>Driving licence number</label>
+        <input id="dl_raw" placeholder="e.g. RJ0720170010191" oninput="onDLInput()" autocomplete="off" />
+        <div id="dl-message" class="hint">Printed on the front of your DL.</div>
+      </div>
+
+      <div class="row2">
+        <div class="field">
+          <label>Date of birth</label>
+          <input id="dob" placeholder="DD-MM-YYYY" maxlength="10" inputmode="numeric" oninput="formatDOB(this)" />
+        </div>
+        <div class="field">
+          <label>Mobile number</label>
+          <input id="mobile" placeholder="10-digit mobile" maxlength="10" inputmode="numeric" />
+          <div class="hint">We'll send you a status update here.</div>
+        </div>
+      </div>
+
+      <div class="field">
+        <label>Full name (optional)</label>
+        <input id="name" placeholder="As printed on your DL" />
+        <div class="hint">Leave blank — we'll read it from the portal.</div>
+      </div>
+
+      <div class="actions">
+        <button onclick="goStep(1)">Back</button>
+        <button class="primary" onclick="goStep(3)">Continue</button>
+      </div>
+    </section>
+
+    <!-- ── STEP 3 ── Address PIN + review ─────────────────────────────── -->
+    <section id="screen-3" class="card hidden">
+      <h2>Where do you live now?</h2>
+      <p class="sub">The portal asks for your current address PIN code. The rest is auto-filled from your DL.</p>
+
+      <div class="field">
+        <label>Present address PIN code</label>
+        <input id="pin_code" placeholder="6-digit PIN" maxlength="6" inputmode="numeric" />
+      </div>
+
+      <h2 style="margin-top: 24px">Review before we start</h2>
+      <div class="review" id="review-rows"></div>
+
+      <p class="footnote">
+        By continuing, you authorise us to fill the government Sarathi portal on your behalf using these details.
+        You'll enter the OTP yourself when the portal sends it. We don't store your DL or OTP after this application is submitted.
+      </p>
+
+      <div class="actions">
+        <button onclick="goStep(2)">Back</button>
+        <button class="primary" id="start-btn" onclick="startJob()">Start my application</button>
+      </div>
+    </section>
+
+    <!-- ── STEP 4 ── Live agent status ────────────────────────────────── -->
+    <section id="screen-4" class="card hidden">
+      <div class="live-head">
+        <div class="spin" id="spin"></div>
+        <div>
+          <div class="live-title" id="live-title">Starting your application</div>
+          <div class="live-sub"   id="live-sub">Connecting to the government portal…</div>
+        </div>
+      </div>
+
+      <div class="phase-track" id="phase-track">
+        <div class="ph on"   data-phase="connecting">Connecting</div>
+        <div class="ph"      data-phase="filling">Filling form</div>
+        <div class="ph"      data-phase="waiting">Your OTP</div>
+        <div class="ph"      data-phase="submitting">Submitting</div>
+      </div>
+
+      <div class="banner hidden" id="live-banner"></div>
+
+      <p class="footnote">
+        Your details are saved. You can close this tab — when you return,
+        we'll show you the same screen.
+      </p>
+    </section>
+
+    <!-- ── OTP overlay ────────────────────────────────────────────────── -->
+    <section id="screen-otp" class="card hidden">
+      <h2>Enter the OTP</h2>
+      <p class="sub" id="otp-sub">The government portal just sent an OTP to your registered mobile. Enter it here so we can submit your application.</p>
+
+      <div class="otp-row" id="otp-row">
+        <input maxlength="1" inputmode="numeric" oninput="moveOTP(this, 1)" />
+        <input maxlength="1" inputmode="numeric" oninput="moveOTP(this, 2)" />
+        <input maxlength="1" inputmode="numeric" oninput="moveOTP(this, 3)" />
+        <input maxlength="1" inputmode="numeric" oninput="moveOTP(this, 4)" />
+        <input maxlength="1" inputmode="numeric" oninput="moveOTP(this, 5)" />
+        <input maxlength="1" inputmode="numeric" oninput="moveOTP(this, 6)" />
+      </div>
+
+      <div style="text-align:center; margin-top: 6px">
+        <span class="resend" onclick="resendOTP()" id="resend-otp">Didn't get it? Wait a moment and try again.</span>
+      </div>
+
+      <div class="actions" style="justify-content: center">
+        <button class="primary" id="otp-btn" onclick="submitOTP()">Submit OTP</button>
+      </div>
+    </section>
+
+    <!-- ── Human-needed overlay ──────────────────────────────────────── -->
+    <section id="screen-human" class="card hidden">
+      <h2 id="human-title">We need one detail</h2>
+      <p class="sub" id="human-sub">The agent needs your input to continue.</p>
+
+      <div class="field">
+        <label>Your answer</label>
+        <textarea id="human-answer" rows="3"></textarea>
+      </div>
+
+      <div class="actions">
+        <button class="primary" onclick="submitHumanResponse()">Send</button>
+      </div>
+    </section>
+
+    <!-- ── Done ──────────────────────────────────────────────────────── -->
+    <section id="screen-done" class="card hidden">
+      <h2>Application submitted</h2>
+      <p class="sub">Your acknowledgement number is below. You'll get an SMS update from the government portal.</p>
+      <div class="banner success" id="app-number">Submitted on the portal.</div>
+      <div class="actions">
+        <button onclick="location.reload()">Start another application</button>
+      </div>
+    </section>
+
   </main>
 
 <script>
-const API = window.location.origin;
-const SECRET = 'dev-secret-change-in-prod';
-const TOTAL_STEPS = 17;
+const API    = window.location.origin;
+const SECRET = 'dev-secret-change-in-prod';   // must equal API_SECRET_KEY env
 let currentJobId = null;
 let pollTimer = null;
 let dlNormalised = '';
-let photoPath = '';
-let lastLogKey = '';
+let lastSubline = '';
+let dlImageUploaded = false;
+let extractedSnapshot = {};
 
-const stepLabels = {
-  open_homepage: 'Opening government portal',
-  close_homepage_popup: 'Preparing portal session',
-  select_state: 'Selecting your state',
-  close_state_popup: 'Handling portal notices',
-  navigate_to_dl_services: 'Opening DL renewal',
-  fetch_dl_details: 'Fetching DL details',
-  confirm_dl_details: 'Confirming DL information',
-  auth_method_selection: 'Setting up verification',
-  fill_personal_details: 'Filling application',
-  mobile_otp_verification: 'Verifying OTP',
-  download_acknowledgment: 'Collecting acknowledgement',
-};
-
-function showScreen(step) {
-  const names = ['details', 'review', 'agent', 'otp', 'human', 'done'];
-  names.forEach(name => document.getElementById(`screen-${name}`).classList.add('hidden'));
-  const map = {1: 'details', 2: 'review', 3: 'agent', 4: 'otp', 5: 'done', human: 'human'};
-  document.getElementById(`screen-${map[step]}`).classList.remove('hidden');
-  document.querySelectorAll('.step').forEach(el => {
-    const n = Number(el.dataset.step);
-    el.classList.toggle('active', n === Number(step));
-    el.classList.toggle('done', n < Number(step));
+// ─── Step nav ───────────────────────────────────────────────────────────────
+function goStep(n) {
+  const screens = ['1', '2', '3', '4'];
+  screens.forEach(s => document.getElementById(`screen-${s}`).classList.add('hidden'));
+  document.getElementById(`screen-${n}`).classList.remove('hidden');
+  document.querySelectorAll('#progress .pd').forEach(el => {
+    const i = Number(el.dataset.step);
+    el.classList.toggle('on',   i === n);
+    el.classList.toggle('done', i < n);
   });
+  if (n === 3) renderReview();
+  window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
-let dlTimer;
-function onDLInput() {
-  clearTimeout(dlTimer);
-  dlTimer = setTimeout(validateDL, 400);
+// ─── Step 1: OCR upload ─────────────────────────────────────────────────────
+async function onDLImage(input) {
+  const file = input.files[0];
+  if (!file) return;
+  const banner = document.getElementById('ocr-banner');
+  banner.className = 'banner';
+  banner.classList.remove('hidden');
+  banner.textContent = 'Reading your DL — this takes a few seconds…';
+
+  const form = new FormData();
+  form.append('file', file);
+  let r;
+  try {
+    r = await fetch(`${API}/onboard/extract-dl-image`, {
+      method: 'POST',
+      headers: { 'X-Secret': SECRET },
+      body: form,
+    }).then(x => x.json());
+  } catch (e) {
+    banner.className = 'banner warn';
+    banner.innerHTML = "We couldn't reach the OCR service. <a href='#' onclick='document.getElementById(\"dl-file\").click(); return false'>Try again</a> or continue and type your details.";
+    return;
+  }
+
+  extractedSnapshot = r.extracted || {};
+  dlImageUploaded   = true;
+
+  // Pre-fill what we read
+  if (extractedSnapshot.dl_number) document.getElementById('dl_raw').value = extractedSnapshot.dl_number;
+  if (extractedSnapshot.dob)       document.getElementById('dob').value    = extractedSnapshot.dob;
+  if (extractedSnapshot.name)      document.getElementById('name').value   = extractedSnapshot.name;
+  if (extractedSnapshot.pin_code)  document.getElementById('pin_code').value = extractedSnapshot.pin_code;
+
+  const conf = Math.round((r.confidence || 0) * 100);
+  if (r.ocr_success) {
+    banner.className = 'banner success';
+    banner.innerHTML = `We read your DL clearly (${conf}% confidence). Tap continue to review.`;
+    document.getElementById('step1-next').textContent = 'Continue';
+  } else {
+    banner.className = 'banner warn';
+    const missing = (r.missing_fields || []).join(', ');
+    const reason  = missing ? `we couldn't read: ${missing}` : "the image was blurry";
+    banner.innerHTML = `
+      We read part of your DL, but ${reason}.
+      <div style="margin-top: 10px">
+        <button class="ghost" onclick="document.getElementById('dl-file').click()">Retake photo</button>
+        <button class="ghost" onclick="goStep(2)">Type details instead</button>
+      </div>`;
+  }
+  await validateDL();
 }
+
+// ─── Step 2: DL validation, DOB autoformat ──────────────────────────────────
+let dlTimer;
+function onDLInput() { clearTimeout(dlTimer); dlTimer = setTimeout(validateDL, 300); }
 
 async function validateDL() {
   const raw = document.getElementById('dl_raw').value.trim();
   const msg = document.getElementById('dl-message');
-  if (!raw) {
-    dlNormalised = '';
-    msg.textContent = 'Printed on your driving license.';
-    return false;
-  }
+  if (!raw) { dlNormalised = ''; msg.textContent = 'Printed on the front of your DL.'; msg.className = 'hint'; return false; }
   const r = await apiJson('/onboard/validate-dl', { dl_number: raw });
   if (r && r.valid) {
     dlNormalised = r.normalized;
-    msg.textContent = `${r.state_name} - ${r.display}`;
-    msg.style.color = '#16803c';
+    msg.textContent = `Looks good — ${r.state_name} • ${r.display}`;
+    msg.className = 'hint ok';
     return true;
   }
   dlNormalised = '';
-  msg.textContent = r?.error || 'Please check the DL number.';
-  msg.style.color = '#b42318';
+  msg.textContent = r?.error || 'Please double-check the DL number.';
+  msg.className = 'hint err';
   return false;
 }
 
-async function uploadDLImage(input) {
-  const file = input.files[0];
-  if (!file) return;
-  const box = document.getElementById('ocr-status');
-  box.className = 'status';
-  box.textContent = 'Reading your DL image...';
-  const form = new FormData();
-  form.append('file', file);
-  const r = await fetch(`${API}/onboard/extract-dl-image`, {
-    method: 'POST',
-    headers: { 'X-Secret': SECRET },
-    body: form,
-  }).then(x => x.json()).catch(e => ({ error: e.message }));
-
-  const extracted = r.extracted || {};
-  if (extracted.dl_number) document.getElementById('dl_raw').value = extracted.dl_number;
-  if (extracted.dob) document.getElementById('dob').value = extracted.dob;
-  if (extracted.name) document.getElementById('name').value = extracted.name;
-  if (extracted.address) document.getElementById('address').value = extracted.address;
-  if (extracted.pin_code) document.getElementById('pin_code').value = extracted.pin_code;
-  await validateDL();
-
-  if (r.ocr_success) {
-    box.className = 'status success';
-    box.textContent = `DL read with ${Math.round((r.confidence || 0) * 100)}% confidence. Please review the fields.`;
-  } else {
-    box.className = 'status warn';
-    const missing = (r.missing_fields || []).join(', ');
-    box.textContent = missing
-      ? `We need you to confirm: ${missing}. Please type the missing fields manually.`
-      : 'We could not read the DL clearly. Please type the details manually.';
-  }
+function formatDOB(el) {
+  let v = el.value.replace(/\D/g, '').slice(0, 8);
+  if (v.length >= 5) v = `${v.slice(0,2)}-${v.slice(2,4)}-${v.slice(4)}`;
+  else if (v.length >= 3) v = `${v.slice(0,2)}-${v.slice(2)}`;
+  el.value = v;
 }
 
-async function uploadSelfie(input) {
-  const file = input.files[0];
-  if (!file) return;
-  const form = new FormData();
-  form.append('file', file);
-  const r = await fetch(`${API}/onboard/upload-photo`, {
-    method: 'POST',
-    body: form,
-  }).then(x => x.json()).catch(() => null);
-  if (r && r.path) photoPath = r.path;
-}
-
-async function goToReview() {
-  const okDl = await validateDL();
-  const mobile = document.getElementById('mobile').value.trim();
-  const dob = document.getElementById('dob').value.trim();
-  const pin = document.getElementById('pin_code').value.trim();
-  if (!okDl) return alert('Please enter a valid DL number.');
-  if (!/^\d{2}-\d{2}-\d{4}$/.test(dob)) return alert('Please enter DOB as DD-MM-YYYY.');
-  if (!/^\d{10}$/.test(mobile)) return alert('Please enter a valid 10-digit mobile number.');
-  if (!/^\d{6}$/.test(pin)) return alert('Please enter the 6-digit present address PIN code.');
-
-  const data = collectPayload();
+// ─── Step 3: review + start ────────────────────────────────────────────────
+function renderReview() {
   const rows = {
-    'DL number': formatDL(dlNormalised),
-    'DOB': data.dob,
-    'Mobile': data.mobile_number,
-    'PIN code': data.pin_code,
-    'Name': data.name || 'Not provided',
-    'Email': data.email || 'Not required',
-    'Selfie/photo': photoPath ? 'Uploaded' : 'Not uploaded yet',
+    'DL number':  formatDL(dlNormalised) || document.getElementById('dl_raw').value || '—',
+    'DOB':        document.getElementById('dob').value || '—',
+    'Mobile':     document.getElementById('mobile').value || '—',
+    'PIN code':   document.getElementById('pin_code').value || '—',
+    'Name':       document.getElementById('name').value || 'Will read from portal',
   };
-  document.getElementById('review-rows').innerHTML = Object.entries(rows).map(([k, v]) => (
-    `<div class="row"><b>${escapeHtml(k)}</b><span>${escapeHtml(v)}</span></div>`
-  )).join('');
-  showScreen(2);
-}
-
-function collectPayload() {
-  return {
-    dl_number: document.getElementById('dl_raw').value.trim(),
-    dob: document.getElementById('dob').value.trim(),
-    mobile_number: document.getElementById('mobile').value.trim(),
-    name: document.getElementById('name').value.trim(),
-    email: document.getElementById('email').value.trim(),
-    address: document.getElementById('address').value.trim(),
-    pin_code: document.getElementById('pin_code').value.trim(),
-    photo_path: photoPath,
-    state_code: dlNormalised.slice(0, 2),
-    service: 'DL_RENEWAL',
-  };
+  document.getElementById('review-rows').innerHTML = Object.entries(rows).map(([k, v]) =>
+    `<div class="row"><b>${k}</b><span>${escapeHtml(v)}</span></div>`
+  ).join('');
 }
 
 async function startJob() {
+  // Validate inputs
+  const okDl   = await validateDL();
+  const dob    = document.getElementById('dob').value.trim();
+  const mobile = document.getElementById('mobile').value.trim();
+  const pin    = document.getElementById('pin_code').value.trim();
+  if (!okDl)                          return inlineAlert('Please double-check the DL number.');
+  if (!/^\d{2}-\d{2}-\d{4}$/.test(dob))   return inlineAlert('DOB should be DD-MM-YYYY.');
+  if (!/^\d{10}$/.test(mobile))           return inlineAlert('Mobile should be 10 digits.');
+  if (!/^\d{6}$/.test(pin))               return inlineAlert('PIN should be 6 digits.');
+
   const btn = document.getElementById('start-btn');
-  btn.disabled = true;
-  btn.textContent = 'Starting...';
-  const r = await apiJson('/onboard/confirm-and-start', collectPayload());
+  btn.disabled = true; btn.textContent = 'Starting…';
+
+  const payload = {
+    dl_number:     document.getElementById('dl_raw').value.trim(),
+    dob, mobile_number: mobile, pin_code: pin,
+    name:    document.getElementById('name').value.trim(),
+    address: extractedSnapshot.address || '',
+    state_code: (dlNormalised || '').slice(0, 2),
+    service: 'DL_RENEWAL',
+  };
+
+  const r = await apiJson('/onboard/confirm-and-start', payload);
   if (!r || !r.job_id) {
-    btn.disabled = false;
-    btn.textContent = 'Confirm and start';
-    return showToast('Could not start the application. Please check the details and try again.', 'error');
+    btn.disabled = false; btn.textContent = 'Start my application';
+    return inlineAlert(r?.detail || "We couldn't start the application — please check your details.");
   }
   currentJobId = r.job_id;
-  showScreen(3);
-  logLine('Application started.');
+  goStep(4);
+  setLive({ phase: 'connecting', headline: 'Starting your application', subline: 'Opening the government portal…' });
   startPolling();
 }
 
+function inlineAlert(msg) {
+  const banner = document.getElementById('ocr-banner');
+  banner.className = 'banner err';
+  banner.classList.remove('hidden');
+  banner.textContent = msg;
+  goStep(2);
+}
+
+// ─── Step 4: live polling ──────────────────────────────────────────────────
 function startPolling() {
   clearInterval(pollTimer);
-  pollTimer = setInterval(pollStatus, 2500);
-  pollStatus();
+  pollTimer = setInterval(poll, 2500);
+  poll();
 }
 
-async function pollStatus() {
+async function poll() {
   if (!currentJobId) return;
-  const r = await fetch(`${API}/jobs/${currentJobId}`, {
-    headers: { 'X-Secret': SECRET },
-  }).then(x => x.json()).catch(() => null);
+  let r;
+  try {
+    r = await fetch(`${API}/jobs/${currentJobId}`, { headers: { 'X-Secret': SECRET } }).then(x => x.json());
+  } catch { return; }
   if (!r) return;
-  renderStatus(r);
+  applyJob(r);
 }
 
-function renderStatus(r) {
-  const view = r.customer_view || {};
-  document.getElementById('status-title').textContent = view.title || statusLabel(r.status);
-  document.getElementById('status-message').textContent = view.message || 'Working on your application.';
-  const box = document.getElementById('customer-status');
-  box.className = `status ${view.severity === 'error' ? 'error' : view.severity === 'warning' ? 'warn' : view.severity === 'success' ? 'success' : ''}`;
-  box.textContent = view.message || statusLabel(r.status);
+function applyJob(r) {
+  const v = r.customer_view || {};
+  setLive(v);
 
-  const done = r.steps_completed?.length || 0;
-  document.getElementById('progress-bar').style.width = Math.min(5 + (done / TOTAL_STEPS) * 90, 100) + '%';
-  const last = r.steps_completed?.[done - 1];
-  if (last) logLine(stepLabels[last] || view.last_step_label || last);
-
-  if (r.status === 'WAITING_OTP' || view.action_type === 'otp') {
+  if (v.action_type === 'otp' || r.status === 'WAITING_OTP') {
     clearInterval(pollTimer);
-    showOTPScreen(r.otp_pending_type);
-  } else if (r.status === 'STUCK_HUMAN_NEEDED' && view.action_type !== 'otp') {
+    showOTP(v);
+  } else if (v.action_type === 'human_response' || r.status === 'STUCK_HUMAN_NEEDED') {
     clearInterval(pollTimer);
-    document.getElementById('human-question').textContent = view.message || 'The agent needs your input.';
-    showScreen('human');
+    document.getElementById('human-title').textContent = v.headline || 'We need one detail';
+    document.getElementById('human-sub').textContent   = v.subline  || 'Please confirm one detail so we can continue.';
+    show('screen-human');
   } else if (r.status === 'SUBMITTED' || r.status === 'COMPLETED') {
     clearInterval(pollTimer);
-    showSuccess(r.application_number);
+    document.getElementById('app-number').textContent = r.application_number
+      ? `Acknowledgement number: ${r.application_number}`
+      : 'Your application was submitted on the portal.';
+    show('screen-done');
   } else if (r.status === 'FAILED') {
     clearInterval(pollTimer);
-    logLine(view.message || 'The application could not be completed.');
+    // Failed but customer can retry
+    const b = document.getElementById('live-banner');
+    b.className = 'banner err'; b.classList.remove('hidden');
+    b.innerHTML = `${escapeHtml(v.subline || 'Something went wrong.')}
+      <div style="margin-top: 10px"><button class="ghost" onclick="location.reload()">Try again</button></div>`;
   }
 }
 
-function showOTPScreen(type) {
-  document.getElementById('otp-desc').textContent = type === 'aadhaar'
-    ? 'Enter the OTP sent to your Aadhaar-linked mobile number.'
-    : 'Enter the OTP sent to your DL-registered mobile number.';
-  showScreen(4);
+function setLive(v) {
+  document.getElementById('live-title').textContent = v.headline || 'Working on your application';
+  const sub = v.subline || v.message || '';
+  if (sub && sub !== lastSubline) {
+    document.getElementById('live-sub').textContent = sub;
+    lastSubline = sub;
+  }
+
+  const spin = document.getElementById('spin');
+  spin.className = 'spin';
+  if (v.phase === 'retrying') spin.classList.add('warn');
+  if (v.phase === 'done')     spin.classList.add('done');
+  if (v.phase === 'failed')   spin.classList.add('err');
+
+  const order = ['connecting', 'filling', 'waiting', 'submitting'];
+  const cur = order.indexOf(v.phase || 'connecting');
+  document.querySelectorAll('#phase-track .ph').forEach((el, i) => {
+    el.classList.toggle('on',   i === cur);
+    el.classList.toggle('done', i <  cur || v.phase === 'done');
+  });
+
+  const banner = document.getElementById('live-banner');
+  if (v.phase === 'retrying') {
+    banner.className = 'banner warn'; banner.classList.remove('hidden');
+    banner.textContent = v.subline || 'Government portal is slow right now. We will retry.';
+  } else if (v.phase === 'done') {
+    banner.classList.add('hidden');
+  } else {
+    banner.classList.add('hidden');
+  }
 }
 
-function moveOTP(el, nextId) {
+// ─── OTP screen ────────────────────────────────────────────────────────────
+function showOTP(v) {
+  document.getElementById('otp-sub').textContent = v.subline
+    || 'Enter the OTP the government portal sent to your phone.';
+  show('screen-otp');
+  const first = document.querySelector('#otp-row input');
+  if (first) first.focus();
+}
+
+function moveOTP(el, idx) {
   el.value = el.value.replace(/\D/g, '').slice(-1);
-  if (el.value && nextId) document.getElementById(nextId).focus();
+  const inputs = document.querySelectorAll('#otp-row input');
+  if (el.value && idx < 6) inputs[idx].focus();
 }
 
 async function submitOTP() {
-  const otp = ['o1','o2','o3','o4','o5','o6'].map(id => document.getElementById(id).value).join('');
-  if (otp.length !== 6) return showToast('Please enter all 6 OTP digits.', 'error');
+  const otp = Array.from(document.querySelectorAll('#otp-row input')).map(x => x.value).join('');
+  if (otp.length !== 6) return alert('Please enter all 6 digits.');
   const btn = document.getElementById('otp-btn');
-  btn.disabled = true;
-  btn.textContent = 'Submitting...';
+  btn.disabled = true; btn.textContent = 'Submitting…';
   const res = await fetch(`${API}/jobs/${currentJobId}/otp`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Secret': SECRET },
     body: JSON.stringify({ otp }),
   });
-  btn.disabled = false;
-  btn.textContent = 'Submit OTP';
-  if (!res.ok) return showToast('Could not submit OTP yet. Please try again.', 'error');
-  showScreen(3);
-  logLine('OTP submitted. Agent resuming.');
+  btn.disabled = false; btn.textContent = 'Submit OTP';
+  if (!res.ok) return alert("We couldn't submit the OTP — please try again.");
+  show('screen-4');
+  startPolling();
+}
+
+function resendOTP() {
+  // No API for resend yet — restart the polling so the agent re-evaluates.
+  show('screen-4');
   startPolling();
 }
 
 async function submitHumanResponse() {
   const answer = document.getElementById('human-answer').value.trim();
-  if (!answer) return showToast('Please enter the requested detail.', 'error');
+  if (!answer) return alert('Please type your answer.');
   const res = await fetch(`${API}/jobs/${currentJobId}/human-response`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Secret': SECRET },
     body: JSON.stringify({ answer }),
   });
-  if (!res.ok) return showToast('Could not send the response. Please try again.', 'error');
-  showScreen(3);
-  logLine('Your response was sent. Agent resuming.');
+  if (!res.ok) return alert("We couldn't send your answer — please try again.");
+  show('screen-4');
   startPolling();
 }
 
-function showSuccess(appNumber) {
-  document.getElementById('app-number').textContent = appNumber || 'Submitted on portal';
-  document.getElementById('progress-bar').style.width = '100%';
-  showScreen(5);
-}
-
-function statusLabel(status) {
-  return {
-    CREATED: 'Preparing',
-    AGENT_RUNNING: 'Agent running',
-    WAITING_OTP: 'OTP needed',
-    STUCK_HUMAN_NEEDED: 'Action needed',
-    SUBMITTED: 'Submitted',
-    COMPLETED: 'Completed',
-    FAILED: 'Could not complete',
-  }[status] || status;
-}
-
-function logLine(text) {
-  if (!text || text === lastLogKey) return;
-  lastLogKey = text;
-  const log = document.getElementById('step-log');
-  const item = document.createElement('div');
-  item.className = 'log-item';
-  item.textContent = text;
-  log.appendChild(item);
-  log.scrollTop = log.scrollHeight;
+// ─── helpers ───────────────────────────────────────────────────────────────
+function show(id) {
+  ['screen-1','screen-2','screen-3','screen-4','screen-otp','screen-human','screen-done']
+    .forEach(s => document.getElementById(s).classList.add('hidden'));
+  document.getElementById(id).classList.remove('hidden');
 }
 
 async function apiJson(path, payload) {
-  return fetch(`${API}${path}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Secret': SECRET },
-    body: JSON.stringify(payload),
-  }).then(x => x.json()).catch(e => ({ error: e.message }));
+  try {
+    return await fetch(`${API}${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Secret': SECRET },
+      body: JSON.stringify(payload),
+    }).then(x => x.json());
+  } catch (e) { return { error: e.message }; }
 }
 
 function formatDL(dl) {
   return dl && dl.length >= 8 ? `${dl.slice(0,4)} ${dl.slice(4,8)} ${dl.slice(8)}` : (dl || '');
 }
 
-function showToast(message, type) {
-  const box = document.getElementById('ocr-status');
-  box.className = `status ${type === 'error' ? 'error' : 'warn'}`;
-  box.textContent = message;
-  box.classList.remove('hidden');
-}
-
-function escapeHtml(value) {
-  return String(value).replace(/[&<>"']/g, ch => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-  }[ch]));
+function escapeHtml(v) {
+  return String(v).replace(/[&<>"']/g, ch => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[ch]));
 }
 </script>
 </body>
 </html>
-

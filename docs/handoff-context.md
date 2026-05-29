@@ -127,6 +127,44 @@ Deploy pipeline shipped (674096e):
   GitHub secret `API_SECRET_KEY` must equal that string until we switch to a
   runtime config endpoint.
 
+## Customer-facing UX (current)
+
+`frontend/index.html` is a 3-step intake + live status + OTP + done:
+
+1. **Step 1**: optional DL photo upload. OCR returns confidence + missing
+   fields. Low confidence shows a calm "retake or type instead" banner.
+2. **Step 2**: confirm DL number (live normalised + validated) + DOB + mobile
+   + name (optional).
+3. **Step 3**: present-address PIN + review card + inline consent disclosure
+   (no checkbox — soft opt-in by clicking "Start my application").
+4. **Live screen**: 4-phase track (Connecting → Filling → OTP → Submitting),
+   one headline + one subline rotation, portal-down banner on `phase=retrying`.
+5. **OTP overlay**: 6-digit boxes, masked mobile suffix "+91 72******63"
+   pulled from `customer_view.mobile_suffix`.
+
+`api/status_messages.py` returns:
+
+- new fields: `phase` (connecting/filling/waiting/submitting/retrying/done/failed),
+  `headline`, `subline`, `mobile_suffix`;
+- legacy fields kept for any older callers.
+
+Portal-down detection: status_messages scans recent step logs for `5xx`,
+"service unavailable", "bad gateway", DNS failures — and surfaces a calm
+"government portal is slow, we will retry" message instead of an error.
+
+## Deferred / next batch (do not start without alignment)
+
+- **Customer entity + lookup**: today `customer_id` is the mobile number with
+  no separate Customer row. Need a `Customer` table keyed by phone + a unique
+  customer ID, so customers can come back later and look up status by phone
+  (or by ID) across multiple services.
+- **RTO operator portal**: an admin view at `/admin` (auth-gated) listing all
+  applications across customers, with status + ability to nudge a stuck job.
+  Powers the "RTO agent logs in and sees everyone's applications" use case.
+
+Both are explicitly lower priority than getting OCR + Sarathi end-to-end
+working reliably and seeing the live URL respond.
+
 ## User Preferences
 
 - Keep the user in the loop.
