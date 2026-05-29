@@ -601,3 +601,16 @@ Workflow hardening added after this failure:
 Validated locally before pushing this workflow fix:
 
 - `python -c "import yaml; yaml.safe_load(open('.github/workflows/deploy.yml', encoding='utf-8')); print('workflow yaml ok')"`
+
+Final deploy result:
+
+- Fix commit: `4aad131` (`Harden App Runner deploy workflow`)
+- GitHub Actions run: `#8`
+- Status: `Success`
+- Duration: about 9m14s
+- Every step passed, including `Wait for App Runner to serve this commit`.
+  That step polls the live App Runner `/health` endpoint and only succeeds
+  when `.commit == 4aad131...`, so the live app was verified as updated.
+- Only remaining warning: GitHub's Node.js 20 deprecation warning for upstream
+  actions (`actions/checkout`, AWS credential action, Docker actions). This is
+  not blocking today, but should be upgraded later.
