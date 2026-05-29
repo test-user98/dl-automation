@@ -44,6 +44,7 @@ from tools.captcha_solver import CaptchaSolver
 from tools.otp_relay import OTPRelay
 from tools.image_processor import ImageProcessor
 from tools.dl_normalizer import STATE_CODES
+from tools.portal_triage import PortalTriageService
 from flows.dl_renewal import DL_RENEWAL_STEPS, steps_after
 
 log = structlog.get_logger(__name__)
@@ -99,6 +100,7 @@ class AgentBrain:
         self._captcha  = CaptchaSolver()
         self._otp      = OTPRelay(state_manager)
         self._img_proc = ImageProcessor()
+        self._portal_triage = PortalTriageService()
         self._llm      = get_llm_client()
         self._last_deterministic_failure = ""
         self._otp_sent: bool = False            # True once OTP API call succeeds
@@ -325,6 +327,16 @@ class AgentBrain:
                     observation=failure_context,
                     page_url=url,
                     failed_approach="deterministic_dl_fetch_handler",
+                )
+                await self._maybe_record_portal_triage(
+                    job=job,
+                    screenshot=screenshot,
+                    page_text=page_text,
+                    url=url,
+                    current_step=current_step,
+                    dom_elements=dom_elements,
+                    failure_context=failure_context,
+                    last_action="deterministic_dl_fetch_handler",
                 )
                 continue
 
@@ -635,6 +647,19 @@ class AgentBrain:
                     observation=failure_context,
                     page_url=url,
                     failed_approach=f"{action.action_type} selector={action.selector} text={action.text}",
+                )
+                await self._maybe_record_portal_triage(
+                    job=job,
+                    screenshot=screenshot,
+                    page_text=page_text,
+                    url=url,
+                    current_step=current_step,
+                    dom_elements=dom_elements,
+                    failure_context=failure_context,
+                    last_action=(
+                        f"{action.action_type} selector={action.selector} "
+                        f"text={action.text} value={action.value}"
+                    ),
                 )
                 if learned:
                     await self._ls.mark_solution_outcome(learned.scenario_id, worked=False)
@@ -4640,6 +4665,46 @@ KNOWN OBSTACLES: {json.dumps(next_step.known_obstacles if next_step else [])}
         return False
 
     # ── Human escalation ──────────────────────────────────────────────────────
+
+    async def _maybe_record_portal_triage(
+        self,
+        *,
+        job: Job,
+        screenshot: bytes,
+        page_text: str,
+        url: str,
+        current_step: str,
+        dom_elements: dict,
+        failure_context: str,
+        last_action: str = "",
+    ) -> None:
+        """Run bounded LLM triage and store enum results on the job."""
+        if settings.portal_triage_mode == "off" or not failure_context:
+            return
+        try:
+            triage = await self._portal_triage.classify(
+                screenshot=screenshot,
+                page_text=page_text,
+                url=url,
+                current_step=current_step,
+                dom_elements=dom_elements,
+                failure_context=failure_context,
+                last_action=last_action,
+                retry_count=job.retry_counts.get(current_step, 0),
+            )
+            if not triage:
+                return
+            job.customer_data["portal_triage"] = triage
+            history = job.customer_data.setdefault("portal_triage_history", [])
+            if not isinstance(history, list):
+                history = []
+                job.customer_data["portal_triage_history"] = history
+            history.append(triage)
+            if len(history) > 20:
+                del history[: len(history) - 20]
+            await self._sm.save(job)
+        except Exception as e:  # noqa: BLE001
+            log.warning("brain.portal_triage_record_failed", error=str(e), step=current_step)
 
     async def _handle_stuck(self, job: Job, action: AgentAction, screenshot: bytes):
         q_text, ctx, opts = HumanLoop.build_stuck_question(action.observation, action.thought)

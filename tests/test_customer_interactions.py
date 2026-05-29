@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 from agent.state_manager import Job, JobStatus, StepLog
 from api.status_messages import customer_job_view
 
@@ -203,3 +205,68 @@ def test_customer_view_maps_browser_session_interruption_to_retryable_failure():
     assert view["phase"] == "failed"
     assert view["headline"] == "Portal session interrupted"
     assert view["retryable"] is True
+
+
+def test_customer_view_uses_high_confidence_portal_triage(monkeypatch):
+    import api.status_messages as status_messages
+
+    monkeypatch.setattr(status_messages.settings, "portal_triage_mode", "assist")
+    monkeypatch.setattr(status_messages.settings, "portal_triage_min_confidence", 0.70)
+    job = _job(JobStatus.AGENT_RUNNING)
+    job.customer_data["portal_triage"] = {
+        "issue_type": "validation_rejected",
+        "confidence": 0.91,
+        "recommended_next_action": "refill_required_fields",
+        "field_key": "",
+        "at": datetime.now(timezone.utc).isoformat(),
+        "internal_diagnosis": "Portal alert rejected fields with raw technical text.",
+        "reasoning_summary": "Alert text appeared after submit.",
+    }
+
+    view = customer_job_view(job)
+
+    assert view["phase"] == "retrying"
+    assert view["headline"] == "Checking the details again"
+    assert "portal did not accept" in view["subline"].lower()
+    assert view["portal_triage"]["issue_type"] == "validation_rejected"
+    assert "raw technical" not in view["subline"]
+
+
+def test_customer_view_ignores_low_confidence_portal_triage(monkeypatch):
+    import api.status_messages as status_messages
+
+    monkeypatch.setattr(status_messages.settings, "portal_triage_mode", "assist")
+    monkeypatch.setattr(status_messages.settings, "portal_triage_min_confidence", 0.70)
+    job = _job(JobStatus.AGENT_RUNNING)
+    job.customer_data["portal_triage"] = {
+        "issue_type": "validation_rejected",
+        "confidence": 0.40,
+        "recommended_next_action": "refill_required_fields",
+        "at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    view = customer_job_view(job)
+
+    assert view["phase"] == "filling"
+    assert view["headline"] == "Filling your application"
+    assert view["portal_triage"] == {}
+
+
+def test_customer_view_shadow_triage_does_not_override_copy(monkeypatch):
+    import api.status_messages as status_messages
+
+    monkeypatch.setattr(status_messages.settings, "portal_triage_mode", "shadow")
+    monkeypatch.setattr(status_messages.settings, "portal_triage_min_confidence", 0.70)
+    job = _job(JobStatus.AGENT_RUNNING)
+    job.customer_data["portal_triage"] = {
+        "issue_type": "portal_slow",
+        "confidence": 0.95,
+        "recommended_next_action": "restart_portal_session",
+        "at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    view = customer_job_view(job)
+
+    assert view["phase"] == "filling"
+    assert view["headline"] == "Filling your application"
+    assert view["portal_triage"]["mode"] == "shadow"

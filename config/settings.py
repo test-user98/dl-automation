@@ -123,6 +123,15 @@ class Settings(BaseSettings):
     max_repeated_page_states: int = Field(3, env="MAX_REPEATED_PAGE_STATES")
     stuck_threshold_retries: int = Field(3, env="STUCK_THRESHOLD_RETRIES")
     screenshot_on_every_step: bool = Field(True, env="SCREENSHOT_ON_EVERY_STEP")
+    portal_triage_mode: Literal["off", "shadow", "assist"] = Field(
+        "assist", env="PORTAL_TRIAGE_MODE"
+    )
+    portal_triage_min_confidence: float = Field(
+        0.70, env="PORTAL_TRIAGE_MIN_CONFIDENCE"
+    )
+    portal_triage_reasoning_mode: Literal["off", "summary"] = Field(
+        "summary", env="PORTAL_TRIAGE_REASONING_MODE"
+    )
     log_level: str = Field("INFO", env="LOG_LEVEL")
 
     # ── DEMO MODE ────────────────────────────────────────────────────────────

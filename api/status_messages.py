@@ -18,7 +18,13 @@ a calm "we will retry" message instead of an error screen.
 """
 
 import re
+from datetime import datetime, timezone
+
 from agent.state_manager import Job, JobStatus
+from config.settings import get_settings
+
+
+settings = get_settings()
 
 
 PHASE_CONNECTING = "connecting"
@@ -282,7 +288,6 @@ def customer_job_view(job: Job) -> dict:
         portal_message_text = (last_portal.get("text") or "").strip()
         if portal_message_text:
             try:
-                from datetime import datetime, timezone
                 at_iso = last_portal.get("at") or ""
                 # Parse as UTC; tolerate both naive and tz-aware ISO strings.
                 if at_iso:
@@ -294,6 +299,22 @@ def customer_job_view(job: Job) -> dict:
                         portal_message = portal_message_text
             except Exception:
                 portal_message = portal_message_text  # if parse fails, show it anyway
+
+    triage = _fresh_portal_triage(job)
+    if (
+        triage
+        and settings.portal_triage_mode == "assist"
+        and not action_required
+        and job.status not in {JobStatus.SUBMITTED, JobStatus.COMPLETED}
+    ):
+        overlay = _triage_status_overlay(triage)
+        if overlay:
+            phase = overlay["phase"]
+            title = overlay["title"]
+            message = overlay["message"]
+            severity = overlay["severity"]
+            retryable = overlay["retryable"]
+            step_label = overlay.get("step_label", step_label)
 
     return {
         # New phase-based fields
@@ -310,6 +331,7 @@ def customer_job_view(job: Job) -> dict:
         "action_type":      action_type,
         "retryable":        retryable,
         "last_step_label":  step_label,
+        "portal_triage":    _customer_triage_payload(triage),
         "customer_request": _customer_request_payload(pending_request, action_required),
         "available_services": job.customer_data.get("available_services", []),
     }
@@ -326,6 +348,104 @@ def _raw_context(job: Job) -> str:
             item.get("error", ""),
         ])
     return "\n".join(parts)
+
+
+def _fresh_portal_triage(job: Job) -> dict:
+    triage = job.customer_data.get("portal_triage") or {}
+    if not isinstance(triage, dict):
+        return {}
+    try:
+        confidence = float(triage.get("confidence") or 0)
+    except (TypeError, ValueError):
+        confidence = 0
+    if confidence < settings.portal_triage_min_confidence:
+        return {}
+    at_iso = triage.get("at") or ""
+    if at_iso:
+        try:
+            dt = datetime.fromisoformat(str(at_iso).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            if (datetime.now(timezone.utc) - dt).total_seconds() > 300:
+                return {}
+        except Exception:
+            return {}
+    return triage
+
+
+def _triage_status_overlay(triage: dict) -> dict:
+    issue_type = (triage.get("issue_type") or "unknown").strip().lower()
+    templates = {
+        "portal_slow": {
+            "phase": PHASE_RETRYING,
+            "title": "Government portal is slow right now",
+            "message": "The portal is not responding cleanly. Your details are saved and we are retrying.",
+            "severity": "warning",
+            "retryable": True,
+            "step_label": "Retrying the portal",
+        },
+        "retryable_portal_error": {
+            "phase": PHASE_RETRYING,
+            "title": "Retrying",
+            "message": "The portal did not respond cleanly. We are retrying without changing your details.",
+            "severity": "warning",
+            "retryable": True,
+            "step_label": "Retrying the portal",
+        },
+        "validation_rejected": {
+            "phase": PHASE_RETRYING,
+            "title": "Checking the details again",
+            "message": "The portal did not accept the last attempt. We are checking the fields and retrying.",
+            "severity": "warning",
+            "retryable": True,
+            "step_label": "Checking the portal response",
+        },
+        "missing_customer_data": {
+            "phase": PHASE_FILLING,
+            "title": "Checking one detail",
+            "message": "The portal is asking for an additional detail. We are checking what is needed.",
+            "severity": "info",
+            "retryable": True,
+            "step_label": "Checking portal requirements",
+        },
+        "captcha_required": {
+            "phase": PHASE_FILLING,
+            "title": "Working through the portal verification",
+            "message": "We are completing the portal verification step.",
+            "severity": "info",
+            "retryable": True,
+            "step_label": "Portal verification",
+        },
+        "service_unavailable_for_rto": {
+            "phase": PHASE_FAILED,
+            "title": "This service is not available at your RTO",
+            "message": "Sarathi says this DL service is not available for the RTO linked to this licence.",
+            "severity": "error",
+            "retryable": False,
+            "step_label": "Service unavailable",
+        },
+        "payment_pending": {
+            "phase": PHASE_SUBMITTING,
+            "title": "Confirming payment",
+            "message": "The portal is confirming your payment. Please do not retry yet.",
+            "severity": "warning",
+            "retryable": True,
+            "step_label": "Confirming payment",
+        },
+    }
+    return templates.get(issue_type, {})
+
+
+def _customer_triage_payload(triage: dict) -> dict:
+    if not triage:
+        return {}
+    return {
+        "issue_type": triage.get("issue_type", "unknown"),
+        "confidence": triage.get("confidence", 0),
+        "recommended_next_action": triage.get("recommended_next_action", "unknown"),
+        "field_key": triage.get("field_key", ""),
+        "mode": settings.portal_triage_mode,
+    }
 
 
 def _is_portal_down(lower: str) -> bool:
