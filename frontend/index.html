@@ -682,6 +682,7 @@ let ocrRetakeCount = 0;
 let otpSubmitInFlight = false; // prevent duplicate OTP submits while backend is processing
 let activityItems = [];
 let lastActivityKey = '';
+let manualStateDlPrefix = "";
 
 // ─── Customer session persistence (sessionStorage) ──────────────────────────
 // What we persist is purely for UI continuity: customer's typed form data so
@@ -703,6 +704,7 @@ function persistCustomerSession() {
       ocrConfidence,
       ocrRetakeCount,
       manualStateCode: (typeof manualStateCode === 'string') ? manualStateCode : '',
+      manualStateDlPrefix: (typeof manualStateDlPrefix === 'string') ? manualStateDlPrefix : '',
       form: {
         dl_raw: document.getElementById('dl_raw')?.value || '',
         dob: document.getElementById('dob')?.value || '',
@@ -879,6 +881,11 @@ async function validateDL() {
   const r = await apiJson('/onboard/validate-dl', { dl_number: raw });
   if (r && r.valid) {
     dlNormalised = r.normalized;
+    const derivedState = (r.state_code || (r.normalized || '').slice(0, 2)).toUpperCase();
+    if (manualStateCode && manualStateCode !== derivedState && manualStateDlPrefix !== derivedState) {
+      manualStateCode = '';
+      manualStateDlPrefix = '';
+    }
     msg.textContent = `Looks good — ${r.state_name} • ${r.display}`;
     msg.className = 'hint ok';
     return true;
@@ -987,6 +994,7 @@ function toggleStateEdit() {
 
 function onStatePicked(code) {
   manualStateCode = code || '';
+  manualStateDlPrefix = manualStateCode ? dlDerivedStateCode() : '';
   const box = document.getElementById('state-edit');
   if (box) box.classList.add('hidden');
   persistCustomerSession();
@@ -1051,6 +1059,7 @@ async function startJob() {
     name:    document.getElementById('name').value.trim(),
     address: extractedSnapshot.address || '',
     state_code: resolvedState,
+    state_confirmed_manually: Boolean(manualStateCode && manualStateDlPrefix === dlDerivedStateCode()),
     service: 'DL_RENEWAL',
     dl_image_path:  dlImagePath,
     dl_image_s3_url: dlImageS3Url,
@@ -1903,6 +1912,7 @@ function rehydrateCustomerSession() {
   ocrConfidence = snap.ocrConfidence || 0;
   ocrRetakeCount = snap.ocrRetakeCount || 0;
   if (typeof snap.manualStateCode === 'string') manualStateCode = snap.manualStateCode;
+  if (typeof snap.manualStateDlPrefix === 'string') manualStateDlPrefix = snap.manualStateDlPrefix;
   // If the snapshot has a job id, the customer was already on the live
   // screen — drop them straight back there and resume polling, instead of
   // forcing them to walk through the form again. The agent kept running

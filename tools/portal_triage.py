@@ -29,6 +29,7 @@ ISSUE_TYPES = {
     "otp_required",
     "captcha_required",
     "service_unavailable_for_rto",
+    "dl_not_in_central_repository",
     "payment_pending",
     "unknown",
 }
@@ -134,6 +135,7 @@ Rules:
 - Use validation_rejected when Sarathi rejected submitted fields or reset a form.
 - Use retryable_portal_error or portal_slow for gateway, timeout, blocked, or unavailable states.
 - Use service_unavailable_for_rto only when Sarathi says the requested service is not available for the RTO.
+- Use dl_not_in_central_repository when Sarathi says the given DL details are not available in the central repository or online records.
 - Use unknown with confidence below 0.60 when the page state is ambiguous.
 """
         try:

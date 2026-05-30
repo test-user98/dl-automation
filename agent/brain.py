@@ -523,6 +523,13 @@ class AgentBrain:
             portal_alert_seen = False
             dialog_msg = await self._browser.get_last_dialog_message()
             if dialog_msg:
+                if self._dialog_indicates_dl_not_in_central_repo(dialog_msg):
+                    await self._fail_dl_central_repository_unavailable(
+                        job=job,
+                        current_step=current_step,
+                        portal_message=dialog_msg,
+                    )
+                    break
                 if self._dialog_indicates_failure(dialog_msg):
                     portal_alert_seen = True
                     log.warning("brain.portal_alert", message=dialog_msg[:120], step=current_step)
@@ -3419,6 +3426,14 @@ class AgentBrain:
 
             await asyncio.sleep(2.0)
             dialog_msg = await self._browser.get_last_dialog_message()
+            if dialog_msg and self._dialog_indicates_dl_not_in_central_repo(dialog_msg):
+                await self._fail_dl_central_repository_unavailable(
+                    job=job,
+                    current_step=current_step,
+                    portal_message=dialog_msg,
+                )
+                return True
+
             if dialog_msg and self._dialog_indicates_failure(dialog_msg):
                 log.warning(
                     "brain.dl_fetch_rejected",
@@ -3465,6 +3480,43 @@ class AgentBrain:
             "or ask the user/operator instead of clicking navigation links."
         )
         return False
+
+    async def _fail_dl_central_repository_unavailable(
+        self,
+        *,
+        job: Job,
+        current_step: str,
+        portal_message: str,
+    ) -> None:
+        customer_message = (
+            "Sarathi could not find this DL in its online records. Online application "
+            "cannot continue for this licence. Please contact the issuing RTO/RLA authority."
+        )
+        job.error_message = (
+            "DL central record unavailable: Sarathi says this licence is not available "
+            "for online applications and requires RTO/RLA handling."
+        )
+        job.customer_data["portal_terminal_reason"] = "dl_not_in_central_repository"
+        job.customer_data["last_portal_message"] = {
+            "text": customer_message,
+            "kind": "terminal",
+            "step": current_step,
+            "at": datetime.now(timezone.utc).isoformat(),
+        }
+        job.customer_data.pop("_pending_customer_request", None)
+        job.mark_step_done(current_step, StepLog(
+            step_name=current_step,
+            status="failed",
+            observation=customer_message,
+            action_taken="terminal_portal_business_rule",
+            error=job.error_message,
+        ))
+        await self._sm.transition(job, JobStatus.FAILED, job.error_message)
+        log.warning(
+            "brain.dl_central_repository_unavailable",
+            step=current_step,
+            message=portal_message[:180],
+        )
 
     async def _recover_dl_fetch_page_after_reject(self) -> bool:
         """
@@ -4016,6 +4068,8 @@ class AgentBrain:
         lower = message.lower()
         if "application already exists" in lower:
             return False
+        if AgentBrain._dialog_indicates_dl_not_in_central_repo(message):
+            return True
         failure_terms = [
             "please provide",
             "invalid",
@@ -4027,6 +4081,17 @@ class AgentBrain:
             "required",
         ]
         return any(term in lower for term in failure_terms)
+
+    @staticmethod
+    def _dialog_indicates_dl_not_in_central_repo(message: str) -> bool:
+        lower = message.lower()
+        return (
+            "details of given dl number not available" in lower
+            or "not available in the central repository" in lower
+            or "licence data not available in central repository" in lower
+            or "license data not available in central repository" in lower
+            or ("central repository" in lower and ("rto / rla" in lower or "rto/rla" in lower))
+        )
 
     @staticmethod
     def _portal_transient_block_reason(page_text: str, url: str) -> str:

@@ -173,6 +173,7 @@ def customer_job_view(job: Job) -> dict:
     severity = "info"
     retryable = True
     portal_down = _is_portal_down(lower)
+    central_repo_unavailable = _is_central_repo_unavailable(lower)
     service_rejected = _is_service_rejection(lower)
 
     # Portal-down beats most other states — show the calm retry message.
@@ -192,6 +193,13 @@ def customer_job_view(job: Job) -> dict:
         severity = "warning"
         action_required = False
         action_type = ""
+
+    elif central_repo_unavailable:
+        phase = PHASE_FAILED
+        title, message, retryable = _central_repo_unavailable_message()
+        action_required = False
+        action_type = ""
+        severity = "error"
 
     elif service_rejected:
         phase = PHASE_FAILED
@@ -440,6 +448,17 @@ def _triage_status_overlay(triage: dict) -> dict:
             "retryable": False,
             "step_label": "Service unavailable",
         },
+        "dl_not_in_central_repository": {
+            "phase": PHASE_FAILED,
+            "title": "DL record not available online",
+            "message": (
+                "Sarathi could not find this DL in its online records. Online application "
+                "cannot continue for this licence; please contact the issuing RTO/RLA authority."
+            ),
+            "severity": "error",
+            "retryable": False,
+            "step_label": "DL lookup stopped",
+        },
         "payment_pending": {
             "phase": PHASE_SUBMITTING,
             "title": "Confirming payment",
@@ -477,6 +496,25 @@ def _is_service_rejection(lower: str) -> bool:
             or "not eligible for requested rto" in lower
             or "kindly visit the rto/rla authority" in lower
         )
+    )
+
+
+def _is_central_repo_unavailable(lower: str) -> bool:
+    return (
+        "dl central record unavailable" in lower
+        or "details of given dl number not available" in lower
+        or "not available in the central repository" in lower
+        or "licence data not available in central repository" in lower
+        or "license data not available in central repository" in lower
+    )
+
+
+def _central_repo_unavailable_message() -> tuple[str, str, bool]:
+    return (
+        "DL record not available online",
+        "Sarathi could not find this DL in its online records. Online application "
+        "cannot continue for this licence; please contact the issuing RTO/RLA authority.",
+        False,
     )
 
 
@@ -572,6 +610,8 @@ def _field_question(field_key: str) -> str:
 
 
 def _failure_message(lower: str) -> tuple[str, str, bool]:
+    if _is_central_repo_unavailable(lower):
+        return _central_repo_unavailable_message()
     if _is_service_rejection(lower):
         return _service_rejection_message(lower)
     if "stopped after" in lower and "repeated attempts" in lower:

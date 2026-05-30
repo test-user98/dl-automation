@@ -389,6 +389,36 @@ def test_upload_accepts_dl_when_only_optional_fields_are_missing(client, monkeyp
     assert body["extracted"]["dl_number"] == "RJ07 2017 0010191"
 
 
+def test_confirm_and_start_uses_dl_state_when_ui_state_is_stale(client, monkeypatch):
+    import api.onboard
+
+    async def fake_run_job(job_id):
+        return None
+
+    monkeypatch.setattr(api.onboard._orchestrator, "run_job", fake_run_job)
+
+    r = client.post(
+        "/onboard/confirm-and-start",
+        json={
+            "dl_number": "RJ07 2017 0010191",
+            "dob": "01-01-1990",
+            "mobile_number": "9876543210",
+            "pin_code": "334401",
+            "state_code": "KA",
+            "state_confirmed_manually": False,
+            "service": "DL_RENEWAL",
+        },
+    )
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["customer_summary"]["state"] == "Rajasthan"
+
+    detail = client.get(f"/admin/applications/{body['app_id']}", headers=_hdr(client))
+    assert detail.status_code == 200
+    assert detail.json()["application"]["state_code"] == "RJ"
+
+
 def test_lookup_by_application_number(client):
     """Lookup by application number finds the customer record."""
     # Seeded app numbers include 'RJ-DL-2026-04219'

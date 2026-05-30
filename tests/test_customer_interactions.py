@@ -121,6 +121,22 @@ def test_customer_view_maps_service_rto_rejection_as_terminal_message():
     assert view["available_services"] == ["CHANGE OF ADDRESS IN DL", "DL EXTRACT"]
 
 
+def test_customer_view_maps_central_repository_rejection_as_terminal_message():
+    job = _job(JobStatus.FAILED)
+    job.error_message = (
+        "DL central record unavailable: Sarathi says this licence is not available "
+        "for online applications and requires RTO/RLA handling."
+    )
+
+    view = customer_job_view(job)
+
+    assert view["phase"] == "failed"
+    assert view["headline"] == "DL record not available online"
+    assert "online application cannot continue" in view["subline"].lower()
+    assert view["retryable"] is False
+    assert view["action_required"] is False
+
+
 def test_customer_view_maps_portal_down_to_retrying():
     job = _job(JobStatus.FAILED_RETRYING)
     job.step_logs.append(StepLog(

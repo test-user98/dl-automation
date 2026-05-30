@@ -61,6 +61,9 @@ def test_bad_navigation_guard_blocks_flow_reset_mid_application():
 def test_dialog_failure_detection_for_portal_errors():
     assert AgentBrain._dialog_indicates_failure("Please enter valid captcha")
     assert AgentBrain._dialog_indicates_failure("Invalid OTP")
+    assert AgentBrain._dialog_indicates_dl_not_in_central_repo(
+        "Details of given DL Number not available in the central Repository"
+    )
     assert not AgentBrain._dialog_indicates_failure("OTP sent successfully")
 
 

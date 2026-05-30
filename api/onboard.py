@@ -304,6 +304,7 @@ class ConfirmAndStartRequest(BaseModel):
     gender:        str = ""
     state_code:    str = ""
     rto_code:      str = ""
+    state_confirmed_manually: bool = False
 
     # Document paths (set by server after upload)
     photo_path:     str = ""
@@ -327,7 +328,16 @@ async def confirm_and_start(req: ConfirmAndStartRequest):
     if not dl_result["valid"]:
         raise HTTPException(status_code=400, detail=dl_result["error"])
 
-    selected_state_code = (req.state_code or "").strip().upper()
+    requested_state_code = (req.state_code or "").strip().upper()
+    dl_state_code = (dl_result.get("state_code") or "").strip().upper()
+    selected_state_code = requested_state_code or dl_state_code
+    if (
+        requested_state_code
+        and dl_state_code
+        and requested_state_code != dl_state_code
+        and not req.state_confirmed_manually
+    ):
+        selected_state_code = dl_state_code
     if not selected_state_code:
         raise HTTPException(status_code=400, detail="Please confirm the filing state before starting.")
     selected_state_name = STATE_CODES.get(
