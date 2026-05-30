@@ -1,5 +1,6 @@
 # Core
 anthropic>=0.40.0
+openai>=2.0.0,<3        # LLM_PRIMARY=openai (gpt-4o) — required for OCR + agent vision
 # Pinned exactly: the Docker base image
 # `mcr.microsoft.com/playwright/python:v1.48.0-jammy` ships chromium for 1.48.
 # Any newer SDK (e.g. 1.60.0) expects chromium at a different path and
