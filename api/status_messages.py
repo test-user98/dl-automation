@@ -22,6 +22,18 @@ from datetime import datetime, timezone
 
 from agent.state_manager import Job, JobStatus
 from config.settings import get_settings
+from config.portal_rules import (
+    DL_CENTRAL_REPO_UNAVAILABLE_RULES,
+    text_indicates_dl_central_repo_unavailable,
+    terminal_reason_view,
+)
+
+# Triage issue types that are "one-way doors" — telling the customer to give up.
+# They require a higher confidence bar than ordinary (retryable) classifications.
+_TERMINAL_TRIAGE_ISSUES = {
+    "service_unavailable_for_rto",
+    "dl_not_in_central_repository",
+}
 
 
 settings = get_settings()
@@ -176,12 +188,33 @@ def customer_job_view(job: Job) -> dict:
     central_repo_unavailable = _is_central_repo_unavailable(lower)
     service_rejected = _is_service_rejection(lower)
 
+    # Structured terminal reason wins over everything. The agent stamps this key
+    # when it closes a job for good, so we render the customer copy from the
+    # reason itself instead of re-parsing the error prose (which can drift).
+    terminal = (
+        terminal_reason_view(job.customer_data.get("portal_terminal_reason", ""))
+        if job.status in {JobStatus.FAILED, JobStatus.CANCELLED}
+        else None
+    )
+
     # Portal-down beats most other states — show the calm retry message.
     # Important: it also beats a generic STUCK_HUMAN_NEEDED prompt. The LLM
     # may ask the customer/operator what to do with a raw 403/Forbidden page,
     # but that is not actionable customer input; it is a portal retry state.
-    if portal_down and job.status not in {
+    # It must NOT fire once the job is terminally FAILED/CANCELLED, otherwise a
+    # closed job would still tell the customer "we'll keep retrying".
+    if terminal:
+        phase = PHASE_FAILED
+        title = terminal["title"]
+        message = terminal["message"]
+        retryable = terminal["retryable"]
+        severity = "error"
+        action_required = False
+        action_type = ""
+
+    elif portal_down and job.status not in {
         JobStatus.SUBMITTED, JobStatus.COMPLETED, JobStatus.WAITING_OTP,
+        JobStatus.FAILED, JobStatus.CANCELLED,
     }:
         phase = PHASE_RETRYING
         title = "Government portal is slow right now"
@@ -399,6 +432,17 @@ def _triage_status_overlay(triage: dict) -> dict:
         "captcha" in recommended or "captcha" in evidence_blob
     ):
         issue_type = "captcha_required"
+    # Terminal ("one-way door") classifications need a higher confidence bar than
+    # the general overlay gate. A low-confidence terminal guess is downgraded to
+    # a retry message rather than telling the customer to give up — a false
+    # terminal costs far more than a wasted retry.
+    if issue_type in _TERMINAL_TRIAGE_ISSUES:
+        try:
+            confidence = float(triage.get("confidence") or 0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        if confidence < settings.portal_triage_terminal_min_confidence:
+            issue_type = "retryable_portal_error"
     templates = {
         "portal_slow": {
             "phase": PHASE_RETRYING,
@@ -450,11 +494,8 @@ def _triage_status_overlay(triage: dict) -> dict:
         },
         "dl_not_in_central_repository": {
             "phase": PHASE_FAILED,
-            "title": "DL record not available online",
-            "message": (
-                "Sarathi could not find this DL in its online records. Online application "
-                "cannot continue for this licence; please contact the issuing RTO/RLA authority."
-            ),
+            "title": DL_CENTRAL_REPO_UNAVAILABLE_RULES["customer_title"],
+            "message": DL_CENTRAL_REPO_UNAVAILABLE_RULES["customer_message"],
             "severity": "error",
             "retryable": False,
             "step_label": "DL lookup stopped",
@@ -500,20 +541,14 @@ def _is_service_rejection(lower: str) -> bool:
 
 
 def _is_central_repo_unavailable(lower: str) -> bool:
-    return (
-        "dl central record unavailable" in lower
-        or "details of given dl number not available" in lower
-        or "not available in the central repository" in lower
-        or "licence data not available in central repository" in lower
-        or "license data not available in central repository" in lower
-    )
+    # Phrase list lives in config.portal_rules (shared with the agent).
+    return text_indicates_dl_central_repo_unavailable(lower)
 
 
 def _central_repo_unavailable_message() -> tuple[str, str, bool]:
     return (
-        "DL record not available online",
-        "Sarathi could not find this DL in its online records. Online application "
-        "cannot continue for this licence; please contact the issuing RTO/RLA authority.",
+        DL_CENTRAL_REPO_UNAVAILABLE_RULES["customer_title"],
+        DL_CENTRAL_REPO_UNAVAILABLE_RULES["customer_message"],
         False,
     )
 

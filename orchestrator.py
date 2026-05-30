@@ -87,9 +87,16 @@ class Orchestrator:
                 )
 
                 if restart_count > max_restarts:
+                    # Transient retries are exhausted — close the loop with a
+                    # clear, customer-safe terminal reason instead of leaking the
+                    # raw exception (which the status layer would otherwise keep
+                    # showing as "we'll retry").
+                    from config.portal_rules import TERMINAL_REASONS
+                    job.customer_data["portal_terminal_reason"] = "portal_unavailable"
                     await self._sm.transition(
                         job, JobStatus.FAILED,
-                        f"Failed after {max_restarts} restarts: {str(e)}"
+                        TERMINAL_REASONS["portal_unavailable"]["error_message"]
+                        + f" (after {max_restarts} retries: {str(e)[:200]})",
                     )
                     break
 

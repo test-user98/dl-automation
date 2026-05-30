@@ -703,8 +703,10 @@ function persistCustomerSession() {
       extractedSnapshot,
       ocrConfidence,
       ocrRetakeCount,
-      manualStateCode: (typeof manualStateCode === 'string') ? manualStateCode : '',
-      manualStateDlPrefix: (typeof manualStateDlPrefix === 'string') ? manualStateDlPrefix : '',
+      // NOTE: manualStateCode is deliberately NOT persisted. A manual state
+      // pick is a live, in-session choice; persisting it let a stale override
+      // from a previous session silently beat the DL-derived state on reload.
+      // The filing state is always recoverable from the (persisted) DL number.
       form: {
         dl_raw: document.getElementById('dl_raw')?.value || '',
         dob: document.getElementById('dob')?.value || '',
@@ -929,8 +931,6 @@ const STATE_NAMES = {
   UK:"Uttarakhand", WB:"West Bengal",
 };
 
-// Last-resort fallback only — used when there is no DL on file yet.
-const DEFAULT_FILING_STATE = "RJ";
 // Customer override. Empty means "use the DL-derived state". Once the
 // customer explicitly picks something from the dropdown, this holds their
 // choice and we never silently overwrite it.
@@ -941,7 +941,9 @@ function dlDerivedStateCode() {
 }
 
 function effectiveStateCode() {
-  return manualStateCode || dlDerivedStateCode() || DEFAULT_FILING_STATE;
+  // Detected from the DL when possible; otherwise the customer's manual pick.
+  // Empty means we could not detect it and must ask the customer to choose.
+  return manualStateCode || dlDerivedStateCode();
 }
 
 function effectiveStateName() {
@@ -952,7 +954,7 @@ function effectiveStateName() {
 function stateSourceLabel() {
   if (manualStateCode) return 'you picked this';
   if (dlDerivedStateCode()) return 'from your DL — change if needed';
-  return 'default';
+  return 'tap Change to pick your state';
 }
 
 function renderReview() {
@@ -1038,8 +1040,8 @@ async function startJob() {
     }
     return;
   }
-  // State is now allowed to come from the DL by default — only block if we
-  // have no DL prefix AND no customer override AND no last-resort fallback.
+  // State comes from the DL when we can detect it. Only block when we have
+  // neither a DL-derived state nor a customer pick — then ask them to choose.
   const resolvedState = effectiveStateCode();
   if (!resolvedState) {
     setScreenBanner('step3-banner', 'Please pick the state where you want us to file this application.');
@@ -1059,7 +1061,6 @@ async function startJob() {
     name:    document.getElementById('name').value.trim(),
     address: extractedSnapshot.address || '',
     state_code: resolvedState,
-    state_confirmed_manually: Boolean(manualStateCode && manualStateDlPrefix === dlDerivedStateCode()),
     service: 'DL_RENEWAL',
     dl_image_path:  dlImagePath,
     dl_image_s3_url: dlImageS3Url,
@@ -1911,8 +1912,10 @@ function rehydrateCustomerSession() {
   extractedSnapshot = snap.extractedSnapshot || {};
   ocrConfidence = snap.ocrConfidence || 0;
   ocrRetakeCount = snap.ocrRetakeCount || 0;
-  if (typeof snap.manualStateCode === 'string') manualStateCode = snap.manualStateCode;
-  if (typeof snap.manualStateDlPrefix === 'string') manualStateDlPrefix = snap.manualStateDlPrefix;
+  // Manual state pick is intentionally not restored — the DL-derived state is
+  // authoritative on load, so a stale pick can never silently override it.
+  manualStateCode = '';
+  manualStateDlPrefix = '';
   // If the snapshot has a job id, the customer was already on the live
   // screen — drop them straight back there and resume polling, instead of
   // forcing them to walk through the form again. The agent kept running

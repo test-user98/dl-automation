@@ -33,6 +33,9 @@ from config.portal_rules import (
     SERVICE_SELECTION_RULES,
     CHANGE_DOB_RULES,
     SERVICE_REJECTION_RULES,
+    DL_CENTRAL_REPO_UNAVAILABLE_RULES,
+    TERMINAL_REASONS,
+    text_indicates_dl_central_repo_unavailable,
     record_discovery,
 )
 from agent.llm_client import get_llm_client
@@ -43,7 +46,7 @@ from browser.controller import BrowserController
 from tools.captcha_solver import CaptchaSolver
 from tools.otp_relay import OTPRelay
 from tools.image_processor import ImageProcessor
-from tools.dl_normalizer import STATE_CODES
+from tools.dl_normalizer import STATE_CODES, DLNormalizer
 from tools.portal_triage import PortalTriageService
 from flows.dl_renewal import DL_RENEWAL_STEPS, steps_after
 
@@ -3474,29 +3477,53 @@ class AgentBrain:
             log.warning("brain.get_dl_details_no_success_proof", attempt=attempt)
 
         log.warning("brain.dl_fetch_exhausted_retries")
-        self._last_deterministic_failure = (
-            "Clicked Get DL Details but could not verify that DL details or the next controls appeared. "
-            "The agent should stay on the DL fetch page, retry with a fresh CAPTCHA if available, "
-            "or ask the user/operator instead of clicking navigation links."
-        )
-        return False
+        # Most common cause of exhaustion here is a wrong DL number or DOB. Give
+        # the customer one chance to correct the DL number; if they can't supply
+        # a usable, different one, close the loop with a clear terminal message.
+        if not job.customer_data.get("_dl_reentry_asked"):
+            job.customer_data["_dl_reentry_asked"] = True
+            resp = await self._hl.ask(
+                job=job,
+                step_name=current_step,
+                question=(
+                    "We couldn't fetch your driving licence from the government portal. "
+                    "Please re-enter your DL number exactly as printed on the licence."
+                ),
+                context="Sarathi did not return DL details for the number/DOB on file after several attempts.",
+                field_key="dl_number",
+            )
+            answer = (resp.answer or "").strip()
+            if answer and answer.lower() not in {"__timeout__", "skip", "cancel", "abort job"}:
+                normalized = DLNormalizer().normalize(answer)
+                current_dl = (job.customer_data.get("dl_number") or "").strip().upper()
+                if normalized.get("valid") and normalized["normalized"] != current_dl:
+                    job.customer_data["dl_number"] = normalized["normalized"]
+                    self._last_deterministic_failure = ""
+                    log.info("brain.dl_reentry_accepted", new_dl=normalized["normalized"])
+                    return False  # retry the fetch with the corrected DL number
 
-    async def _fail_dl_central_repository_unavailable(
+        await self._fail_dl_not_found(job=job, current_step=current_step)
+        return True
+
+    async def _fail_terminal(
         self,
         *,
         job: Job,
         current_step: str,
-        portal_message: str,
+        reason: str,
+        log_event: str,
+        log_detail: str = "",
     ) -> None:
-        customer_message = (
-            "Sarathi could not find this DL in its online records. Online application "
-            "cannot continue for this licence. Please contact the issuing RTO/RLA authority."
-        )
-        job.error_message = (
-            "DL central record unavailable: Sarathi says this licence is not available "
-            "for online applications and requires RTO/RLA handling."
-        )
-        job.customer_data["portal_terminal_reason"] = "dl_not_in_central_repository"
+        """Close a job for good with a structured, customer-safe terminal reason.
+
+        Stamps job.customer_data["portal_terminal_reason"] so the status layer
+        renders the customer copy from the reason key (config.portal_rules
+        TERMINAL_REASONS) rather than re-parsing the error prose.
+        """
+        view = TERMINAL_REASONS[reason]
+        customer_message = view["message"]
+        job.error_message = view["error_message"]
+        job.customer_data["portal_terminal_reason"] = reason
         job.customer_data["last_portal_message"] = {
             "text": customer_message,
             "kind": "terminal",
@@ -3512,10 +3539,30 @@ class AgentBrain:
             error=job.error_message,
         ))
         await self._sm.transition(job, JobStatus.FAILED, job.error_message)
-        log.warning(
-            "brain.dl_central_repository_unavailable",
-            step=current_step,
-            message=portal_message[:180],
+        log.warning(log_event, step=current_step, detail=log_detail[:180])
+
+    async def _fail_dl_central_repository_unavailable(
+        self,
+        *,
+        job: Job,
+        current_step: str,
+        portal_message: str,
+    ) -> None:
+        await self._fail_terminal(
+            job=job,
+            current_step=current_step,
+            reason="dl_not_in_central_repository",
+            log_event="brain.dl_central_repository_unavailable",
+            log_detail=portal_message,
+        )
+
+    async def _fail_dl_not_found(self, *, job: Job, current_step: str) -> None:
+        await self._fail_terminal(
+            job=job,
+            current_step=current_step,
+            reason="dl_not_found",
+            log_event="brain.dl_not_found_terminal",
+            log_detail="DL fetch exhausted and no usable DL correction from customer.",
         )
 
     async def _recover_dl_fetch_page_after_reject(self) -> bool:
@@ -4068,8 +4115,6 @@ class AgentBrain:
         lower = message.lower()
         if "application already exists" in lower:
             return False
-        if AgentBrain._dialog_indicates_dl_not_in_central_repo(message):
-            return True
         failure_terms = [
             "please provide",
             "invalid",
@@ -4084,14 +4129,8 @@ class AgentBrain:
 
     @staticmethod
     def _dialog_indicates_dl_not_in_central_repo(message: str) -> bool:
-        lower = message.lower()
-        return (
-            "details of given dl number not available" in lower
-            or "not available in the central repository" in lower
-            or "licence data not available in central repository" in lower
-            or "license data not available in central repository" in lower
-            or ("central repository" in lower and ("rto / rla" in lower or "rto/rla" in lower))
-        )
+        # Phrase list lives in config.portal_rules (shared with the status layer).
+        return text_indicates_dl_central_repo_unavailable(message)
 
     @staticmethod
     def _portal_transient_block_reason(page_text: str, url: str) -> str:

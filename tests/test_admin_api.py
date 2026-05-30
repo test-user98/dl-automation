@@ -389,7 +389,37 @@ def test_upload_accepts_dl_when_only_optional_fields_are_missing(client, monkeyp
     assert body["extracted"]["dl_number"] == "RJ07 2017 0010191"
 
 
-def test_confirm_and_start_uses_dl_state_when_ui_state_is_stale(client, monkeypatch):
+def test_confirm_and_start_derives_state_from_dl(client, monkeypatch):
+    """With no state_code from the client, the filing state is derived from the DL."""
+    import api.onboard
+
+    async def fake_run_job(job_id):
+        return None
+
+    monkeypatch.setattr(api.onboard._orchestrator, "run_job", fake_run_job)
+
+    r = client.post(
+        "/onboard/confirm-and-start",
+        json={
+            "dl_number": "RJ07 2017 0010191",
+            "dob": "01-01-1990",
+            "mobile_number": "9876543210",
+            "pin_code": "334401",
+            "service": "DL_RENEWAL",
+        },
+    )
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["customer_summary"]["state"] == "Rajasthan"
+
+    detail = client.get(f"/admin/applications/{body['app_id']}", headers=_hdr(client))
+    assert detail.status_code == 200
+    assert detail.json()["application"]["state_code"] == "RJ"
+
+
+def test_confirm_and_start_honors_explicit_state_pick(client, monkeypatch):
+    """An explicit state_code from the client (the customer's pick) is honored."""
     import api.onboard
 
     async def fake_run_job(job_id):
@@ -405,18 +435,17 @@ def test_confirm_and_start_uses_dl_state_when_ui_state_is_stale(client, monkeypa
             "mobile_number": "9876543210",
             "pin_code": "334401",
             "state_code": "KA",
-            "state_confirmed_manually": False,
             "service": "DL_RENEWAL",
         },
     )
 
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["customer_summary"]["state"] == "Rajasthan"
+    assert body["customer_summary"]["state"] == "Karnataka"
 
     detail = client.get(f"/admin/applications/{body['app_id']}", headers=_hdr(client))
     assert detail.status_code == 200
-    assert detail.json()["application"]["state_code"] == "RJ"
+    assert detail.json()["application"]["state_code"] == "KA"
 
 
 def test_lookup_by_application_number(client):

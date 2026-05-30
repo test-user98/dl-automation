@@ -18,6 +18,32 @@ from agent.llm_client import get_llm_client
 log = structlog.get_logger(__name__)
 settings = get_settings()
 
+
+def _downscale_for_vision(data: bytes, max_px: int) -> bytes:
+    """Resize so the longest side <= max_px before the vision call.
+
+    Cuts upload size, token count, and latency with negligible accuracy loss
+    for document OCR. On any failure, returns the original bytes unchanged.
+    """
+    if max_px <= 0 or not data:
+        return data
+    try:
+        from io import BytesIO
+        from PIL import Image
+        img = Image.open(BytesIO(data))
+        longest = max(img.size)
+        if longest <= max_px:
+            return data
+        scale = max_px / longest
+        new_size = (max(1, int(img.width * scale)), max(1, int(img.height * scale)))
+        img = img.convert("RGB").resize(new_size, Image.LANCZOS)
+        out = BytesIO()
+        img.save(out, format="JPEG", quality=90)
+        return out.getvalue()
+    except Exception as e:  # noqa: BLE001
+        log.warning("ocr.downscale_failed", error=str(e))
+        return data
+
 DL_EXTRACTED_FIELDS = (
     "dl_number",
     "name",
@@ -225,12 +251,14 @@ class OCRService:
     ) -> dict:
         try:
             image_bytes = Path(image_path).read_bytes()
+            image_bytes = _downscale_for_vision(image_bytes, settings.ocr_max_image_px)
             llm = self._llm or get_llm_client()
             self._llm = llm
             raw = await llm.vision(
                 image_bytes,
                 system_prompt or "You extract structured data from Indian identity documents. Return only valid JSON.",
                 prompt,
+                detail=settings.ocr_vision_detail,
             )
             data = self._parse_json_object(raw)
             fields = list(data.keys()) if isinstance(data, dict) else []

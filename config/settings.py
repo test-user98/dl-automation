@@ -94,6 +94,13 @@ class Settings(BaseSettings):
     )
     ocr_max_attempts: int = Field(2, env="OCR_MAX_ATTEMPTS")
     ocr_retake_budget: int = Field(2, env="OCR_RETAKE_BUDGET")
+    # OCR latency knobs: downscale the upload before the vision call and let the
+    # model pick image fidelity ("auto") instead of forcing "high" tiling.
+    # NOTE: 2048 is the floor that still reads DL numbers correctly — 1600 was
+    # measured to drop a digit (RJ07201700010191 -> RJ0720170010191). Do not
+    # lower without re-validating against known-good DL images.
+    ocr_max_image_px: int = Field(2048, env="OCR_MAX_IMAGE_PX")
+    ocr_vision_detail: Literal["auto", "low", "high"] = Field("auto", env="OCR_VISION_DETAIL")
     aws_textract_region: str = Field("ap-south-1", env="AWS_TEXTRACT_REGION")
     aws_access_key_id: str = Field("", env="AWS_ACCESS_KEY_ID")
     aws_secret_access_key: str = Field("", env="AWS_SECRET_ACCESS_KEY")
@@ -128,6 +135,12 @@ class Settings(BaseSettings):
     )
     portal_triage_min_confidence: float = Field(
         0.70, env="PORTAL_TRIAGE_MIN_CONFIDENCE"
+    )
+    # Higher bar for terminal ("one-way door") classifications — telling a
+    # customer to give up and visit the RTO is far costlier than an extra retry,
+    # so a low-confidence terminal guess is downgraded to a retry message.
+    portal_triage_terminal_min_confidence: float = Field(
+        0.85, env="PORTAL_TRIAGE_TERMINAL_MIN_CONFIDENCE"
     )
     portal_triage_reasoning_mode: Literal["off", "summary"] = Field(
         "summary", env="PORTAL_TRIAGE_REASONING_MODE"

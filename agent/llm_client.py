@@ -24,7 +24,7 @@ class LLMClient(ABC):
     """Base interface — all providers implement vision() and text()."""
 
     @abstractmethod
-    async def vision(self, image_bytes: bytes, system_prompt: str, user_text: str) -> str: ...
+    async def vision(self, image_bytes: bytes, system_prompt: str, user_text: str, detail: str = "high") -> str: ...
 
     @abstractmethod
     async def text(self, system_prompt: str, user_text: str) -> str: ...
@@ -41,7 +41,7 @@ class OpenAIClient(LLMClient):
         self._model  = settings.resolved_model_for("openai")
         log.info("llm.provider_ready", provider="openai", model=self._model)
 
-    async def vision(self, image_bytes: bytes, system_prompt: str, user_text: str) -> str:
+    async def vision(self, image_bytes: bytes, system_prompt: str, user_text: str, detail: str = "high") -> str:
         b64 = self._b64.b64encode(image_bytes).decode()
         response = self._client.chat.completions.create(
             model      = self._model,
@@ -56,7 +56,7 @@ class OpenAIClient(LLMClient):
                             "type": "image_url",
                             "image_url": {
                                 "url":    f"data:image/png;base64,{b64}",
-                                "detail": "high",
+                                "detail": detail,
                             },
                         },
                         {"type": "text", "text": user_text},
@@ -90,7 +90,9 @@ class AnthropicClient(LLMClient):
         self._model  = settings.resolved_model_for("anthropic")
         log.info("llm.provider_ready", provider="anthropic", model=self._model)
 
-    async def vision(self, image_bytes: bytes, system_prompt: str, user_text: str) -> str:
+    async def vision(self, image_bytes: bytes, system_prompt: str, user_text: str, detail: str = "high") -> str:
+        # Anthropic auto-manages image resolution; `detail` is accepted for a
+        # uniform interface but only affects the OpenAI provider.
         b64 = self._b64.b64encode(image_bytes).decode()
         response = self._client.messages.create(
             model      = self._model,
@@ -140,16 +142,16 @@ class LLMWithFallback(LLMClient):
         self._primary_name = primary_name
         self._fallback_name= fallback_name
 
-    async def vision(self, image_bytes: bytes, system_prompt: str, user_text: str) -> str:
+    async def vision(self, image_bytes: bytes, system_prompt: str, user_text: str, detail: str = "high") -> str:
         if settings.llm_primary_paused:
-            return await self._use_fallback("vision", image_bytes, system_prompt, user_text)
+            return await self._use_fallback("vision", image_bytes, system_prompt, user_text, detail)
         try:
-            result = await self._primary.vision(image_bytes, system_prompt, user_text)
+            result = await self._primary.vision(image_bytes, system_prompt, user_text, detail)
             log.debug("llm.used", provider=self._primary_name)
             return result
         except Exception as e:
             log.warning("llm.primary_failed", provider=self._primary_name, error=str(e))
-            return await self._use_fallback("vision", image_bytes, system_prompt, user_text)
+            return await self._use_fallback("vision", image_bytes, system_prompt, user_text, detail)
 
     async def text(self, system_prompt: str, user_text: str) -> str:
         if settings.llm_primary_paused:
@@ -162,12 +164,12 @@ class LLMWithFallback(LLMClient):
             log.warning("llm.primary_failed", provider=self._primary_name, error=str(e))
             return await self._use_fallback("text", None, system_prompt, user_text)
 
-    async def _use_fallback(self, method: str, image_bytes, system_prompt: str, user_text: str) -> str:
+    async def _use_fallback(self, method: str, image_bytes, system_prompt: str, user_text: str, detail: str = "high") -> str:
         if not self._fallback:
             raise RuntimeError(f"Primary LLM ({self._primary_name}) failed and no fallback configured")
         log.info("llm.using_fallback", provider=self._fallback_name)
         if method == "vision":
-            return await self._fallback.vision(image_bytes, system_prompt, user_text)
+            return await self._fallback.vision(image_bytes, system_prompt, user_text, detail)
         return await self._fallback.text(system_prompt, user_text)
 
 

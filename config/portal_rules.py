@@ -269,6 +269,100 @@ SERVICE_REJECTION_RULES = {
     ),
 }
 
+# ── DL central repository unavailable (terminal business rule) ───────────────
+#
+# Sarathi reports that a DL is not present in the national/central repository,
+# so the licence cannot be processed online — the customer must visit the
+# issuing RTO/RLA. This is the single source of truth for the phrases both the
+# agent (raw portal dialog) and the status layer (customer copy) match against,
+# plus the canonical marker the agent writes into Job.error_message so the
+# status layer can recognise the reason without re-parsing portal prose.
+DL_CENTRAL_REPO_UNAVAILABLE_RULES = {
+    "dialog_patterns": [
+        "details of given dl number not available",
+        "not available in the central repository",
+        "licence data not available in central repository",
+        "license data not available in central repository",
+    ],
+    "error_marker": "dl central record unavailable",
+    "customer_title": "DL record not available online",
+    "customer_message": (
+        "Sarathi could not find this DL in its online records. Online application "
+        "cannot continue for this licence; please contact the issuing RTO/RLA authority."
+    ),
+    "agent_error_message": (
+        "DL central record unavailable: Sarathi says this licence is not available "
+        "for online applications and requires RTO/RLA handling."
+    ),
+}
+
+
+def text_indicates_dl_central_repo_unavailable(text: str) -> bool:
+    """True for a raw Sarathi dialog/page OR our own canonical error marker.
+
+    Used by both the agent (matching raw portal text) and the status layer
+    (matching Job.error_message prose), so the phrase list never drifts.
+    """
+    lower = (text or "").lower()
+    if DL_CENTRAL_REPO_UNAVAILABLE_RULES["error_marker"] in lower:
+        return True
+    if any(p in lower for p in DL_CENTRAL_REPO_UNAVAILABLE_RULES["dialog_patterns"]):
+        return True
+    return "central repository" in lower and ("rto / rla" in lower or "rto/rla" in lower)
+
+
+# ── Terminal job reasons (one source of truth for agent + status layer) ──────
+#
+# When the agent stops a job for good it stamps job.customer_data
+# ["portal_terminal_reason"] with one of these keys. The status layer reads the
+# *key* (not re-parsed prose) to render the customer message — so the agent's
+# decision and the customer's copy can never drift. `retryable` here means the
+# customer may sensibly start over later (e.g. portal was down), not that the
+# closed job auto-retries.
+TERMINAL_REASONS = {
+    "dl_not_in_central_repository": {
+        "title": DL_CENTRAL_REPO_UNAVAILABLE_RULES["customer_title"],
+        "message": DL_CENTRAL_REPO_UNAVAILABLE_RULES["customer_message"],
+        "error_message": DL_CENTRAL_REPO_UNAVAILABLE_RULES["agent_error_message"],
+        "retryable": False,
+    },
+    "service_unavailable_for_rto": {
+        "title": SERVICE_REJECTION_RULES["customer_title"],
+        "message": SERVICE_REJECTION_RULES["customer_message"],
+        "error_message": "Service unavailable for RTO: " + SERVICE_REJECTION_RULES["customer_message"],
+        "retryable": False,
+    },
+    "dl_not_found": {
+        "title": "We couldn't find your driving licence",
+        "message": (
+            "Sarathi could not fetch this driving licence with the number and date of "
+            "birth provided. Please double-check the DL number and try again. If the "
+            "details are correct and it still can't be found, the licence may not be "
+            "available for online services — please contact your RTO/RLA authority."
+        ),
+        "error_message": (
+            "DL not found: Sarathi could not fetch the licence for the DL number/DOB "
+            "provided, and the customer did not supply a usable correction."
+        ),
+        "retryable": True,
+    },
+    "portal_unavailable": {
+        "title": "The government portal isn't responding",
+        "message": (
+            "We tried several times but the government Sarathi portal did not respond. "
+            "Your details are saved — please try again in a little while."
+        ),
+        "error_message": "Portal unavailable: Sarathi did not respond after the maximum retries.",
+        "retryable": True,
+    },
+}
+
+
+def terminal_reason_view(reason: str) -> dict | None:
+    """Return the (title, message, retryable) view for a terminal reason key."""
+    return TERMINAL_REASONS.get((reason or "").strip().lower())
+
+
 CHANGE_DOB_RULES = {
     "service_value": "CHANGE OF DATE OF BIRTH IN DL",
     "reason_selector": "#codreasoncd",

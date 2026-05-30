@@ -356,3 +356,63 @@ def test_customer_view_shadow_triage_does_not_override_copy(monkeypatch):
     assert view["phase"] == "filling"
     assert view["headline"] == "Filling your application"
     assert view["portal_triage"]["mode"] == "shadow"
+
+
+# ── Structured terminal reasons + terminal confidence gate ──────────────────
+
+def _fresh_triage(issue_type: str, confidence: float) -> dict:
+    return {
+        "issue_type": issue_type,
+        "confidence": confidence,
+        "recommended_next_action": "stop_terminal",
+        "evidence": [],
+        "at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def test_portal_unavailable_terminal_closes_loop_not_retry():
+    """A FAILED job stamped portal_unavailable must NOT say 'we'll keep retrying'."""
+    job = _job(JobStatus.FAILED)
+    job.customer_data["portal_terminal_reason"] = "portal_unavailable"
+    # Error prose contains portal-down keywords that previously triggered the
+    # calm "we are retrying automatically" message even though the job is closed.
+    job.error_message = "Portal unavailable: government portal timed out / unavailable."
+
+    view = customer_job_view(job)
+
+    assert view["phase"] == "failed"
+    assert "isn't responding" in view["headline"]
+    assert "retrying" not in view["subline"].lower()
+    assert view["action_required"] is False
+
+
+def test_dl_not_found_terminal_message():
+    job = _job(JobStatus.FAILED)
+    job.customer_data["portal_terminal_reason"] = "dl_not_found"
+
+    view = customer_job_view(job)
+
+    assert view["phase"] == "failed"
+    assert view["headline"] == "We couldn't find your driving licence"
+    assert view["retryable"] is True
+
+
+def test_low_confidence_terminal_triage_downgraded_to_retry():
+    """A low-confidence terminal guess must not tell the customer to give up."""
+    job = _job(JobStatus.AGENT_RUNNING)
+    job.customer_data["portal_triage"] = _fresh_triage("dl_not_in_central_repository", 0.75)
+
+    view = customer_job_view(job)
+
+    assert view["phase"] == "retrying"
+    assert view["retryable"] is True
+
+
+def test_high_confidence_terminal_triage_shows_terminal():
+    job = _job(JobStatus.AGENT_RUNNING)
+    job.customer_data["portal_triage"] = _fresh_triage("dl_not_in_central_repository", 0.90)
+
+    view = customer_job_view(job)
+
+    assert view["phase"] == "failed"
+    assert view["retryable"] is False
