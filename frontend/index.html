@@ -941,9 +941,12 @@ function dlDerivedStateCode() {
 }
 
 function effectiveStateCode() {
-  // Detected from the DL when possible; otherwise the customer's manual pick.
-  // Empty means we could not detect it and must ask the customer to choose.
-  return manualStateCode || dlDerivedStateCode();
+  // The DL-derived state is AUTHORITATIVE whenever we can detect it. A manual
+  // pick only applies when the DL has no detectable state. This guarantees a
+  // stale/leftover pick can never override a clearly detected state.
+  const derived = dlDerivedStateCode();
+  if (derived) return derived;
+  return manualStateCode;
 }
 
 function effectiveStateName() {
@@ -952,8 +955,8 @@ function effectiveStateName() {
 }
 
 function stateSourceLabel() {
+  if (dlDerivedStateCode()) return 'detected from your DL';
   if (manualStateCode) return 'you picked this';
-  if (dlDerivedStateCode()) return 'from your DL — change if needed';
   return 'tap Change to pick your state';
 }
 

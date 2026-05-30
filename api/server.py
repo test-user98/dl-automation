@@ -11,6 +11,16 @@ Endpoints:
 """
 
 import asyncio
+import sys
+
+# Windows + Playwright: the agent launches Chromium as a subprocess, which
+# requires asyncio's Proactor event loop. Under `uvicorn --reload` the worker
+# can land on a Selector loop, where subprocess creation raises
+# NotImplementedError and the browser never starts ("browser.launch_failed").
+# Force the Proactor policy at import — before uvicorn creates its loop.
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
 import json
 from datetime import datetime
 from typing import Optional
